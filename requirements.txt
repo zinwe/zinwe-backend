@@ -20,3 +20,6 @@ Pillow>=11,<13
 segno>=1.6,<2
 # Web push to the owner's browsers (z_devices/web_push.py): encrypts and signs each push
 pywebpush>=2.0,<3
+# Reads and writes the marketing contact file (.xlsx); defusedxml makes openpyxl parse uploads safely
+openpyxl>=3.1,<4
+defusedxml>=0.7,<1

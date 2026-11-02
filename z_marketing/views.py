@@ -5,6 +5,7 @@ import hmac
 from typing import Any
 
 from django.conf import settings
+from django.db import transaction
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -20,8 +21,9 @@ from rest_framework.views import APIView
 
 from z_analytics.services import track
 
-from . import outreach
-from .models import Audience, Campaign, CampaignEmail, Contact, Suppression
+from . import contact_file, email_html, outreach, patterns
+from .contact_file import FileProblem
+from .models import Audience, Campaign, CampaignEmail, Contact, EmailTemplate, OutreachSend, Persona, Suppression
 from .outreach import OutreachError
 
 
@@ -29,37 +31,103 @@ def _chips(max_items: int = 40) -> serializers.ListField:
     return serializers.ListField(child=serializers.CharField(max_length=240), required=False, max_length=max_items)
 
 
+# The 12 profiling sections. Lists hold table rows; the others hold label -> text.
+PROFILE_FORMS = {"business", "icp_b2b", "icp_b2c", "psychology", "journey", "keywords", "email", "ads", "market", "definition"}
+PROFILE_TABLES = {"pains", "channels", "segments"}
+
+
+def _clean_text(values: dict[str, Any]) -> dict[str, Any]:
+    if len(values) > 40 or not all(isinstance(k, str) and isinstance(v, str) and len(v) <= 2000 for k, v in values.items()):
+        raise serializers.ValidationError("Keep each answer under 2,000 characters.")
+    return values
+
+
+class PersonaSerializer(serializers.ModelSerializer):
+    audience_count = serializers.IntegerField(source="audiences.count", read_only=True)
+
+    class Meta:
+        model = Persona
+        fields = ["id", "name", "confidence", "profile", "audience_count", "updated_at"]
+        read_only_fields = ["updated_at"]
+
+    def validate_profile(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) - PROFILE_FORMS - PROFILE_TABLES:
+            raise serializers.ValidationError("That profile has a section we don't know.")
+        for key, section in value.items():
+            if key in PROFILE_TABLES:
+                if not isinstance(section, list) or len(section) > 30 or not all(isinstance(r, dict) for r in section):
+                    raise serializers.ValidationError("Keep each table under 30 rows.")
+                for row in section:
+                    _clean_text(row)
+            elif isinstance(section, dict):
+                _clean_text(section)
+            else:
+                raise serializers.ValidationError("That profile has a section in the wrong shape.")
+        return value
+
+
 class AudienceSerializer(serializers.ModelSerializer):
-    segments = _chips()
-    triggers = _chips()
-    words = _chips()
-    objections = _chips()
-    not_for = _chips()
-    problems = _chips()
-    solutions = _chips()
-    offers = _chips()
+    key_benefits = _chips()
+    job_titles = _chips()
+    decision_makers = _chips()
+    industry_keywords = _chips()
+    competitors = _chips()
     channels = _chips()
+    campaign_count = serializers.IntegerField(source="campaigns.count", read_only=True)
 
     class Meta:
         model = Audience
         fields = [
-            "id", "name", "country", "decider", "setup", "today", "confidence", "segments", "triggers", "words",
-            "objections", "not_for", "problems", "solutions", "offers", "channels", "summary",
+            "id", "persona", "name", "country", "state", "city", "business_category", "business_segment", "business_type",
+            "primary_problem", "secondary_problem", "product_service", "how_solves", "key_benefits", "primary_offer",
+            "pricing", "objective", "cta", "job_titles", "decision_makers", "industry_keywords", "competitors", "notes",
+            "channels", "campaign_count",
         ]
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
-        merged = {k: attrs.get(k, getattr(self.instance, k, None)) for k in ("segments", "problems", "channels")}
-        for field, label in (("segments", "segment"), ("problems", "problem"), ("channels", "channel")):
-            if not merged[field]:
+        for field, label in (("key_benefits", "benefit"), ("channels", "channel")):
+            if not attrs.get(field, getattr(self.instance, field, None)):
                 raise serializers.ValidationError({field: f"Add at least one {label}."})
         return attrs
 
 
+def _clean_body(value: str) -> str:
+    cleaned = email_html.clean_body(value)
+    if not email_html.to_text(cleaned):
+        raise serializers.ValidationError("Write the email first.")
+    return cleaned
+
+
 class EmailStepSerializer(serializers.ModelSerializer):
+    template_name = serializers.CharField(source="template.name", default="", read_only=True)
+
     class Meta:
         model = CampaignEmail
-        fields = ["n", "stage", "when", "week", "subject", "body"]
+        fields = ["n", "stage", "when", "week", "subject", "body", "template_name"]
         read_only_fields = ["n", "stage", "when", "week"]
+
+    def validate_body(self, value: str) -> str:
+        return _clean_body(value)
+
+
+class TemplateSerializer(serializers.ModelSerializer):
+    built_in = serializers.SerializerMethodField()
+    used_in = serializers.IntegerField(source="uses.count", read_only=True)
+
+    class Meta:
+        model = EmailTemplate
+        fields = ["id", "name", "kind", "subject", "body", "built_in", "used_in"]
+
+    def get_built_in(self, obj: EmailTemplate) -> bool:
+        return obj.step is not None
+
+    def validate_body(self, value: str) -> str:
+        return _clean_body(value)
+
+    def validate_kind(self, value: str) -> str:
+        if self.instance and self.instance.step is not None and value != self.instance.kind:
+            raise serializers.ValidationError("This starter template belongs to the patterns, so its type stays.")
+        return value
 
 
 class CampaignInput(serializers.ModelSerializer):
@@ -102,23 +170,27 @@ def _sender() -> dict[str, Any]:
         "newsletter_from": settings.ZINWE_NEWSLETTER_FROM if settings.EMAIL_NEWSLETTER_HOST else settings.DEFAULT_FROM_EMAIL,
         "postal_address": settings.ZINWE_OUTREACH_POSTAL_ADDRESS,
         "limits": outreach.DAILY_LIMITS,
+        "patterns": patterns.public(),
     }
 
 
 def _summary(c: Campaign) -> dict[str, Any]:
+    room = max(0, c.daily_limit - outreach.sent_today(c))
+    funnel = {f["label"]: f["value"] for f in outreach.report(c)["funnel"]}
+    counts = outreach.counts(c)
     return {
         "id": c.id, "name": c.name, "audience": c.audience_id, "audience_name": c.audience.name, "goal": c.goal,
-        "theme": c.theme, "status": c.status, "counts": outreach.counts(c),
+        "theme": c.theme, "status": c.status, "counts": counts, "pattern": c.pattern, "emails_count": c.emails.count(),
+        "ready_today": min(counts["due"], room), "emailed": funnel["Emailed"], "replied": funnel["Replied"],
+        "signed_up": funnel["Signed up"],
     }
 
 
 def _detail(c: Campaign) -> dict[str, Any]:
-    due = outreach.due(c)
-    room = max(0, c.daily_limit - outreach.sent_today(c))
     return {
         **_summary(c), "problem": c.problem, "offer": c.offer, "pause_reason": c.pause_reason,
-        "daily_limit": c.daily_limit, "sent_today": outreach.sent_today(c), "ready_today": min(len(due), room),
-        "dns_result": c.dns_result, "dns_checked_at": c.dns_checked_at, "rules_checked_at": c.rules_checked_at,
+        "daily_limit": c.daily_limit, "sent_today": outreach.sent_today(c), "pattern_open": outreach.pattern_open(c),
+        "emails_read_at": c.emails_read_at, "persona": c.audience.persona_id, "dns_result": c.dns_result, "dns_checked_at": c.dns_checked_at, "rules_checked_at": c.rules_checked_at,
         "rules_checked_by": c.rules_checked_by, "test_sent_at": c.test_sent_at,
         "checks": outreach.checks(c), "report": outreach.report(c),
         "emails": EmailStepSerializer(c.emails.all(), many=True).data,
@@ -135,9 +207,40 @@ class Staff(APIView):
         track(f"admin.marketing_{action}", properties, actor_email=request.user.email, ref=ref)
 
 
+class PersonaListView(Staff):
+    def get(self, request: Request) -> Response:
+        return Response(PersonaSerializer(Persona.objects.all(), many=True).data)
+
+    def post(self, request: Request) -> Response:
+        data = PersonaSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        return Response(PersonaSerializer(data.save()).data, status=status.HTTP_201_CREATED)
+
+
+class PersonaDetailView(Staff):
+    def get(self, request: Request, pk: int) -> Response:
+        return Response(PersonaSerializer(get_object_or_404(Persona, pk=pk)).data)
+
+    def put(self, request: Request, pk: int) -> Response:
+        data = PersonaSerializer(get_object_or_404(Persona, pk=pk), data=request.data)
+        data.is_valid(raise_exception=True)
+        return Response(PersonaSerializer(data.save()).data)
+
+    def delete(self, request: Request, pk: int) -> Response:
+        persona = get_object_or_404(Persona, pk=pk)
+        if persona.audiences.exists():
+            return self.refused(Exception("Remove its target audiences first."))
+        persona.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class AudienceListView(Staff):
     def get(self, request: Request) -> Response:
-        return Response(AudienceSerializer(Audience.objects.all(), many=True).data)
+        rows = Audience.objects.all()
+        persona = request.query_params.get("persona", "")
+        if persona.isdigit():
+            rows = rows.filter(persona_id=persona)
+        return Response(AudienceSerializer(rows, many=True).data)
 
     def post(self, request: Request) -> Response:
         data = AudienceSerializer(data=request.data)
@@ -146,10 +249,20 @@ class AudienceListView(Staff):
 
 
 class AudienceDetailView(Staff):
+    def get(self, request: Request, pk: int) -> Response:
+        return Response(AudienceSerializer(get_object_or_404(Audience, pk=pk)).data)
+
     def put(self, request: Request, pk: int) -> Response:
         data = AudienceSerializer(get_object_or_404(Audience, pk=pk), data=request.data)
         data.is_valid(raise_exception=True)
         return Response(AudienceSerializer(data.save()).data)
+
+    def delete(self, request: Request, pk: int) -> Response:
+        audience = get_object_or_404(Audience, pk=pk)
+        if audience.campaigns.exists():
+            return self.refused(Exception("A campaign uses this audience, so it can't be removed."))
+        audience.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class CampaignListView(Staff):
@@ -157,19 +270,24 @@ class CampaignListView(Staff):
         rows = Campaign.objects.select_related("audience")
         return Response({"sender": _sender(), "campaigns": [_summary(c) for c in rows]})
 
+    @transaction.atomic
     def post(self, request: Request) -> Response:
-        """A new draft starts with a copy of the first campaign's emails, ready to edit."""
+        """A new draft: an audience plus its own copy of an email pattern, or of another campaign's emails."""
         data = CampaignInput(data=request.data)
         data.is_valid(raise_exception=True)
         if "audience" not in data.validated_data or not data.validated_data.get("name"):
             return self.refused(Exception("Add a name and pick an audience."))
-        campaign = data.save()
-        source = Campaign.objects.exclude(pk=campaign.pk).order_by("id").first()
-        if source is not None:
-            CampaignEmail.objects.bulk_create(
-                CampaignEmail(campaign=campaign, n=s.n, stage=s.stage, when=s.when, week=s.week, subject=s.subject, body=s.body)
-                for s in source.emails.all()
-            )
+        pattern, source = str(request.data.get("pattern", "")), request.data.get("copy_from")
+        if source:
+            original = get_object_or_404(Campaign, pk=source)
+            pattern = original.pattern
+            steps = list(original.emails.values("n", "stage", "when", "week", "subject", "body", "template_id"))
+        elif pattern in patterns.PATTERNS:
+            steps = patterns.emails(pattern)
+        else:
+            return self.refused(Exception("Pick an email pattern."))
+        campaign = data.save(pattern=pattern)
+        CampaignEmail.objects.bulk_create(CampaignEmail(campaign=campaign, **step) for step in steps)
         return Response(_detail(campaign), status=status.HTTP_201_CREATED)
 
 
@@ -183,6 +301,15 @@ class CampaignDetailView(Staff):
         data.is_valid(raise_exception=True)
         return Response(_detail(data.save()))
 
+    def delete(self, request: Request, pk: int) -> Response:
+        """Only a draft that never sent. A campaign with history stays, for its report and proof of consent."""
+        campaign = get_object_or_404(Campaign, pk=pk)
+        if campaign.status != Campaign.Status.DRAFT or OutreachSend.objects.filter(contact__campaign=campaign).exists():
+            return self.refused(Exception("Only a draft that never sent can be removed."))
+        self.audit(request, "campaign_removed", campaign, contacts=campaign.contacts.count())
+        campaign.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 class EmailStepView(Staff):
     def put(self, request: Request, pk: int, n: int) -> Response:
@@ -192,9 +319,69 @@ class EmailStepView(Staff):
         data.save()
         return Response(data.data)
 
+    def delete(self, request: Request, pk: int, n: int) -> Response:
+        try:
+            outreach.remove_step(get_object_or_404(Campaign, pk=pk), n)
+        except OutreachError as exc:
+            return self.refused(exc)
+        return Response(_detail(get_object_or_404(Campaign.objects.select_related("audience"), pk=pk)))
+
+
+class EmailStepListView(Staff):
+    def post(self, request: Request, pk: int) -> Response:
+        """A new email at the end: a blank one, or a copy of `template`."""
+        campaign = get_object_or_404(Campaign.objects.select_related("audience"), pk=pk)
+        chosen = request.data.get("template")
+        try:
+            outreach.add_step(campaign, get_object_or_404(EmailTemplate, pk=chosen) if chosen else None)
+        except OutreachError as exc:
+            return self.refused(exc)
+        return Response(_detail(campaign), status=status.HTTP_201_CREATED)
+
+
+class EmailStepActionView(Staff):
+    """POST .../emails/<n>/use-template/ {template} or .../emails/<n>/save-template/ {name}."""
+
+    def post(self, request: Request, pk: int, n: int, action: str) -> Response:
+        campaign = get_object_or_404(Campaign.objects.select_related("audience"), pk=pk)
+        try:
+            if action == "use-template":
+                outreach.use_template(campaign, n, get_object_or_404(EmailTemplate, pk=request.data.get("template")))
+                return Response(_detail(campaign))
+            if action == "save-template":
+                made = outreach.save_as_template(campaign, n, str(request.data.get("name", "")))
+                return Response(TemplateSerializer(made).data, status=status.HTTP_201_CREATED)
+        except (OutreachError, ValueError, TypeError) as exc:
+            return self.refused(exc)
+        return self.refused(Exception("That action isn't available."))
+
+
+class TemplateListView(Staff):
+    def get(self, request: Request) -> Response:
+        return Response(TemplateSerializer(EmailTemplate.objects.all(), many=True).data)
+
+    def post(self, request: Request) -> Response:
+        data = TemplateSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        return Response(TemplateSerializer(data.save()).data, status=status.HTTP_201_CREATED)
+
+
+class TemplateDetailView(Staff):
+    def put(self, request: Request, pk: int) -> Response:
+        data = TemplateSerializer(get_object_or_404(EmailTemplate, pk=pk), data=request.data)
+        data.is_valid(raise_exception=True)
+        return Response(TemplateSerializer(data.save()).data)
+
+    def delete(self, request: Request, pk: int) -> Response:
+        template = get_object_or_404(EmailTemplate, pk=pk)
+        if template.step is not None:
+            return self.refused(Exception("The email patterns use this starter template, so it stays. You can edit it."))
+        template.delete()  # campaigns keep their copies
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 class CampaignActionView(Staff):
-    """POST .../campaigns/<id>/<action>/: launch, pause, test, dns, rules, send."""
+    """POST .../campaigns/<id>/<action>/: launch, pause, test, dns, rules, emails-read, send."""
 
     def post(self, request: Request, pk: int, action: str) -> Response:
         campaign = get_object_or_404(Campaign.objects.select_related("audience"), pk=pk)
@@ -213,6 +400,9 @@ class CampaignActionView(Staff):
                 campaign.rules_checked_at = timezone.now() if done else None
                 campaign.rules_checked_by = actor if done else ""
                 campaign.save(update_fields=["rules_checked_at", "rules_checked_by"])
+            elif action == "emails-read":
+                campaign.emails_read_at = timezone.now() if request.data.get("checked") else None
+                campaign.save(update_fields=["emails_read_at"])
             elif action == "send":
                 approved = outreach.approve(campaign, int(request.data.get("expected", -1)), actor)
                 self.audit(request, "outreach_approved", campaign, emails=approved)
@@ -239,6 +429,36 @@ class ContactImportView(Staff):
         results = outreach.import_contacts(campaign, str(request.data.get("text", "")), request.user.email)
         self.audit(request, "contacts_added", campaign, added=sum(r["result"] == "good" for r in results))
         return Response({"results": results})
+
+
+class ContactTemplateView(Staff):
+    def get(self, request: Request) -> HttpResponse:
+        response = HttpResponse(
+            contact_file.template(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        response["Content-Disposition"] = 'attachment; filename="zinwe-contacts-template.xlsx"'
+        return response
+
+
+class ContactUploadView(Staff):
+    """POST a file. Without `add` it only reviews each row; with add=1 it adds the rows that review as ready."""
+
+    parser_classes = [MultiPartParser]
+
+    def post(self, request: Request, pk: int) -> Response:
+        campaign = get_object_or_404(Campaign, pk=pk)
+        upload = request.FILES.get("file")
+        if upload is None:
+            return self.refused(Exception("Choose a file first."))
+        try:
+            rows = contact_file.parse(upload, upload.name, upload.size)
+        except FileProblem as exc:
+            return self.refused(exc)
+        if request.data.get("add") == "1":
+            added = outreach.add_from_file(campaign, rows, request.user.email)
+            self.audit(request, "contacts_added", campaign, added=added, source="file")
+            return Response({"added": added})
+        return Response({"rows": outreach.review_file(campaign, rows)})
 
 
 class ContactActView(Staff):

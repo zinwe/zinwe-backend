@@ -5,13 +5,21 @@ from . import views
 app_name = "z_marketing_staff"
 
 urlpatterns = [
+    path("personas/", views.PersonaListView.as_view(), name="personas"),
+    path("personas/<int:pk>/", views.PersonaDetailView.as_view(), name="persona"),
     path("audiences/", views.AudienceListView.as_view(), name="audiences"),
     path("audiences/<int:pk>/", views.AudienceDetailView.as_view(), name="audience"),
     path("campaigns/", views.CampaignListView.as_view(), name="campaigns"),
     path("campaigns/<int:pk>/", views.CampaignDetailView.as_view(), name="campaign"),
+    path("campaigns/<int:pk>/emails/", views.EmailStepListView.as_view(), name="emails"),
     path("campaigns/<int:pk>/emails/<int:n>/", views.EmailStepView.as_view(), name="email"),
+    path("campaigns/<int:pk>/emails/<int:n>/<slug:action>/", views.EmailStepActionView.as_view(), name="email-action"),
+    path("templates/", views.TemplateListView.as_view(), name="templates"),
+    path("templates/<int:pk>/", views.TemplateDetailView.as_view(), name="template"),
     path("campaigns/<int:pk>/contacts/", views.ContactListView.as_view(), name="contacts"),
     path("campaigns/<int:pk>/contacts/import/", views.ContactImportView.as_view(), name="contacts-import"),
+    path("campaigns/<int:pk>/contacts/upload/", views.ContactUploadView.as_view(), name="contacts-upload"),
+    path("contact-template/", views.ContactTemplateView.as_view(), name="contact-template"),
     path("campaigns/<int:pk>/<slug:action>/", views.CampaignActionView.as_view(), name="campaign-action"),
     path("contacts/<int:pk>/act/", views.ContactActView.as_view(), name="contact-act"),
     path("blocked/", views.BlockedView.as_view(), name="blocked"),

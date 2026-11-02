@@ -1,4 +1,4 @@
-"""Marketing: audiences, and one-to-one outreach campaigns that staff approve batch by batch."""
+"""Marketing: personas, their target audiences, and one-to-one outreach campaigns that staff approve batch by batch."""
 from __future__ import annotations
 
 import secrets
@@ -11,8 +11,8 @@ def new_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-class Audience(models.Model):
-    """Who we target: the group, its main persona, what they need and how to reach them."""
+class Persona(models.Model):
+    """The base customer profile every target audience starts from. `profile` holds the 12 profiling sections."""
 
     class Confidence(models.TextChoices):
         GUESS = "Guess", "Guess"
@@ -20,22 +20,55 @@ class Audience(models.Model):
         CONFIRMED = "Confirmed", "Confirmed"
 
     name = models.CharField(max_length=120)
-    country = models.CharField(max_length=40, default="USA")
-    decider = models.CharField(max_length=200, blank=True)
-    setup = models.CharField(max_length=200, blank=True)
-    today = models.CharField(max_length=300, blank=True)
     confidence = models.CharField(max_length=12, choices=Confidence.choices, default=Confidence.GUESS)
-    # Lists of short texts (chips). The first channel is the best channel.
-    segments = models.JSONField(default=list, blank=True)
-    triggers = models.JSONField(default=list, blank=True)
-    words = models.JSONField(default=list, blank=True)
-    objections = models.JSONField(default=list, blank=True)
-    not_for = models.JSONField(default=list, blank=True)
-    problems = models.JSONField(default=list, blank=True)
-    solutions = models.JSONField(default=list, blank=True)
-    offers = models.JSONField(default=list, blank=True)
-    channels = models.JSONField(default=list, blank=True)
-    summary = models.TextField(blank=True)
+    profile = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Audience(models.Model):
+    """A target audience inside a persona: who and where, their problem, our answer, the offer and the channels."""
+
+    class BusinessType(models.TextChoices):
+        B2B = "B2B", "B2B"
+        B2C = "B2C", "B2C"
+        BOTH = "Both", "Both"
+
+    class Objective(models.TextChoices):
+        LEADS = "Leads", "Leads"
+        SALES = "Sales", "Sales"
+        ENQUIRIES = "Enquiries", "Enquiries"
+        AWARENESS = "Brand Awareness", "Brand Awareness"
+
+    persona = models.ForeignKey(Persona, on_delete=models.PROTECT, related_name="audiences")
+    name = models.CharField(max_length=120)
+    country = models.CharField(max_length=40, default="USA")
+    state = models.CharField(max_length=80, blank=True)  # blank: the whole country
+    city = models.CharField(max_length=80, blank=True)  # blank: the whole state
+    business_category = models.CharField(max_length=120)
+    business_segment = models.CharField(max_length=120)
+    business_type = models.CharField(max_length=4, choices=BusinessType.choices, default=BusinessType.B2B)
+    primary_problem = models.CharField(max_length=240)
+    secondary_problem = models.CharField(max_length=240, blank=True)
+    product_service = models.CharField(max_length=120)
+    how_solves = models.TextField()
+    key_benefits = models.JSONField(default=list)
+    primary_offer = models.CharField(max_length=240)
+    pricing = models.CharField(max_length=240, blank=True)
+    objective = models.CharField(max_length=16, choices=Objective.choices, default=Objective.LEADS)
+    cta = models.CharField(max_length=120)
+    job_titles = models.JSONField(default=list, blank=True)
+    decision_makers = models.JSONField(default=list, blank=True)
+    industry_keywords = models.JSONField(default=list, blank=True)
+    competitors = models.JSONField(default=list, blank=True)
+    notes = models.TextField(blank=True)
+    channels = models.JSONField(default=list)  # the first channel is the best channel
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -63,13 +96,39 @@ class Campaign(models.Model):
     status = models.CharField(max_length=8, choices=Status.choices, default=Status.DRAFT)
     pause_reason = models.CharField(max_length=240, blank=True)
     daily_limit = models.PositiveSmallIntegerField(default=10)
+    pattern = models.CharField(max_length=20, default="full")  # the set of emails it started from: patterns.PATTERNS
     # Launch checks that a person answers for.
     rules_checked_at = models.DateTimeField(null=True, blank=True)
     rules_checked_by = models.EmailField(blank=True)
     test_sent_at = models.DateTimeField(null=True, blank=True)
+    emails_read_at = models.DateTimeField(null=True, blank=True)  # someone read them against this audience
     dns_result = models.JSONField(default=dict, blank=True)  # {"spf": bool, "dkim": bool, "dmarc": bool}
     dns_checked_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class EmailTemplate(models.Model):
+    """A generic email. A campaign takes a copy, so nothing here changes a campaign, and no campaign edit changes this."""
+
+    class Kind(models.TextChoices):
+        COLD = "Cold", "Cold"
+        SETUP = "Setup", "Setup"
+        TIPS = "Tips", "Tips"
+        FINAL = "Final", "Final"
+
+    name = models.CharField(max_length=120)
+    kind = models.CharField(max_length=12, choices=Kind.choices, default=Kind.TIPS)
+    subject = models.CharField(max_length=200)
+    body = models.TextField()
+    step = models.PositiveSmallIntegerField(null=True, blank=True, unique=True)  # its place in the patterns: patterns.PATTERNS
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["id"]
@@ -88,6 +147,7 @@ class CampaignEmail(models.Model):
     week = models.PositiveSmallIntegerField(default=0)  # sets the gap to the next email
     subject = models.CharField(max_length=200)
     body = models.TextField()
+    template = models.ForeignKey(EmailTemplate, on_delete=models.SET_NULL, null=True, blank=True, related_name="uses")
 
     class Meta:
         ordering = ["campaign_id", "n"]
@@ -132,6 +192,7 @@ class Contact(models.Model):
     opted_in_at = models.DateField(null=True, blank=True)
     proof = models.CharField(max_length=240, blank=True)  # their words when they said yes
     replied_at = models.DateField(null=True, blank=True)
+    replied_step = models.PositiveSmallIntegerField(default=0)  # the last email they had when they first replied
     signed_up_at = models.DateField(null=True, blank=True)
     installed = models.BooleanField(default=False)
     reason = models.CharField(max_length=160, blank=True)

@@ -92,3 +92,19 @@ EMAILS = [
      "newsletter: https://zinwe.io/blog\n\nYou'll get a confirmation email first. If you do neither, I won't email you "
      "again.\n\nThanks for reading,\nVishal"),
 ]
+
+# Names for these emails in the template library (migration 0007).
+TEMPLATE_NAMES = {
+    1: "First cold email: client files",
+    2: "Cold follow-up: client files",
+    3: "Here's how to start",
+    4: "Install on one PC first",
+    5: "2-minute USB test",
+    6: "Which USB drives to allow",
+    7: "A stranger asks for AnyDesk",
+    8: "Large file transfers",
+    9: "What software is on your PCs",
+    10: "See your team's day",
+    11: "Keep instructions out of group chats",
+    12: "Should I keep sending these?",
+}

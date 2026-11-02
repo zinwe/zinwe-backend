@@ -29,14 +29,14 @@ from z_blog.models import NewsletterSubscriber
 from z_notification.models import Notification
 from z_notification.services import notify
 
-from .models import Campaign, CampaignEmail, Contact, ContactEvent, OutreachSend, Suppression, sender_address
+from . import email_html
+from .models import Campaign, CampaignEmail, Contact, ContactEvent, EmailTemplate, OutreachSend, Suppression, sender_address
 
 logger = logging.getLogger("zinwe.marketing")
 
 Status = Contact.Status
 Send = OutreachSend.Status
 
-LAST_EMAIL = 12
 SENDABLE = [Status.NEW, Status.COLD, Status.OPTED, Status.SIGNED]
 SHARED_INBOXES = {"info", "admin", "hello", "contact", "sales", "marketing", "support", "office", "accounts", "team"}
 FREE_MAIL = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com", "aol.com", "proton.me"}
@@ -78,9 +78,8 @@ def blocked(email: str) -> bool:
     )
 
 
-def add_contact(campaign: Campaign, first_name: str, firm: str, email: str, city: str, actor: str, source: str) -> dict[str, str]:
-    """Add one person, or say why not. `result` is good, warn or bad; a good result can also be someone already added."""
-    email = (email or "").strip().lower()
+def refusal(campaign: Campaign, first_name: str, firm: str, email: str) -> dict[str, str] | None:
+    """Why this person can't be added, or None if they can. `email` is already clean and lower case."""
     if not first_name or not firm or not _EMAIL.match(email):
         return {"line": email or firm, "result": "bad", "message": "Check the format"}
     local, domain = email.split("@")
@@ -96,6 +95,15 @@ def add_contact(campaign: Campaign, first_name: str, firm: str, email: str, city
         return {"line": email, "result": "warn", "message": "Free email, use a work address"}
     if domain.endswith("zinwe.io") or domain.endswith("zinwe.tech"):
         return {"line": email, "result": "warn", "message": "Our own address, skipped"}
+    return None
+
+
+def add_contact(campaign: Campaign, first_name: str, firm: str, email: str, city: str, actor: str, source: str) -> dict[str, str]:
+    """Add one person, or say why not. `result` is good, warn or bad; a good result can also be someone already added."""
+    email = (email or "").strip().lower()
+    refused = refusal(campaign, first_name, firm, email)
+    if refused:
+        return refused
     contact = Contact.objects.create(
         campaign=campaign, first_name=first_name[:80], firm=firm[:160], email=email, city=(city or "")[:80],
         next_date=today(), added_by=actor,
@@ -117,6 +125,33 @@ def import_contacts(campaign: Campaign, text: str, actor: str) -> list[dict[str,
             result = add_contact(campaign, parts[0], parts[1], parts[2], parts[3], actor, "Added by hand")
             results.append({**result, "line": parts[2].lower() if result["message"] != "Check the format" else line.strip()})
     return results
+
+
+def review_file(campaign: Campaign, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What adding these rows would do, adding nothing. A later row at the same firm as an earlier one is refused."""
+    seen: set[str] = set()
+    out = []
+    for row in rows:
+        email = row["email"].strip().lower()
+        verdict = refusal(campaign, row["first_name"], row["firm"], email) or {"result": "ready", "message": "Ready to add"}
+        if verdict["result"] == "ready":
+            domain = email.split("@")[1]
+            if domain in seen:
+                verdict = {"result": "warn", "message": "Same firm as an earlier row, skipped"}
+            seen.add(domain)
+        out.append({**row, "result": verdict["result"], "message": verdict["message"]})
+    return out
+
+
+@transaction.atomic
+def add_from_file(campaign: Campaign, rows: list[dict[str, Any]], actor: str) -> int:
+    """Add the rows that review as ready. Refuses everything else, exactly as the review showed."""
+    added = 0
+    for row in review_file(campaign, rows):
+        if row["result"] == "ready":
+            add_contact(campaign, row["first_name"], row["firm"], row["email"], row["city"], actor, "Added from a file")
+            added += 1
+    return added
 
 
 def import_sheet_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -143,6 +178,16 @@ def _suppress(contact: Contact, reason: str, actor: str) -> None:
     _log(contact, reason, actor)
 
 
+def _step_or_end(contact: Contact, n: int) -> int:
+    """Patterns differ in length: email `n` if this campaign has it, else 0, nothing planned."""
+    return n if contact.campaign.emails.filter(n=n).exists() else 0
+
+
+def _schedule(contact: Contact, n: int, when: date | None) -> None:
+    contact.next_email = _step_or_end(contact, n)
+    contact.next_date = when if contact.next_email else None
+
+
 ACTIONS = ("yes", "signed", "installed", "notnow", "question", "resume", "noreply", "no", "bounce", "complaint")
 
 
@@ -156,26 +201,25 @@ def act(contact: Contact, action: str, actor: str, note: str = "") -> Contact:
     now = today()
     was_cold = contact.status in (Status.NEW, Status.COLD, Status.WAITING)
     if action in ("yes", "notnow", "question", "no") and contact.replied_at is None:
-        contact.replied_at = now
+        contact.replied_at, contact.replied_step = now, contact.last_email
     if action == "yes":
         contact.status, contact.opted_in_at = Status.OPTED, now
         contact.proof = (note or contact.proof or 'Reply: "yes"')[:240]
-        contact.next_email = max(3, contact.next_email or 0, contact.last_email + 1)
-        if contact.installed and contact.next_email < 5:
-            contact.next_email = 5
-        contact.next_date, contact.reason = now, ""
+        target = max(3, contact.next_email or 0, contact.last_email + 1)
+        _schedule(contact, 5 if contact.installed and target < 5 else target, now)
+        contact.reason = ""
         _log(contact, "Replied yes", actor)
     elif action == "signed":
         contact.signed_up_at = contact.signed_up_at or now
         if contact.status != Status.OPTED:
             contact.status = Status.SIGNED
         if was_cold:
-            contact.next_email, contact.next_date = 3, now
+            _schedule(contact, 3, now)
         _log(contact, "Signed up", actor)
     elif action == "installed":
         contact.installed = True
         if 2 < contact.next_email < 5:
-            contact.next_email = 5
+            _schedule(contact, 5, contact.next_date)
         _log(contact, "Installed, setup emails skipped", actor)
     elif action == "notnow":
         contact.status, contact.next_email, contact.next_date = Status.SNOOZED, 0, None
@@ -219,7 +263,7 @@ def unsubscribe(token: str) -> Contact | None:
     if contact.status != Status.SUPPRESSED:
         with transaction.atomic():
             if contact.replied_at is None:
-                contact.replied_at = today()
+                contact.replied_at, contact.replied_step = today(), contact.last_email
             _suppress(contact, "Unsubscribed", "")
             contact.save()
     return contact
@@ -236,7 +280,7 @@ def after_send(contact: Contact, n: int, steps: dict[int, CampaignEmail]) -> Non
     elif contact.status == Status.SIGNED and n >= 5:
         contact.status, contact.next_email, contact.next_date = Status.CLOSED, 0, None
         contact.reason = 'Signed up, no "yes" for tips'
-    elif n == LAST_EMAIL:
+    elif n == max(steps):
         contact.status, contact.next_email, contact.next_date = Status.FINISHED, 0, None
         contact.reason = "Flow complete"
     else:
@@ -285,6 +329,7 @@ def checks(campaign: Campaign) -> list[dict[str, Any]]:
         {"key": "domain", "label": "Send from a separate domain, not zinwe.io", "done": separate_domain()},
         {"key": "dns", "label": "SPF, DKIM and DMARC pass", "done": all(dns.get(k) for k in ("spf", "dkim", "dmarc"))},
         {"key": "rules", "label": "Check the cold email rules for the USA and India", "done": bool(campaign.rules_checked_at)},
+        {"key": "emails", "label": "Read every email for this audience", "done": bool(campaign.emails_read_at)},
         {"key": "test", "label": "Send a test email to yourself", "done": bool(campaign.test_sent_at)},
         {"key": "contacts", "label": "Audience has contacts", "done": campaign.contacts.filter(status__in=SENDABLE).exists()},
     ]
@@ -329,6 +374,79 @@ def pause(campaign: Campaign, reason: str = "") -> Campaign:
     return campaign
 
 
+# --- The email pattern ------------------------------------------------------------
+
+
+def pattern_open(campaign: Campaign) -> bool:
+    """Emails can be added or removed until the first one is approved, so nobody's place in the flow shifts."""
+    return not (
+        OutreachSend.objects.filter(contact__campaign=campaign).exists() or campaign.contacts.filter(next_email__gt=2).exists()
+    )
+
+
+def _check_fits(n: int, template: EmailTemplate) -> None:
+    """Email 1 and 2 are the only cold emails, and only they are, so a template can't add a third."""
+    cold = template.kind == EmailTemplate.Kind.COLD
+    if n <= 2 and not cold:
+        raise OutreachError("Email 1 and Email 2 can only use a Cold template.")
+    if n > 2 and cold:
+        raise OutreachError("A Cold template can only be used for Email 1 or Email 2.")
+
+
+def add_step(campaign: Campaign, template: EmailTemplate | None = None) -> CampaignEmail:
+    if not pattern_open(campaign):
+        raise OutreachError("Emails can't be added once sending has started. You can still edit their text.")
+    last = campaign.emails.order_by("-n").first()
+    n, week = last.n + 1, last.week + 1
+    if template is not None:
+        _check_fits(n, template)
+    return CampaignEmail.objects.create(
+        campaign=campaign, n=n, stage=template.kind if template else "Tips", when="On yes" if n == 3 else f"Week {week}", week=week,
+        subject=template.subject if template else "New email", body=template.body if template else "<p>Hi {{FirstName}},</p><p>Write your email here.</p><p>Vishal</p>",
+        template=template,
+    )
+
+
+def use_template(campaign: Campaign, n: int, template: EmailTemplate) -> None:
+    """Copy a template over one email. The text changed, so "I read them all" has to be ticked again."""
+    if not pattern_open(campaign):
+        raise OutreachError("Templates can't be applied once sending has started. You can still edit the text.")
+    step = campaign.emails.filter(n=n).first()
+    if step is None:
+        raise OutreachError("That email doesn't exist.")
+    _check_fits(n, template)
+    step.subject, step.body, step.template, step.stage = template.subject, template.body, template, template.kind
+    step.save(update_fields=["subject", "body", "template", "stage"])
+    campaign.emails_read_at = None
+    campaign.save(update_fields=["emails_read_at"])
+
+
+def save_as_template(campaign: Campaign, n: int, name: str) -> EmailTemplate:
+    """A copy of this email in the library. Later edits on either side stay on that side."""
+    step = campaign.emails.filter(n=n).first()
+    if step is None:
+        raise OutreachError("That email doesn't exist.")
+    if not name.strip():
+        raise OutreachError("Give the template a name.")
+    kinds = EmailTemplate.Kind
+    kind = kinds.COLD if n <= 2 else step.stage if step.stage in kinds.values and step.stage != kinds.COLD else kinds.TIPS
+    return EmailTemplate.objects.create(name=name.strip()[:120], kind=kind, subject=step.subject, body=step.body)
+
+
+@transaction.atomic
+def remove_step(campaign: Campaign, n: int) -> None:
+    if not pattern_open(campaign):
+        raise OutreachError("Emails can't be removed once sending has started.")
+    if n <= 2:
+        raise OutreachError("Email 1 and Email 2 are the two cold emails, so they stay.")
+    deleted, _ = campaign.emails.filter(n=n).delete()
+    if not deleted:
+        raise OutreachError("That email doesn't exist.")
+    for step in campaign.emails.filter(n__gt=n).order_by("n"):
+        step.n -= 1
+        step.save(update_fields=["n"])
+
+
 # --- Sending ----------------------------------------------------------------------
 
 
@@ -336,27 +454,23 @@ def fill(text: str, contact: Contact) -> str:
     return text.replace("{{FirstName}}", contact.first_name).replace("{{Firm}}", contact.firm)
 
 
+def _fill_html(text: str, contact: Contact) -> str:
+    """Names go into HTML here, so a firm called "A&B <Co>" stays text."""
+    return text.replace("{{FirstName}}", html.escape(contact.first_name)).replace("{{Firm}}", html.escape(contact.firm))
+
+
 def _body(step: CampaignEmail, contact: Contact) -> str:
-    """The text for this contact. Email 5's signed-up line goes only to people who signed up but never said yes."""
+    """The HTML for this contact. Email 5's signed-up line goes only to people who signed up but never said yes."""
     keep = contact.status == Status.SIGNED
-    return _SIGNED_ONLY.sub((lambda m: m.group(1) + "\n\n") if keep else "", fill(step.body, contact))
-
-
-def _html(text: str) -> str:
-    def paragraph(block: str) -> str:
-        safe = html.escape(block).replace("\n", "<br>")
-        safe = re.sub(r"(https?://[^\s<]+)", r'<a href="\1">\1</a>', safe)
-        return f'<p style="margin:0 0 14px;">{safe}</p>'
-
-    return "".join(paragraph(b) for b in re.split(r"\n{2,}", text.strip()))
+    return email_html.drop_empty(_SIGNED_ONLY.sub((lambda m: m.group(1)) if keep else "", email_html.as_html(step.body)))
 
 
 def _context(step: CampaignEmail, contact: Contact, unsubscribe_url: str) -> dict[str, Any]:
     body = _body(step, contact)
     return {
         "subject": fill(step.subject, contact),
-        "body_text": body,
-        "body_html": _html(body),
+        "body_text": fill(email_html.to_text(body), contact),
+        "body_html": email_html.styled(_fill_html(body, contact)),
         "unsubscribe_url": unsubscribe_url,
         "postal_address": settings.ZINWE_OUTREACH_POSTAL_ADDRESS,
     }
@@ -499,16 +613,22 @@ def report(campaign: Campaign) -> dict[str, Any]:
     unsubscribed = contacts.filter(reason__in=["Unsubscribed", "Said no or unsubscribed"]).count()
     complaints = contacts.filter(reason="Spam complaint").count()
     by_step = dict(sends.values_list("n").annotate(c=Count("id")).order_by())
+    replies = dict(contacts.filter(replied_at__isnull=False).values_list("replied_step").annotate(c=Count("id")).order_by())
+    replied = contacts.filter(replied_at__isnull=False).count()
     rate = lambda n: round(n / emailed * 100, 1) if emailed else 0  # noqa: E731
     return {
         "funnel": [
             {"label": "Emailed", "value": emailed},
-            {"label": "Replied", "value": contacts.filter(replied_at__isnull=False).count()},
+            {"label": "Replied", "value": replied},
             {"label": "Said yes", "value": contacts.filter(opted_in_at__isnull=False).count()},
             {"label": "Signed up", "value": contacts.filter(signed_up_at__isnull=False).count()},
             {"label": "Installed", "value": contacts.filter(installed=True).count()},
         ],
-        "by_email": [{"n": s.n, "subject": s.subject, "stage": s.stage, "sent": by_step.get(s.n, 0)} for s in campaign.emails.all()],
+        "by_email": [
+            {"n": s.n, "subject": s.subject, "stage": s.stage, "sent": by_step.get(s.n, 0), "replies": replies.get(s.n, 0)}
+            for s in campaign.emails.all()
+        ],
+        "reply_rate": rate(replied),
         "health": {
             "bounce_rate": rate(bounced), "unsubscribe_rate": rate(unsubscribed), "complaints": complaints,
         },
