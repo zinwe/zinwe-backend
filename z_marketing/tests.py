@@ -166,6 +166,8 @@ class SendTests(Base):
         self.assertEqual(m.extra_headers["List-Unsubscribe-Post"], "List-Unsubscribe=One-Click")
         self.assertTrue(m.extra_headers["Message-ID"].endswith("@zinwe.tech>"))
         self.assertIn("SKYTECHNO", m.body)
+        self.assertNotIn("<img", m.alternatives[0][0])  # reads as a personal note: no logo (owner, 2026-11-02)
+        self.assertNotIn("utm_", m.body)  # the address is visible to the reader
         c.refresh_from_db()
         self.assertEqual((c.status, c.last_email, c.next_email), (Status.COLD, 1, 2))
 
@@ -270,6 +272,9 @@ class LaunchTests(Base):
         records["zinwe.tech"] = ["v=spf1 include:_spf.reach.hostinger.com ~all"]
         with mock.patch("z_marketing.outreach._txt", side_effect=lambda n: records[n]):
             self.assertFalse(outreach.check_dns(self.campaign)["spf"])
+        records["_dmarc.zinwe.tech"] = ["v=DMARC1; p=none", "v=DMARC1; p=none; rua=mailto:x@y.z"]
+        with mock.patch("z_marketing.outreach._txt", side_effect=lambda n: records[n]):
+            self.assertFalse(outreach.check_dns(self.campaign)["dmarc"])
 
 
 class ApiTests(Base):

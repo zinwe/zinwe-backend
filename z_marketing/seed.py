@@ -1,7 +1,7 @@
 """The first audience and campaign (migration 0002). No contacts: those are hand-picked in the admin."""
 from __future__ import annotations
 
-_LINK = "https://zinwe.io/?utm_source=cold-email&utm_medium=email&utm_campaign=2026-11-us-cpa"
+_LINK = "https://zinwe.io"  # the address is visible in the email, so it stays clean
 
 AUDIENCE = {
     "name": "Texas CPA firms",

@@ -133,7 +133,7 @@ class RedactTests(TestCase):
 
 
 class EmailLogoTests(TestCase):
-    """Every HTML email shows the official Zinwe logo (owner rule, 2026-10-22): the hosted image by default,
+    """Every HTML email but cold outreach shows the official Zinwe logo (owner rule, 2026-10-22): the hosted image by default,
     with alt text styled as the wordmark for mail apps that block images; the text wordmark only when turned
     off. Nothing is ever attached (an inline cid logo made Gmail drop the emails)."""
 
@@ -170,7 +170,7 @@ class EmailLogoTests(TestCase):
 
         root = Path(__file__).resolve().parent / "templates" / "z_notification"
         missing = [p.parent.name for p in root.glob("*/body.html") if "_brand.html" not in p.read_text(encoding="utf-8")]
-        self.assertEqual(missing, [])
+        self.assertEqual(missing, ["outreach_email"])  # the one exception (owner, 2026-11-02): cold email stays personal
 
 
 class PlainTextIsNeverEscapedTests(TestCase):

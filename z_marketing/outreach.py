@@ -305,7 +305,7 @@ def check_dns(campaign: Campaign) -> dict[str, bool]:
         result = {
             "spf": any(r.startswith("v=spf1") and settings.ZINWE_OUTREACH_SPF_INCLUDE in r for r in root),
             "dkim": any("v=DKIM1" in r for r in _txt(f"{settings.ZINWE_OUTREACH_DKIM_SELECTOR}._domainkey.{domain}")),
-            "dmarc": any(r.startswith("v=DMARC1") for r in _txt(f"_dmarc.{domain}")),
+            "dmarc": sum(r.startswith("v=DMARC1") for r in _txt(f"_dmarc.{domain}")) == 1,  # two records void DMARC
         }
     except OSError as exc:
         raise OutreachError("Couldn't reach public DNS. Try again in a minute.") from exc
