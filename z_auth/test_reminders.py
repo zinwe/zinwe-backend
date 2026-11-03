@@ -129,4 +129,5 @@ class ReminderTests(TestCase):
         out = StringIO()
         call_command("run_jobs", "--once", stdout=out)
         self.assertIn("renewal reminders: 1 reminder(s)", out.getvalue())
-        self.assertEqual(len(mail.outbox), 1)
+        # run_jobs runs every job: on an empty database the weekly version plan also emails the founder.
+        self.assertEqual([m.to for m in mail.outbox if "asha@acme.in" in m.to], [["asha@acme.in"]])
