@@ -22,9 +22,9 @@ BASE = "/api/admin/marketing/wa"
 def sheet(rows: list[list[str]]) -> SimpleUploadedFile:
     book = Workbook()
     ws = book.active
-    ws.append(["Business Name", "Phone", "Segment", "Country", "City", "First Name", "Source", "Useful Info"])
+    ws.append(["Business Name", "Phone", "Segment", "Country", "City", "First Name", "Source", "Useful Info", "Opt-in"])
     for r in rows:
-        ws.append(r)
+        ws.append(r if len(r) > 8 else [*r, "Y"])
     out = io.BytesIO()
     book.save(out)
     return SimpleUploadedFile("contacts.xlsx", out.getvalue())
@@ -37,7 +37,7 @@ class WaBase(TestCase):
         self.api.force_authenticate(self.staff)
         self.first = WaTemplate.objects.get(name="Pen drive check, traders")
         self.campaign = WaCampaign.objects.create(
-            name="Delhi traders", first=self.first, followup=WaTemplate.objects.get(kind="followup"), daily_limit=2,
+            name="Delhi traders", first=self.first, followup=WaTemplate.objects.get(name="One gentle follow-up"), daily_limit=2,
         )
 
     def contact(self, phone: str = "+919810000101", **extra) -> WaContact:  # type: ignore[no-untyped-def]
@@ -67,6 +67,7 @@ class UploadTests(WaBase):
             ["Verma Crafts again", "+91 98100 00201", "Traders", "India", "Noida", "", "", ""],
             ["Lone Star Tax", "512 555 0207", "CPA firms", "USA", "Austin", "", "", "Has a new office"],
             ["", "98100 00300", "Traders", "India", "Delhi", "", "", ""],
+            ["Cold Lead", "98100 00400", "Traders", "India", "Delhi", "", "Directory", "", "N"],
         ]
         r = self.api.post(f"{BASE}/contacts/upload/", {"file": sheet(rows)}, format="multipart")
         self.assertEqual(r.status_code, 200)
@@ -77,6 +78,7 @@ class UploadTests(WaBase):
         self.assertEqual(got[3], ("bad", "Repeat row, skipped"))
         self.assertEqual(got[4][0], "warn")
         self.assertEqual(got[5], ("bad", "Missing Business Name"))
+        self.assertEqual(got[6], ("bad", "No opt-in: email or LinkedIn first, WhatsApp once they agree"))
         self.assertFalse(WaContact.objects.filter(firm="Verma Crafts").exists())  # review adds nothing
 
         choices = {"6": {"include": False}, "4": {"include": True, "campaign": self.campaign.id, "segment": "Exporters"}}
@@ -94,6 +96,7 @@ class UploadTests(WaBase):
         r = self.api.post(f"{BASE}/contacts/upload/", {"file": SimpleUploadedFile("x.xlsx", out.getvalue())}, format="multipart")
         self.assertEqual(r.status_code, 400)
         self.assertIn("Segment", r.json()["detail"])
+        self.assertIn("Opt-in", r.json()["detail"])
 
 
 class FlowTests(WaBase):
@@ -172,3 +175,94 @@ class FlowTests(WaBase):
 
     def test_staff_only(self) -> None:
         self.assertEqual(APIClient().get(f"{BASE}/today/").status_code, 401)
+
+
+class SequenceTests(WaBase):
+    def live(self, **extra) -> WaCampaign:  # type: ignore[no-untyped-def]
+        for k, v in extra.items():
+            setattr(self.campaign, k, v)
+        self.campaign.status = WaCampaign.Status.LIVE
+        self.campaign.save()
+        return self.campaign
+
+    def test_four_touches_then_nothing(self) -> None:
+        touch4 = WaTemplate.objects.create(name="Extra", kind="touch4", text="Hi {{FirstName}}")
+        self.live(daily_limit=10, touch3=WaTemplate.objects.get(name="Day 7 polite close"), touch4=touch4)
+        c = self.contact()
+        start = whatsapp.today()
+        whatsapp.mark_sent(c, "first", "Hi", "staff@zinwe.io")
+        whatsapp.mark_sent(c, "followup", "Nudge", "staff@zinwe.io")
+        c.refresh_from_db()
+        self.assertEqual((c.step, c.next_date), (2, start + timedelta(days=7)))  # the polite close, day 7
+        WaContact.objects.filter(pk=c.pk).update(next_date=start)
+        self.assertEqual([i["kind"] for i in whatsapp.queue()], ["touch3"])
+        whatsapp.mark_sent(c, "touch3", "New point", "staff@zinwe.io")
+        c.refresh_from_db()
+        self.assertEqual((c.step, c.next_date), (3, start + timedelta(days=60)))
+        WaContact.objects.filter(pk=c.pk).update(next_date=start)
+        self.assertEqual([i["kind"] for i in whatsapp.queue()], ["touch4"])
+        whatsapp.mark_sent(c, "touch4", "Last one", "staff@zinwe.io")
+        c.refresh_from_db()
+        self.assertEqual((c.step, c.next_date), (4, None))
+        self.assertEqual(whatsapp.queue(), [])
+        self.assertEqual(list(c.messages.values_list("kind", flat=True)), ["first", "followup", "touch", "touch"])
+        self.assertEqual(whatsapp._sent_today(), 4)  # every no-reply touch counts against the daily limit
+
+    def test_no_touch3_template_means_the_followup_is_the_last(self) -> None:
+        self.live()
+        c = self.contact()
+        whatsapp.mark_sent(c, "first", "Hi", "staff@zinwe.io")
+        whatsapp.mark_sent(c, "followup", "Nudge", "staff@zinwe.io")
+        c.refresh_from_db()
+        self.assertEqual((c.step, c.next_date), (2, None))
+
+    def test_yes_starts_the_track_sequence(self) -> None:
+        self.live()
+        c = self.contact(track="data")
+        whatsapp.mark_sent(c, "first", "Hi", "staff@zinwe.io")
+        whatsapp.record_reply(c, "HAAN", "staff@zinwe.io")
+        whatsapp.act(c, "interested")
+        whatsapp.mark_sent(c, "reply", "Thanks!", "staff@zinwe.io")
+        c.refresh_from_db()
+        self.assertEqual((c.yes_date, c.next_date), (whatsapp.today(), None))
+        item = whatsapp.queue()[0]
+        self.assertEqual((item["kind"], item["template"]), ("nurture", "Every YES, day 0: two questions + link"))
+        self.assertIn("utm_campaign=2026-11-kelash", whatsapp.draft(c, "nurture")["text"])
+        whatsapp.mark_sent(c, "nurture", "Two questions", "staff@zinwe.io")
+        self.assertEqual(whatsapp.queue(), [])  # day 1 is not due yet
+        WaContact.objects.filter(pk=c.pk).update(yes_date=whatsapp.today() - timedelta(days=1))
+        c.refresh_from_db()
+        self.assertEqual(whatsapp.queue()[0]["template"], "Data track, day 1: setup + first alert")
+        c.track = "chat"
+        c.save()
+        self.assertEqual(whatsapp.next_nurture(c).name, "Chat track, day 1: setup + first task")
+
+    def test_a_reply_holds_the_sequence_and_stop_ends_it(self) -> None:
+        c = self.contact()
+        whatsapp.act(c, "interested")
+        self.assertEqual(len(whatsapp.queue()), 1)
+        whatsapp.record_reply(c, "Kitne ka hai?", "staff@zinwe.io")
+        self.assertEqual(whatsapp.queue(), [])  # answer them first
+        whatsapp.record_reply(c, "mat bhejo", "staff@zinwe.io")
+        c.refresh_from_db()
+        self.assertEqual(c.status, Status.STOP)
+        self.assertIsNone(whatsapp.next_nurture(c))
+
+    def test_touch_days_must_stay_in_order_within_90(self) -> None:
+        url = f"{BASE}/campaigns/{self.campaign.id}/"
+        self.assertEqual(self.api.patch(url, {"touch3_days": 2}, format="json").status_code, 400)
+        self.assertEqual(self.api.patch(url, {"touch4_days": 120}, format="json").status_code, 400)
+        r = self.api.patch(url, {"touch3_days": 21, "touch4_days": 45}, format="json")
+        self.assertEqual((r.status_code, r.json()["touch4_days"]), (200, 45))
+
+    def test_seeded_outreach_stops_after_day_7(self) -> None:
+        self.assertEqual(WaCampaign().touch3_days, 7)
+        self.assertFalse(WaTemplate.objects.filter(kind="touch4").exists())
+        outreach = WaTemplate.objects.filter(name__regex=r"^(V\d|Day [37] )")  # the IT firm and agency campaign
+        self.assertEqual(outreach.count(), 9)
+        for text in outreach.values_list("text", flat=True):
+            self.assertIn("Cherry on top", text)
+
+    def test_seeded_copy_has_no_pc_count(self) -> None:
+        for text in WaTemplate.objects.values_list("text", flat=True):
+            self.assertNotIn("3 PCs", text)

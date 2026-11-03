@@ -5,6 +5,10 @@ Zinwe never sends a WhatsApp message itself. WhatsApp bans numbers that send aut
 browser tools, and business-initiated messages through Meta's platform need an opt-in first. So staff open each chat
 from the admin (wa.me with the text filled in), press Send on the Zinwe WhatsApp Business app, then mark it sent here.
 Drafts come from the campaign's templates; with ANTHROPIC_API_KEY set, Claude personalises them from Useful Info.
+
+Someone who never replies gets at most four messages (first, follow-up, touch 3, touch 4), each due a set number of
+days after the first. A YES starts the after-YES sequence: templates of kind "nurture", picked by the contact's track
+and due `day` days after the YES.
 """
 from __future__ import annotations
 
@@ -36,10 +40,13 @@ HEADERS = {
     "first_name": ("first name", "firstname", "first", "name", "contact name"),
     "source": ("source", "where found", "found at"),
     "info": ("useful info", "info", "notes"),
+    "opt_in": ("opt-in", "opt in", "optin", "opted in", "consent"),
 }
+OPT_IN = {"y", "yes"}  # only numbers that opted in, or were introduced, may get a WhatsApp message
 REQUIRED = {"firm": "Business Name", "phone": "Phone", "segment": "Segment", "country": "Country", "city": "City"}
-TEMPLATE_COLUMNS = ["Business Name", "Phone", "Segment", "Country", "City", "First Name", "Source", "Useful Info"]
+TEMPLATE_COLUMNS = ["Business Name", "Phone", "Segment", "Country", "City", "First Name", "Source", "Opt-in", "Useful Info"]
 ACTIONS = ("interested", "signed", "notnow", "stop", "pause", "resume")
+COLD = [WaMessage.Kind.FIRST, WaMessage.Kind.FOLLOWUP, WaMessage.Kind.TOUCH]  # count against the daily limit
 
 
 class WaError(Exception):
@@ -80,6 +87,8 @@ def _columns(header: list[str]) -> dict[str, int]:
             if clean in names and field not in found:
                 found[field] = at
     missing = [label for field, label in REQUIRED.items() if field not in found]
+    if "opt_in" not in found:
+        missing.append("Opt-in")
     if missing:
         raise FileProblem(f"This file has no {', '.join(missing)} column. Use the template, or rename the column.")
     return found
@@ -127,6 +136,8 @@ def parse_file(upload: Any, name: str, size: int) -> list[dict[str, Any]]:
         missing = [label for f, label in REQUIRED.items() if not cell(f)]
         if missing:
             item.update(result="bad", message=f"Missing {', '.join(missing)}")
+        elif cell("opt_in").lower() not in OPT_IN:
+            item.update(result="bad", message="No opt-in: email or LinkedIn first, WhatsApp once they agree")
         elif not phone:
             item.update(result="bad", message="Not a phone number. Add the country code")
         elif phone in stopped:
@@ -183,8 +194,8 @@ def template_file() -> bytes:
     for cell in sheet[1]:
         cell.font = Font(bold=True)
     sheet.append(["Sample Exports (delete this row)", "+91 98100 00000", "Traders and export houses", "India", "Delhi", "Rakesh",
-                  "IndiaMART listing", '{"website":"sample.example","team_size":"12"}'])
-    for letter, width in zip("ABCDEFGH", (30, 18, 26, 10, 14, 14, 22, 40), strict=True):
+                  "Replied to our email", "Y", '{"website":"sample.example","team_size":"12"}'])
+    for letter, width in zip("ABCDEFGHI", (30, 18, 26, 10, 14, 14, 22, 8, 40), strict=True):
         sheet.column_dimensions[letter].width = width
     sheet.freeze_panes = "A2"
     out = BytesIO()
@@ -197,22 +208,38 @@ def template_file() -> bytes:
 
 def fill(text: str, contact: WaContact) -> str:
     first = contact.first_name or "there"
-    return text.replace("{{FirstName}}", first).replace("{{Firm}}", contact.firm)
+    for key, value in (("{{FirstName}}", first), ("{{Firm}}", contact.firm), ("{{Business}}", contact.firm),
+                       ("{{City}}", contact.city)):
+        text = text.replace(key, value)
+    return text
 
 
 def _template_for(contact: WaContact, kind: str) -> WaTemplate | None:
     c = contact.campaign
     if c is None:
         return WaTemplate.objects.filter(kind=kind).first()
-    pick = {"first": c.first, "followup": c.followup, "interested": c.interested, "question": c.question, "notnow": c.notnow}
+    pick = {"first": c.first, "followup": c.followup, "touch3": c.touch3, "touch4": c.touch4, "interested": c.interested,
+            "question": c.question, "notnow": c.notnow}
     return pick.get(kind) or WaTemplate.objects.filter(kind=kind).first()
+
+
+def next_nurture(contact: WaContact) -> WaTemplate | None:
+    """The next after-YES message for this contact (due or not), or None when the sequence is done or never started."""
+    if contact.yes_date is None or contact.status not in (Status.INTERESTED, Status.SIGNED):
+        return None
+    return (
+        WaTemplate.objects.filter(kind=WaTemplate.Kind.NURTURE, track__in=["", contact.track], day__gt=contact.nurture_day)
+        .order_by("day", "track", "id")
+        .first()
+    )
 
 
 SYSTEM = (
     "You personalise WhatsApp messages that Vishal, founder of Zinwe (data protection and team tools for small offices "
     "on Windows PCs), sends by hand to small businesses. Rewrite the template for this one business using only the "
-    "details given. Keep its meaning, its offer and every instruction about replying (YES, STOP, LATER). Keep it under "
-    "400 characters, plain text, warm and short, no emojis. Never invent facts, numbers, links or features, and never "
+    "details given. If useful_info has notes, you may open with one short line drawn only from them. Keep its meaning, its "
+    "offer and every instruction about replying (YES, HAAN, STOP, LATER). Keep it under 400 characters, plain text, "
+    "warm and short, no emojis. Never invent facts, numbers, links, prices, discounts or features, and never "
     "mention their team size or anything that sounds like watching staff. Reply with the message text only."
 )
 
@@ -247,9 +274,9 @@ def _claude(template_text: str, contact: WaContact, their_last: str) -> str | No
 
 def draft(contact: WaContact, kind: str) -> dict[str, Any]:
     """The text to send next: {text, template, by}. `by` is "claude" when Claude personalised it."""
-    template = _template_for(contact, kind)
+    template = next_nurture(contact) if kind == "nurture" else _template_for(contact, kind)
     if template is None:
-        raise WaError("Add a template of this kind first.")
+        raise WaError("No after-YES message is left for this contact." if kind == "nurture" else "Add a template of this kind first.")
     base = fill(template.text, contact)
     last = contact.messages.filter(kind=Kind.THEIRS).last()
     personal = _claude(base, contact, last.text if last else "")
@@ -260,24 +287,40 @@ def draft(contact: WaContact, kind: str) -> dict[str, Any]:
 
 
 def _sent_today(campaign: WaCampaign | None = None) -> int:
-    q = WaMessage.objects.filter(kind__in=[Kind.FIRST, Kind.FOLLOWUP], at__date=today())
+    q = WaMessage.objects.filter(kind__in=COLD, at__date=today())
     return q.filter(contact__campaign=campaign).count() if campaign else q.count()
 
 
+NEXT_KIND = {0: "first", 1: "followup", 2: "touch3", 3: "touch4"}
+
+
 def queue() -> list[dict[str, Any]]:
-    """Follow-ups and first messages due today in live campaigns, within each campaign's daily limit."""
+    """
+    What is due today: after-YES messages first (no daily limit: these people asked for them), then no-reply touches
+    and first messages in live campaigns, within each campaign's daily limit.
+    """
     out: list[dict[str, Any]] = []
     now = today()
+    warm = (
+        WaContact.objects.filter(status__in=[Status.INTERESTED, Status.SIGNED], yes_date__isnull=False, needs_reply=False)
+        .exclude(paused_until__gt=now)
+        .select_related("campaign")
+        .order_by("yes_date", "id")
+    )
+    for contact in warm:
+        template = next_nurture(contact)
+        if template is not None and contact.yes_date + timedelta(days=template.day) <= now:
+            out.append({"contact": contact, "kind": "nurture", "template": template.name})
     for c in WaCampaign.objects.filter(status=WaCampaign.Status.LIVE):
         room = max(0, c.daily_limit - _sent_today(c))
         due = c.contacts.exclude(paused_until__gt=now)
-        followups = due.filter(status=Status.MESSAGED, step=1, next_date__lte=now, needs_reply=False)
+        touches = due.filter(status=Status.MESSAGED, step__in=[1, 2, 3], next_date__lte=now, needs_reply=False)
         firsts = due.filter(status=Status.READY, step=0).filter(Q(next_date__isnull=True) | Q(next_date__lte=now))
-        for contact in list(followups.order_by("next_date", "id")) + list(firsts.order_by("id")):
+        for contact in list(touches.order_by("next_date", "id")) + list(firsts.order_by("id")):
             if room <= 0:
                 break
-            kind = "followup" if contact.step == 1 else "first"
-            if kind == "followup" and not c.followup:
+            kind = NEXT_KIND[contact.step]
+            if kind != "first" and not getattr(c, kind):
                 continue
             out.append({"contact": contact, "kind": kind})
             room -= 1
@@ -298,15 +341,29 @@ def mark_sent(contact: WaContact, kind: str, text: str, actor: str) -> WaContact
     text = text.strip()
     if not text:
         raise WaError("Write the message first.")
-    if kind not in (Kind.FIRST, Kind.FOLLOWUP, Kind.REPLY):
+    if kind not in ("first", "followup", "touch3", "touch4", "nurture", "reply"):
         raise WaError("Unknown message type.")
-    WaMessage.objects.create(contact=contact, kind=kind, text=text[:2000], by=actor)
-    if kind == Kind.FIRST:
-        days = contact.campaign.followup_days if contact.campaign else 3
-        contact.status, contact.step, contact.next_date = Status.MESSAGED, 1, today() + timedelta(days=days)
-    elif kind == Kind.FOLLOWUP:
-        contact.step, contact.next_date = 2, None
-    else:
+    c = contact.campaign
+    if kind == "nurture":
+        template = next_nurture(contact)
+        if template is None:
+            raise WaError("No after-YES message is left for this contact.")
+        contact.nurture_day = template.day
+    stored = Kind.TOUCH if kind in ("touch3", "touch4") else kind
+    WaMessage.objects.create(contact=contact, kind=stored, text=text[:2000], by=actor)
+    start = contact.first_sent or today()
+    if kind == "first":
+        contact.status, contact.step, contact.first_sent = Status.MESSAGED, 1, today()
+        contact.next_date = today() + timedelta(days=c.followup_days if c else 3)
+    elif kind == "followup":
+        contact.step = 2
+        contact.next_date = start + timedelta(days=c.touch3_days) if c and c.touch3_id else None
+    elif kind == "touch3":
+        contact.step = 3
+        contact.next_date = start + timedelta(days=c.touch4_days) if c and c.touch4_id else None
+    elif kind == "touch4":
+        contact.step, contact.next_date = 4, None
+    elif kind == "reply":
         contact.needs_reply = False
     contact.save()
     return contact
@@ -321,7 +378,7 @@ def record_reply(contact: WaContact, text: str, actor: str) -> WaContact:
     if contact.status in (Status.READY, Status.MESSAGED, Status.NOTNOW):
         contact.status = Status.REPLIED
     contact.needs_reply, contact.next_date = True, None
-    if re.fullmatch(r"\W*(stop|unsubscribe|band karo)\W*", text, flags=re.I):
+    if re.fullmatch(r"\W*(stop|unsubscribe|band karo|mat bhejo)\W*", text, flags=re.I):
         _stop(contact, "Replied STOP")
     contact.save()
     return contact
@@ -336,6 +393,9 @@ def _stop(contact: WaContact, reason: str) -> None:
 def act(contact: WaContact, action: str) -> WaContact:
     if action not in ACTIONS:
         raise WaError("Unknown action.")
+    if action in ("interested", "signed") and contact.yes_date is None:
+        # A YES starts the after-YES sequence and ends the no-reply touches.
+        contact.yes_date, contact.nurture_day, contact.next_date = today(), -1, None
     if action == "interested":
         contact.status = Status.INTERESTED
     elif action == "signed":
@@ -373,7 +433,7 @@ def daily(days: int = 14) -> list[dict[str, Any]]:
     rows = (
         WaMessage.objects.filter(at__date__gte=start)
         .values("at__date")
-        .annotate(sent=Count("id", filter=Q(kind__in=[Kind.FIRST, Kind.FOLLOWUP])), replies=Count("id", filter=Q(kind=Kind.THEIRS)))
+        .annotate(sent=Count("id", filter=Q(kind__in=COLD)), replies=Count("id", filter=Q(kind=Kind.THEIRS)))
     )
     by_day = {r["at__date"]: r for r in rows}
     out = []

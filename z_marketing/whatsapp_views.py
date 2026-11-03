@@ -22,7 +22,7 @@ from .whatsapp import WaError
 class WaTemplateSerializer(serializers.ModelSerializer):
     class Meta:
         model = WaTemplate
-        fields = ["id", "name", "kind", "text", "updated_at"]
+        fields = ["id", "name", "kind", "text", "track", "day", "updated_at"]
         read_only_fields = ["updated_at"]
 
 
@@ -40,9 +40,13 @@ class WaContactSerializer(serializers.ModelSerializer):
         model = WaContact
         fields = [
             "id", "campaign", "campaign_name", "phone", "first_name", "firm", "segment", "country", "city", "source", "info",
-            "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "last",
+            "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "last", "track", "yes_date",
+            "nurture_day", "first_sent",
         ]
-        read_only_fields = ["phone", "status", "step", "next_date", "needs_reply", "paused_until", "created_at"]
+        read_only_fields = [
+            "phone", "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "yes_date", "nurture_day",
+            "first_sent",
+        ]
 
     def get_last(self, obj: WaContact) -> dict[str, str] | None:
         m = obj.messages.last()
@@ -62,7 +66,7 @@ class WaCampaignSerializer(serializers.ModelSerializer):
         model = WaCampaign
         fields = [
             "id", "name", "audience", "audience_name", "goal", "status", "daily_limit", "followup_days", "first", "followup",
-            "interested", "question", "notnow", "stats", "created_at",
+            "interested", "question", "notnow", "touch3", "touch4", "touch3_days", "touch4_days", "stats", "created_at",
         ]
         read_only_fields = ["status", "created_at"]
 
@@ -74,6 +78,14 @@ class WaCampaignSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Keep it between 1 and 50 a day.")
         return value
 
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        days = [attrs.get(k, getattr(self.instance, k, d)) for k, d in (("followup_days", 3), ("touch3_days", 30), ("touch4_days", 60))]
+        if not days[0] < days[1] < days[2] <= 90:
+            raise serializers.ValidationError(
+                "Space the messages out: follow-up, then touch 3, then touch 4, all within 90 days of the first."
+            )
+        return attrs
+
 
 def _contact(pk: int) -> WaContact:
     return get_object_or_404(WaContact.objects.select_related("campaign"), pk=pk)
@@ -83,7 +95,10 @@ class WaTodayView(Staff):
     def get(self, request: Request) -> Response:
         items = whatsapp.queue()
         return Response({
-            "queue": [{"kind": i["kind"], "contact": WaContactSerializer(i["contact"]).data} for i in items],
+            "queue": [
+                {"kind": i["kind"], "template": i.get("template", ""), "contact": WaContactSerializer(i["contact"]).data}
+                for i in items
+            ],
             "replies": [
                 {**WaContactSerializer(c).data, "messages": WaMessageSerializer(c.messages.all(), many=True).data}
                 for c in whatsapp.replies()

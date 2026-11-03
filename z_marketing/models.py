@@ -257,18 +257,30 @@ def sender_address() -> str:
 
 
 class WaTemplate(models.Model):
-    """A WhatsApp message draft. {{FirstName}} and {{Firm}} are filled in per contact."""
+    """A WhatsApp message draft. {{FirstName}}, {{Firm}} (or {{Business}}) and {{City}} are filled in per contact."""
 
     class Kind(models.TextChoices):
         FIRST = "first", "First message"
         FOLLOWUP = "followup", "Follow-up"
+        TOUCH3 = "touch3", "No reply: polite close"
+        TOUCH4 = "touch4", "No reply: extra message"
         INTERESTED = "interested", "Reply: interested"
         QUESTION = "question", "Reply: question"
         NOTNOW = "notnow", "Reply: not now"
+        NURTURE = "nurture", "After YES"
+
+    class Track(models.TextChoices):
+        ALL = "", "Every YES"
+        DATA = "data", "Data safety"
+        DAY = "day", "Team's day"
+        CHAT = "chat", "Team chat"
 
     name = models.CharField(max_length=120)
     kind = models.CharField(max_length=12, choices=Kind.choices, default=Kind.FIRST)
     text = models.TextField(max_length=1000)
+    # After-YES messages only: which sequence it belongs to ("" = every YES) and how many days after the YES it is due.
+    track = models.CharField(max_length=4, choices=Track.choices, default="", blank=True)
+    day = models.PositiveSmallIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -280,7 +292,11 @@ class WaTemplate(models.Model):
 
 
 class WaCampaign(models.Model):
-    """One message sequence to one target audience: a first message, at most one follow-up, three kinds of reply."""
+    """
+    One message sequence to one target audience, for opted-in numbers. Someone who never replies gets the first message,
+    one follow-up (a tip) and a polite close (touch 3), then nothing. Touch 4 exists but stays off for outreach.
+    Three kinds of reply.
+    """
 
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
@@ -304,6 +320,10 @@ class WaCampaign(models.Model):
     interested = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
     question = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
     notnow = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
+    touch3 = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
+    touch4 = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
+    touch3_days = models.PositiveSmallIntegerField(default=7, help_text="Days after the first message.")
+    touch4_days = models.PositiveSmallIntegerField(default=60, help_text="Days after the first message.")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -335,8 +355,13 @@ class WaContact(models.Model):
     source = models.CharField(max_length=160)  # where the number was found
     info = models.JSONField(default=dict, blank=True)  # Useful Info: website, team_size, notes...
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.READY, db_index=True)
-    step = models.PositiveSmallIntegerField(default=0)  # 0 nothing sent, 1 first message, 2 follow-up
-    next_date = models.DateField(null=True, blank=True)  # when the next first message or follow-up is due
+    step = models.PositiveSmallIntegerField(default=0)  # 0 nothing sent, 1 first, 2 follow-up, 3 touch 3, 4 touch 4
+    next_date = models.DateField(null=True, blank=True)  # when the next no-reply message is due
+    first_sent = models.DateField(null=True, blank=True)  # touches 3 and 4 count their days from here
+    # After YES: which sequence they are on, when they said YES, and the day of the last after-YES message sent.
+    track = models.CharField(max_length=4, choices=WaTemplate.Track.choices, default="", blank=True)
+    yes_date = models.DateField(null=True, blank=True)
+    nurture_day = models.SmallIntegerField(default=-1)
     needs_reply = models.BooleanField(default=False)  # they wrote and nobody has answered yet
     paused_until = models.DateField(null=True, blank=True)
     added_by = models.EmailField(blank=True)
@@ -355,6 +380,8 @@ class WaMessage(models.Model):
     class Kind(models.TextChoices):
         FIRST = "first", "First message"
         FOLLOWUP = "followup", "Follow-up"
+        TOUCH = "touch", "No-reply touch"
+        NURTURE = "nurture", "After-YES message"
         REPLY = "reply", "Our reply"
         THEIRS = "theirs", "Their message"
 
