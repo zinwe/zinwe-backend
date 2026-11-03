@@ -321,6 +321,10 @@ ZINWE_OUTREACH_GAP_SECONDS = int(env_str("ZINWE_OUTREACH_GAP_SECONDS", "45"))
 # What the DNS check in admin -> Marketing -> Settings looks for (Zoho defaults).
 ZINWE_OUTREACH_SPF_INCLUDE = env_str("ZINWE_OUTREACH_SPF_INCLUDE", "include:zoho.in")
 ZINWE_OUTREACH_DKIM_SELECTOR = env_str("ZINWE_OUTREACH_DKIM_SELECTOR", "zmail")
+# WhatsApp outreach (z_marketing/whatsapp.py): staff send every message by hand. With a key, Claude personalises each
+# draft from the contact's Useful Info; empty: drafts are the templates with the name and business filled in.
+ANTHROPIC_API_KEY = env_str("ANTHROPIC_API_KEY", "")
+ZINWE_WA_MODEL = env_str("ZINWE_WA_MODEL", "claude-opus-5-5")
 EMAIL_HOST = env_str("EMAIL_HOST", "localhost")
 EMAIL_PORT = int(env_str("EMAIL_PORT", "25"))
 EMAIL_HOST_USER = env_str("EMAIL_HOST_USER", "")

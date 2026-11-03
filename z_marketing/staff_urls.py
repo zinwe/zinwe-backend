@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views
+from . import views, whatsapp_views as wa
 
 app_name = "z_marketing_staff"
 
@@ -23,4 +23,17 @@ urlpatterns = [
     path("campaigns/<int:pk>/<slug:action>/", views.CampaignActionView.as_view(), name="campaign-action"),
     path("contacts/<int:pk>/act/", views.ContactActView.as_view(), name="contact-act"),
     path("blocked/", views.BlockedView.as_view(), name="blocked"),
+    # WhatsApp outreach (z_marketing/whatsapp.py): staff send every message themselves.
+    path("wa/today/", wa.WaTodayView.as_view(), name="wa-today"),
+    path("wa/contacts/", wa.WaContactListView.as_view(), name="wa-contacts"),
+    path("wa/contacts/upload/", wa.WaUploadView.as_view(), name="wa-upload"),
+    path("wa/contact-template/", wa.WaContactTemplateView.as_view(), name="wa-contact-template"),
+    path("wa/contacts/<int:pk>/", wa.WaContactDetailView.as_view(), name="wa-contact"),
+    path("wa/contacts/<int:pk>/<slug:action>/", wa.WaContactActionView.as_view(), name="wa-contact-action"),
+    path("wa/campaigns/", wa.WaCampaignListView.as_view(), name="wa-campaigns"),
+    path("wa/campaigns/<int:pk>/", wa.WaCampaignDetailView.as_view(), name="wa-campaign"),
+    path("wa/campaigns/<int:pk>/<slug:action>/", wa.WaCampaignActionView.as_view(), name="wa-campaign-action"),
+    path("wa/templates/", wa.WaTemplateListView.as_view(), name="wa-templates"),
+    path("wa/templates/<int:pk>/", wa.WaTemplateDetailView.as_view(), name="wa-template"),
+    path("wa/analytics/", wa.WaAnalyticsView.as_view(), name="wa-analytics"),
 ]

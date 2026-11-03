@@ -249,3 +249,128 @@ def sender_address() -> str:
     """The bare address outreach comes from."""
     value = settings.ZINWE_OUTREACH_FROM
     return value.split("<")[-1].rstrip(">").strip().lower()
+
+
+# --- WhatsApp outreach ---------------------------------------------------------------------------------------------
+# A person sends every message from the Zinwe WhatsApp Business app: Zinwe drafts, opens the chat with the text filled
+# in, and records what was sent and what came back. Nothing here sends a WhatsApp message by itself.
+
+
+class WaTemplate(models.Model):
+    """A WhatsApp message draft. {{FirstName}} and {{Firm}} are filled in per contact."""
+
+    class Kind(models.TextChoices):
+        FIRST = "first", "First message"
+        FOLLOWUP = "followup", "Follow-up"
+        INTERESTED = "interested", "Reply: interested"
+        QUESTION = "question", "Reply: question"
+        NOTNOW = "notnow", "Reply: not now"
+
+    name = models.CharField(max_length=120)
+    kind = models.CharField(max_length=12, choices=Kind.choices, default=Kind.FIRST)
+    text = models.TextField(max_length=1000)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class WaCampaign(models.Model):
+    """One message sequence to one target audience: a first message, at most one follow-up, three kinds of reply."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        LIVE = "live", "Live"
+        PAUSED = "paused", "Paused"
+
+    class Goal(models.TextChoices):
+        CONVERSATIONS = "Conversations", "Conversations"
+        SIGNUPS = "Free signups", "Free signups"
+        INSTALLS = "Installs", "Installs"
+        PAID = "Paid plans", "Paid plans"
+
+    name = models.CharField(max_length=120)
+    audience = models.ForeignKey(Audience, on_delete=models.PROTECT, related_name="wa_campaigns", null=True, blank=True)
+    goal = models.CharField(max_length=16, choices=Goal.choices, default=Goal.CONVERSATIONS)
+    status = models.CharField(max_length=8, choices=Status.choices, default=Status.DRAFT)
+    daily_limit = models.PositiveSmallIntegerField(default=15)
+    followup_days = models.PositiveSmallIntegerField(default=3)
+    first = models.ForeignKey(WaTemplate, on_delete=models.PROTECT, related_name="+")
+    followup = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
+    interested = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
+    question = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
+    notnow = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-id"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class WaContact(models.Model):
+    """A business that may get WhatsApp messages. One row per phone number, across every campaign."""
+
+    class Status(models.TextChoices):
+        READY = "ready", "Ready"
+        MESSAGED = "messaged", "Messaged"
+        REPLIED = "replied", "Replied"
+        INTERESTED = "interested", "Interested"
+        SIGNED = "signed", "Signed up"
+        NOTNOW = "notnow", "Not now"
+        STOP = "stop", "Do not message"
+
+    campaign = models.ForeignKey(WaCampaign, on_delete=models.SET_NULL, related_name="contacts", null=True, blank=True)
+    phone = models.CharField(max_length=16, unique=True)  # E.164: +919810000101
+    first_name = models.CharField(max_length=80, blank=True)
+    firm = models.CharField(max_length=160)
+    segment = models.CharField(max_length=120)
+    country = models.CharField(max_length=40)
+    city = models.CharField(max_length=80)
+    source = models.CharField(max_length=160)  # where the number was found
+    info = models.JSONField(default=dict, blank=True)  # Useful Info: website, team_size, notes...
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.READY, db_index=True)
+    step = models.PositiveSmallIntegerField(default=0)  # 0 nothing sent, 1 first message, 2 follow-up
+    next_date = models.DateField(null=True, blank=True)  # when the next first message or follow-up is due
+    needs_reply = models.BooleanField(default=False)  # they wrote and nobody has answered yet
+    paused_until = models.DateField(null=True, blank=True)
+    added_by = models.EmailField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-id"]
+
+    def __str__(self) -> str:
+        return f"{self.firm} ({self.phone})"
+
+
+class WaMessage(models.Model):
+    """One message in a WhatsApp conversation, as a person recorded it: what we sent, or what they wrote."""
+
+    class Kind(models.TextChoices):
+        FIRST = "first", "First message"
+        FOLLOWUP = "followup", "Follow-up"
+        REPLY = "reply", "Our reply"
+        THEIRS = "theirs", "Their message"
+
+    contact = models.ForeignKey(WaContact, on_delete=models.CASCADE, related_name="messages")
+    kind = models.CharField(max_length=10, choices=Kind.choices)
+    text = models.TextField(max_length=2000)
+    at = models.DateTimeField(auto_now_add=True, db_index=True)
+    by = models.EmailField(blank=True)
+
+    class Meta:
+        ordering = ["at", "id"]
+
+
+class WaBlock(models.Model):
+    """A number that asked to stop. Never messaged again, in any campaign, and skipped on every upload."""
+
+    phone = models.CharField(max_length=16, unique=True)
+    reason = models.CharField(max_length=120)
+    created_at = models.DateTimeField(auto_now_add=True)
