@@ -114,14 +114,40 @@ def _rating(info: dict[str, Any]) -> str:
     return f"{value:.1f}" if 4.0 <= value <= 5.0 else ""
 
 
+def _sentence(text: str) -> str:
+    text = " ".join(str(text).split()).strip()
+    return text if not text or text[-1] in ".!?" else text + "."
+
+
 def how_we_know(source: str, info: dict[str, Any], subject: str) -> str:
-    """One true line on where we found them, from their own data. '' when we can't say."""
+    """One true line on how we know them, from their own data. '' when we can't say.
+
+    Staff can write the line themselves in Useful Info as "how_we_know" ("Amit from your CA's office suggested I
+    write"); otherwise it follows the source the 90-day plan names: an email reply, LinkedIn, a referral (with
+    "referred_by"), the website, an event (with "event"), or a listing such as Google Maps."""
+    info = info or {}
+    own = _sentence(info.get("how_we_know") or "")
+    if own:
+        return own
     source = (source or "").strip()
-    if not source or source.lower().startswith("uploaded"):
+    low = source.lower()
+    if not source or low.startswith("uploaded"):
         return ""
-    if "google" in source.lower() and "map" in source.lower():
-        rating = _rating(info or {})
+    if "google" in low and "map" in low:
+        rating = _rating(info)
         return f"I found {subject} on Google Maps, where you're rated {rating}." if rating else f"I found {subject} on Google Maps."
+    if "email" in low or "zoho" in low:
+        return "Thanks for replying to my email."
+    if "linkedin" in low:
+        return "Thanks for connecting on LinkedIn."
+    if "referr" in low or "introduc" in low:
+        who = _plain(str(info.get("referred_by") or ""))
+        return f"{who} suggested I write." if who else ""  # never a vague "a friend": say who, or nothing
+    if "website" in low or "zinwe.io" in low or "sign-up" in low or "signup" in low or "form" in low:
+        return "Thanks for leaving your number on zinwe.io."
+    if any(w in low for w in ("event", "meetup", "meet-up", "fair", "expo", "conference")):
+        where = _plain(str(info.get("event") or ""))
+        return f"Good to meet you at {where}." if where else "Good to meet you the other day."
     return f"I found {subject} through {source}."
 
 

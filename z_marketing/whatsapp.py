@@ -242,6 +242,18 @@ def next_nurture(contact: WaContact) -> WaTemplate | None:
     )
 
 
+# The 90-day plan's approved answers (owner, 3 Nov 2026). Also saved as "question" templates staff can copy.
+ANSWERS = [
+    ("Is this spyware?", "No. Zinwe protects company data. It flags things like files copied to a pen drive or remote-access "
+     "sessions. It does not read messages, record screens or log keystrokes, and your team sees the Zinwe widget on their "
+     "PC. More: zinwe.io/legal/privacy"),
+    ("What does it cost?", "There is a Free forever plan; paid plans are on zinwe.io/plans. How many PCs do you have? I'll "
+     "tell you which fits."),
+    ("Do you support Mac?", "Windows only today. I'll tell you when that changes."),
+    ("We have antivirus", "Antivirus stops viruses. Zinwe shows what happens to company files and tools on each PC. They "
+     "work side by side."),
+]
+
 SYSTEM = (
     "You personalise WhatsApp messages that Vishal, founder of Zinwe (data protection and team tools for small offices "
     "on Windows PCs), sends by hand to small businesses. Rewrite the template for this one business using only the "
@@ -250,7 +262,9 @@ SYSTEM = (
     "drawn only from them. Keep its meaning, its "
     "offer and every instruction about replying (YES, HAAN, STOP, LATER). Keep it under 400 characters, plain text, "
     "warm and short, no emojis. Never invent facts, numbers, links, prices, discounts or features, and never "
-    "mention their team size or anything that sounds like watching staff. Reply with the message text only."
+    "mention their team size or anything that sounds like watching staff. Where the template says [Your answer], answer "
+    "their_last_message in two or three lines using only the approved answers below; if none fits, keep [Your answer] "
+    "for staff to fill. Reply with the message text only.\n\nApproved answers:\n" + "\n".join(f"- {q}: {a}" for q, a in ANSWERS)
 )
 
 

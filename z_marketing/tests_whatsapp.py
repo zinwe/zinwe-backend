@@ -218,19 +218,18 @@ class SequenceTests(WaBase):
         self.assertEqual((c.step, c.next_date), (2, None))
 
     def test_yes_starts_the_track_sequence(self) -> None:
-        self.live()
+        self.live(interested=WaTemplate.objects.get(name="YES reply: two questions + sign-up link"))
         c = self.contact(track="data")
         whatsapp.mark_sent(c, "first", "Hi", "staff@zinwe.io")
         whatsapp.record_reply(c, "HAAN", "staff@zinwe.io")
         whatsapp.act(c, "interested")
-        whatsapp.mark_sent(c, "reply", "Thanks!", "staff@zinwe.io")
+        reply = whatsapp.draft(c, "interested")  # the YES is answered once: two questions + the sign-up link
+        self.assertEqual(reply["template"], "YES reply: two questions + sign-up link")
+        self.assertIn("utm_campaign=2026-11-it-agency", reply["text"])
+        whatsapp.mark_sent(c, "reply", reply["text"], "staff@zinwe.io")
         c.refresh_from_db()
         self.assertEqual((c.yes_date, c.next_date), (whatsapp.today(), None))
-        item = whatsapp.queue()[0]
-        self.assertEqual((item["kind"], item["template"]), ("nurture", "Every YES, day 0: two questions + link"))
-        self.assertIn("utm_campaign=2026-11-kelash", whatsapp.draft(c, "nurture")["text"])
-        whatsapp.mark_sent(c, "nurture", "Two questions", "staff@zinwe.io")
-        self.assertEqual(whatsapp.queue(), [])  # day 1 is not due yet
+        self.assertEqual(whatsapp.queue(), [])  # no second day-0 message; day 1 is not due yet
         WaContact.objects.filter(pk=c.pk).update(yes_date=whatsapp.today() - timedelta(days=1))
         c.refresh_from_db()
         self.assertEqual(whatsapp.queue()[0]["template"], "Data track, day 1: setup + first alert")
@@ -241,6 +240,8 @@ class SequenceTests(WaBase):
     def test_a_reply_holds_the_sequence_and_stop_ends_it(self) -> None:
         c = self.contact()
         whatsapp.act(c, "interested")
+        WaContact.objects.filter(pk=c.pk).update(yes_date=whatsapp.today() - timedelta(days=2))  # the install check is due
+        c.refresh_from_db()
         self.assertEqual(len(whatsapp.queue()), 1)
         whatsapp.record_reply(c, "Kitne ka hai?", "staff@zinwe.io")
         self.assertEqual(whatsapp.queue(), [])  # answer them first
@@ -259,10 +260,17 @@ class SequenceTests(WaBase):
     def test_seeded_outreach_stops_after_day_7(self) -> None:
         self.assertEqual(WaCampaign().touch3_days, 7)
         self.assertFalse(WaTemplate.objects.filter(kind="touch4").exists())
-        outreach = WaTemplate.objects.filter(name__regex=r"^(V\d|Day [37] )")  # the IT firm and agency campaign
+        outreach = WaTemplate.objects.filter(name__regex=r"^(IT-\d|AG-\d|Day [37] )")  # the IT firm and agency campaign
         self.assertEqual(outreach.count(), 9)
         for text in outreach.values_list("text", flat=True):
             self.assertIn("Cherry on top", text)
+
+    def test_after_yes_runs_to_day_90(self) -> None:
+        days = sorted(set(WaTemplate.objects.filter(kind="nurture").values_list("day", flat=True)))
+        self.assertEqual(days, [1, 2, 4, 7, 10, 14, 21, 30, 45, 60, 90])
+        self.assertFalse(WaTemplate.objects.filter(text__contains="2026-11-kelash").exists())
+        self.assertEqual(WaTemplate.objects.filter(kind="question", name__startswith="Answer: ").count(), 4)
+        self.assertIn("Approved answers:", whatsapp.SYSTEM)
 
     def test_seeded_copy_has_no_pc_count(self) -> None:
         for text in WaTemplate.objects.values_list("text", flat=True):
@@ -442,6 +450,22 @@ class NameTests(WaBase):
         self.assertEqual(self.address("", "X", source="Uploaded 03 Nov 2026")["how_we_know"], "")
         self.assertEqual(self.address("", "Shanta Narang - Best Seo Expert and Consultant")["how_we_know"],
                          "I found you on Google Maps, where you're rated 4.8.")  # her own name: "you", not "Shanta Narang"
+
+    def test_how_we_know_follows_the_opt_in_sources(self) -> None:
+        from .wa_names import how_we_know
+
+        cases = [
+            ("Cold email reply (Zoho)", {}, "Thanks for replying to my email."),
+            ("LinkedIn", {}, "Thanks for connecting on LinkedIn."),
+            ("Referral", {"referred_by": "Amit from your CA's office"}, "Amit from your CA's office suggested I write."),
+            ("Referral", {}, ""),  # never a vague "a friend"
+            ("Website and sign-up forms", {}, "Thanks for leaving your number on zinwe.io."),
+            ("Events and meetups", {"event": "Nasscom Delhi meetup"}, "Good to meet you at Nasscom Delhi meetup."),
+            ("Events and meetups", {}, "Good to meet you the other day."),
+            ("Google Maps", {"how_we_know": "We met at your Noida office"}, "We met at your Noida office."),  # staff's own line wins
+        ]
+        for source, info, line in cases:
+            self.assertEqual(how_we_know(source, info, "you"), line, source)
 
     def test_the_draft_opens_with_the_right_line(self) -> None:
         t = WaTemplate.objects.create(name="Opening", kind="interested", text="Hi {{FirstName}}, Vishal from Zinwe here. {{HowWeKnow}}\n\nAbout {{Business}}?")
