@@ -281,6 +281,10 @@ class WaTemplate(models.Model):
     # After-YES messages only: which sequence it belongs to ("" = every YES) and how many days after the YES it is due.
     track = models.CharField(max_length=4, choices=Track.choices, default="", blank=True)
     day = models.PositiveSmallIntegerField(default=0)
+    # A picture or video staff attach in WhatsApp (wa_media.py). Never on messages to people who haven't replied.
+    media = models.FileField(upload_to="wa-media/", blank=True)
+    media_kind = models.CharField(max_length=5, blank=True)  # image or video
+    media_name = models.CharField(max_length=160, blank=True)  # the name it was uploaded with
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

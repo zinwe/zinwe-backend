@@ -273,14 +273,16 @@ def _claude(template_text: str, contact: WaContact, their_last: str) -> str | No
 
 
 def draft(contact: WaContact, kind: str) -> dict[str, Any]:
-    """The text to send next: {text, template, by}. `by` is "claude" when Claude personalised it."""
+    """The text to send next: {text, template, by, media}. `by` is "claude" when Claude personalised it."""
     template = next_nurture(contact) if kind == "nurture" else _template_for(contact, kind)
     if template is None:
         raise WaError("No after-YES message is left for this contact." if kind == "nurture" else "Add a template of this kind first.")
     base = fill(template.text, contact)
     last = contact.messages.filter(kind=Kind.THEIRS).last()
     personal = _claude(base, contact, last.text if last else "")
-    return {"text": personal or base, "template": template.name, "by": "claude" if personal else "template"}
+    from .wa_media import describe
+
+    return {"text": personal or base, "template": template.name, "by": "claude" if personal else "template", "media": describe(template)}
 
 
 # --- Today ---------------------------------------------------------------------------------------------------------

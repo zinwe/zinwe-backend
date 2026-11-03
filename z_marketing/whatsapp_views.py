@@ -5,14 +5,14 @@ import json
 from typing import Any
 
 from django.db.models import ProtectedError
-from django.http import HttpResponse
+from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers, status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from . import whatsapp
+from . import wa_media, whatsapp
 from .contact_file import FileProblem
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
 from .views import Staff
@@ -20,10 +20,20 @@ from .whatsapp import WaError
 
 
 class WaTemplateSerializer(serializers.ModelSerializer):
+    media = serializers.SerializerMethodField()
+
     class Meta:
         model = WaTemplate
-        fields = ["id", "name", "kind", "text", "track", "day", "updated_at"]
+        fields = ["id", "name", "kind", "text", "track", "day", "media", "updated_at"]
         read_only_fields = ["updated_at"]
+
+    def get_media(self, obj: WaTemplate) -> dict[str, Any] | None:
+        return wa_media.describe(obj)
+
+    def validate_kind(self, value: str) -> str:
+        if self.instance and self.instance.media and value in wa_media.COLD:
+            raise serializers.ValidationError("Remove the picture or video first. " + wa_media.COLD_REFUSAL)
+        return value
 
 
 class WaMessageSerializer(serializers.ModelSerializer):
@@ -250,11 +260,44 @@ class WaTemplateDetailView(Staff):
         return Response(WaTemplateSerializer(data.save()).data)
 
     def delete(self, request: Request, pk: int) -> Response:
+        template = get_object_or_404(WaTemplate, pk=pk)
+        media = template.media.name if template.media else ""
         try:
-            get_object_or_404(WaTemplate, pk=pk).delete()
+            template.delete()
+            if media:
+                template.media.storage.delete(media)
         except ProtectedError:
             return Response({"detail": "A campaign starts with this template. Pick another first message there first."}, status=status.HTTP_400_BAD_REQUEST)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class WaTemplateMediaView(Staff):
+    """GET the template's picture or video (staff only; MEDIA_ROOT is never public), POST a new one, DELETE it."""
+
+    parser_classes = [MultiPartParser]
+
+    def get(self, request: Request, pk: int) -> FileResponse:
+        template = get_object_or_404(WaTemplate, pk=pk)
+        if not wa_media.describe(template):
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return FileResponse(template.media.open("rb"), content_type=wa_media.content_type(template), filename=template.media_name)
+
+    def post(self, request: Request, pk: int) -> Response:
+        template = get_object_or_404(WaTemplate, pk=pk)
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"detail": "Choose a picture or video first."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            wa_media.attach(template, upload)
+        except wa_media.MediaProblem as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        self.audit(request, "wa_template_media", template, kind=template.media_kind)
+        return Response(WaTemplateSerializer(template).data)
+
+    def delete(self, request: Request, pk: int) -> Response:
+        template = get_object_or_404(WaTemplate, pk=pk)
+        wa_media.remove(template)
+        return Response(WaTemplateSerializer(template).data)
 
 
 class WaAnalyticsView(Staff):

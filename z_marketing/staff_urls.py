@@ -35,5 +35,6 @@ urlpatterns = [
     path("wa/campaigns/<int:pk>/<slug:action>/", wa.WaCampaignActionView.as_view(), name="wa-campaign-action"),
     path("wa/templates/", wa.WaTemplateListView.as_view(), name="wa-templates"),
     path("wa/templates/<int:pk>/", wa.WaTemplateDetailView.as_view(), name="wa-template"),
+    path("wa/templates/<int:pk>/media/", wa.WaTemplateMediaView.as_view(), name="wa-template-media"),
     path("wa/analytics/", wa.WaAnalyticsView.as_view(), name="wa-analytics"),
 ]

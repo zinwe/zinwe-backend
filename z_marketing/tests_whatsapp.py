@@ -12,7 +12,7 @@ from django.test import TestCase, override_settings
 from openpyxl import Workbook
 from rest_framework.test import APIClient
 
-from . import whatsapp
+from . import wa_media, whatsapp
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
 
 Status = WaContact.Status
@@ -266,3 +266,84 @@ class SequenceTests(WaBase):
     def test_seeded_copy_has_no_pc_count(self) -> None:
         for text in WaTemplate.objects.values_list("text", flat=True):
             self.assertNotIn("3 PCs", text)
+
+
+def picture(name: str = "offer.png", size: tuple[int, int] = (40, 30)) -> SimpleUploadedFile:
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", size, (253, 109, 2)).save(out, format="PNG")
+    return SimpleUploadedFile(name, out.getvalue(), content_type="image/png")
+
+
+def video(name: str = "demo.mp4", extra: int = 100) -> SimpleUploadedFile:
+    return SimpleUploadedFile(name, b"\x00\x00\x00\x18ftypmp42" + b"\x00" * extra, content_type="video/mp4")
+
+
+@override_settings(MEDIA_ROOT=__import__("tempfile").mkdtemp(prefix="zinwe-wa-media-"))
+class MediaTests(WaBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.warm = WaTemplate.objects.create(name="After YES offer", kind=WaTemplate.Kind.NURTURE, text="Hi {{FirstName}}", track="", day=0)
+        self.url = f"{BASE}/templates/{self.warm.pk}/media/"
+
+    def test_a_picture_is_kept_and_served_to_staff_only(self) -> None:
+        r = self.api.post(self.url, {"file": picture()}, format="multipart")
+        self.assertEqual(r.status_code, 200, r.content)
+        media = r.json()["media"]
+        self.assertEqual((media["kind"], media["name"]), ("image", "offer.png"))
+        self.warm.refresh_from_db()
+        self.assertNotIn("offer", self.warm.media.name)  # stored under a random name
+        got = self.api.get(self.url)
+        self.assertEqual((got.status_code, got["Content-Type"]), (200, "image/png"))
+        self.assertEqual(APIClient().get(self.url).status_code, 401)
+
+    def test_a_video_and_replacing_it(self) -> None:
+        self.api.post(self.url, {"file": picture()}, format="multipart")
+        self.warm.refresh_from_db()
+        old = self.warm.media.name
+        r = self.api.post(self.url, {"file": video()}, format="multipart")
+        self.assertEqual(r.json()["media"]["kind"], "video")
+        self.assertFalse(self.warm.media.storage.exists(old))
+
+    def test_cold_messages_stay_text_only(self) -> None:
+        r = self.api.post(f"{BASE}/templates/{self.first.pk}/media/", {"file": picture()}, format="multipart")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("text only", r.json()["detail"])
+        self.api.post(self.url, {"file": picture()}, format="multipart")
+        body = {"name": "x", "kind": "first", "text": "Hi", "track": "", "day": 0}
+        self.assertIn("kind", self.api.put(f"{BASE}/templates/{self.warm.pk}/", body, format="json").json())
+
+    def test_bad_files_say_why(self) -> None:
+        cases = [
+            (SimpleUploadedFile("a.png", b"not a picture"), "can't be opened"),
+            (SimpleUploadedFile("a.mp4", b"0123456789abcdef"), "can't be read"),
+            (SimpleUploadedFile("a.gif", b"GIF89a"), "JPG, PNG or WebP"),
+            (SimpleUploadedFile("a.exe", b"MZ"), "JPG, PNG or WebP"),
+            (video(extra=wa_media.VIDEO_MAX), "9 MB"),
+        ]
+        for upload, words in cases:
+            r = self.api.post(self.url, {"file": upload}, format="multipart")
+            self.assertEqual(r.status_code, 400, upload.name)
+            self.assertIn(words, r.json()["detail"], upload.name)
+        self.assertEqual(self.api.post(self.url, {}, format="multipart").status_code, 400)
+
+    def test_the_draft_carries_it_and_removing_cleans_up(self) -> None:
+        c = self.contact(status=Status.INTERESTED, yes_date=whatsapp.today(), step=1)
+        used = whatsapp.next_nurture(c)  # the after-YES message this contact gets next
+        url = f"{BASE}/templates/{used.pk}/media/"
+        self.api.post(url, {"file": picture()}, format="multipart")
+        self.assertEqual(whatsapp.draft(c, "nurture")["media"]["kind"], "image")
+        used.refresh_from_db()
+        stored = used.media.name
+        self.assertIsNone(self.api.delete(url).json()["media"])
+        self.assertFalse(used.media.storage.exists(stored))
+        self.assertEqual(self.api.get(url).status_code, 404)
+        self.assertIsNone(whatsapp.draft(c, "nurture")["media"])
+
+    def test_deleting_the_template_deletes_the_file(self) -> None:
+        self.api.post(self.url, {"file": picture()}, format="multipart")
+        self.warm.refresh_from_db()
+        stored, storage = self.warm.media.name, self.warm.media.storage
+        self.assertEqual(self.api.delete(f"{BASE}/templates/{self.warm.pk}/").status_code, 204)
+        self.assertFalse(storage.exists(stored))
