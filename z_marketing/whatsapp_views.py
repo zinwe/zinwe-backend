@@ -45,13 +45,25 @@ class WaMessageSerializer(serializers.ModelSerializer):
 class WaContactSerializer(serializers.ModelSerializer):
     campaign_name = serializers.CharField(source="campaign.name", read_only=True, default="")
     last = serializers.SerializerMethodField()
+    greet_as = serializers.SerializerMethodField()
+    short_name = serializers.SerializerMethodField()
+
+    def get_greet_as(self, obj: WaContact) -> str:
+        from .wa_names import address
+
+        return address(obj)["greeting"]
+
+    def get_short_name(self, obj: WaContact) -> str:
+        from .wa_names import address
+
+        return address(obj)["business"]
 
     class Meta:
         model = WaContact
         fields = [
             "id", "campaign", "campaign_name", "phone", "first_name", "firm", "segment", "country", "city", "source", "info",
             "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "last", "track", "yes_date",
-            "nurture_day", "first_sent", "opted_in", "opt_in_note",
+            "nurture_day", "first_sent", "opted_in", "opt_in_note", "greet_as", "short_name",
         ]
         read_only_fields = [
             "opted_in", "opt_in_note",

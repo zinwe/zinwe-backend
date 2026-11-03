@@ -147,7 +147,7 @@ class FlowTests(WaBase):
         r = self.api.post(f"{BASE}/contacts/{c.id}/draft/", {"kind": "first"}, format="json")
         body = r.json()
         self.assertEqual(body["by"], "template")
-        self.assertTrue(body["text"].startswith("Hi there, this is Vishal"))
+        self.assertTrue(body["text"].startswith("Hi Gupta Exim team, this is Vishal"))  # no name: greet the business
         self.assertIn("Gupta Exim", body["text"])
 
     @override_settings(ANTHROPIC_API_KEY="test-key")
@@ -397,3 +397,68 @@ class OptInTests(WaBase):
 
     def test_contacts_from_before_count_as_opted_in(self) -> None:
         self.assertTrue(self.contact("+919810000504").opted_in)
+
+
+class NameTests(WaBase):
+    def address(self, first: str, firm: str, wa: str = "", source: str = "Google Maps", rating: str = "4.8") -> dict:
+        from types import SimpleNamespace
+
+        from .wa_names import address
+
+        info = {"rating": rating, **({"wa_business_name": wa} if wa else {})}
+        return address(SimpleNamespace(first_name=first, firm=firm, source=source, info=info))
+
+    def test_scraps_of_business_names_are_not_people(self) -> None:
+        for first, firm, wa in [
+            ("IT", "It Solutions & Services (itss)", "IT Solutions and Services"), ("Sun", "Sun Info Global Services", ""),
+            ("digital", "Startupway24 It Services Pvt. Ltd.", "digital Life"), ("Excel", "Excel Range Media", "Excel Range Media"),
+            ("Trace", "Trace Presence", "Trace Presence"), ("Sole", "Sole Freelancer – Digital Marketing Expert", "solefreelancer"),
+            ("Sales", "Comprompt Solutions Llp", "Sales Comprompt"), ("Mohit", "DigiHeadway - Digital Marketing", "~Mohit Uptown Properties"),
+            ("", "Webgross - Digital Marketing Agency in Delhi", ""),
+        ]:
+            self.assertEqual(self.address(first, firm, wa)["first_name"], "", firm)
+
+    def test_people_are_greeted_by_name(self) -> None:
+        self.assertEqual(self.address("Kishan", "Appfinz Technologies | Certified Shopify", "Kishan Kumar Mishra")["greeting"], "Kishan")
+        self.assertEqual(self.address("Aushi", "Headway Digital Solutions", "Aushi V Saxena")["greeting"], "Aushi")
+        self.assertEqual(self.address("", "Dhanashree Kokate - Website Developer In Pune")["greeting"], "Dhanashree")
+        self.assertEqual(self.address("Rakesh", "Gupta Exim", source="Trade fair")["greeting"], "Rakesh")  # typed in by staff
+
+    def test_short_clean_business_names(self) -> None:
+        cases = {
+            "Webgross - Digital Marketing Agency in Delhi": "Webgross", "Startupway24 It Services Pvt. Ltd.": "Startupway24 It Services",
+            "𝐒𝐓𝐒 𝐃𝐢𝐠𝐢𝐭𝐚𝐥 𝐒𝐨𝐥𝐮𝐭𝐢𝐨𝐧𝐬": "STS Digital Solutions", "✅ 𝗗𝗶𝗴𝗶𝘁𝗮𝗹 𝗘𝘅𝗽𝗲𝗿𝘁𝘇": "Digital Expertz",
+            "Digital Samay Institute of Internet Marketing": "Digital Samay Institute", "Soft Wind Technology: Turning Ideas": "Soft Wind Technology",
+        }
+        for firm, short in cases.items():
+            self.assertEqual(self.address("", firm)["business"], short, firm)
+        self.assertEqual(self.address("", "Webgross - Digital Marketing Agency in Delhi")["greeting"], "Webgross team")
+
+    def test_how_we_know_comes_from_their_data(self) -> None:
+        self.assertEqual(self.address("", "Webgross")["how_we_know"], "I found you on Google Maps, where you're rated 4.8.")
+        self.assertEqual(self.address("", "Webgross", rating="")["how_we_know"], "I found you on Google Maps.")
+        self.assertEqual(self.address("Kishan", "Appfinz Technologies", "Kishan Kumar Mishra")["how_we_know"],
+                         "I found Appfinz Technologies on Google Maps, where you're rated 4.8.")
+        self.assertEqual(self.address("", "X", source="Uploaded 03 Nov 2026")["how_we_know"], "")
+        self.assertEqual(self.address("", "Shanta Narang - Best Seo Expert and Consultant")["how_we_know"],
+                         "I found you on Google Maps, where you're rated 4.8.")  # her own name: "you", not "Shanta Narang"
+
+    def test_the_draft_opens_with_the_right_line(self) -> None:
+        t = WaTemplate.objects.create(name="Opening", kind="interested", text="Hi {{FirstName}}, Vishal from Zinwe here. {{HowWeKnow}}\n\nAbout {{Business}}?")
+        c = self.contact(first_name="Excel", firm="Excel Range Media - SEO Services in Delhi", source="Google Maps",
+                         info={"rating": "4.9", "wa_business_name": "Excel Range Media"})
+        text = whatsapp.fill(t.text, c)
+        self.assertEqual(text, "Hi Excel Range Media team, Vishal from Zinwe here. I found you on Google Maps, where you're rated 4.9.\n\nAbout Excel Range Media?")
+        c.source = ""
+        self.assertEqual(whatsapp.fill(t.text, c).split("\n")[0], "Hi Excel Range Media team, Vishal from Zinwe here.")
+
+    def test_first_templates_got_how_we_know(self) -> None:
+        firsts = WaTemplate.objects.filter(kind="first")
+        hello = [t for t in firsts if "Vishal from Zinwe" in t.text]
+        self.assertTrue(hello)
+        self.assertTrue(all("{{HowWeKnow}}" in t.text for t in hello))
+
+    def test_the_api_shows_how_they_are_greeted(self) -> None:
+        c = self.contact(first_name="IT", firm="It Solutions & Services (itss)", source="Google Maps")
+        data = self.api.get(f"{BASE}/contacts/{c.pk}/").json()
+        self.assertEqual((data["greet_as"], data["short_name"]), ("It Solutions & Services team", "It Solutions & Services"))

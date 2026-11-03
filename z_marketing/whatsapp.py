@@ -210,11 +210,16 @@ def template_file() -> bytes:
 
 
 def fill(text: str, contact: WaContact) -> str:
-    first = contact.first_name or "there"
-    for key, value in (("{{FirstName}}", first), ("{{Firm}}", contact.firm), ("{{Business}}", contact.firm),
-                       ("{{City}}", contact.city)):
+    """{{FirstName}} is their first name only when it clearly is one, else "<Business> team" (wa_names.py);
+    {{Business}} is the short clean name; {{HowWeKnow}} is one true line on where we found them."""
+    from .wa_names import address
+
+    a = address(contact)
+    for key, value in (("{{FirstName}}", a["greeting"]), ("{{Firm}}", a["business"]), ("{{Business}}", a["business"]),
+                       ("{{City}}", contact.city), ("{{HowWeKnow}}", a["how_we_know"])):
         text = text.replace(key, value)
-    return text
+    text = re.sub(r"[ \t]+\n", "\n", text)  # a blank {{HowWeKnow}} leaves no trailing space
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
 def _template_for(contact: WaContact, kind: str) -> WaTemplate | None:
@@ -240,7 +245,9 @@ def next_nurture(contact: WaContact) -> WaTemplate | None:
 SYSTEM = (
     "You personalise WhatsApp messages that Vishal, founder of Zinwe (data protection and team tools for small offices "
     "on Windows PCs), sends by hand to small businesses. Rewrite the template for this one business using only the "
-    "details given. If useful_info has notes, you may open with one short line drawn only from them. Keep its meaning, its "
+    "details given. Address them exactly as address_as, the way the template does; never use any other name for them "
+    "(first_name is empty when we don't know a person's name). If useful_info has notes, you may open with one short line "
+    "drawn only from them. Keep its meaning, its "
     "offer and every instruction about replying (YES, HAAN, STOP, LATER). Keep it under 400 characters, plain text, "
     "warm and short, no emojis. Never invent facts, numbers, links, prices, discounts or features, and never "
     "mention their team size or anything that sounds like watching staff. Reply with the message text only."
@@ -255,8 +262,11 @@ def _claude(template_text: str, contact: WaContact, their_last: str) -> str | No
         import anthropic
 
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=30.0, max_retries=1)
+        from .wa_names import address
+
+        a = address(contact)
         details = {
-            "first_name": contact.first_name, "business": contact.firm, "segment": contact.segment, "city": contact.city,
+            "address_as": a["greeting"], "first_name": a["first_name"], "business": a["business"], "segment": contact.segment, "city": contact.city,
             "country": contact.country, "useful_info": contact.info, "their_last_message": their_last,
         }
         response = client.messages.create(
