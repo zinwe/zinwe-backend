@@ -1,0 +1,20 @@
+{% autoescape off %}{% if failed %}This week's new version plan ({{ period }}) could not be made.
+
+What went wrong: {{ plan.error }}
+
+You can try again from Admin → New version → Make a plan now.
+{% else %}This week's new version plan is ready ({{ period }}). The PDF is attached.
+
+{{ plan.headline }}
+{% if plan.summary %}
+{{ plan.summary }}
+{% endif %}
+From {{ plan.counts.issues|default:0 }} issue reports and {{ plan.counts.feedback|default:0 }} feedback entries{% if plan.counts.average_rating %} (average rating {{ plan.counts.average_rating }}/10){% endif %}.
+{% if going_in %}
+Goes into the next version:
+{% for item in going_in %}- {{ item.title }}
+{% endfor %}{% endif %}{% if plan.error %}
+Note: {{ plan.error }}
+{% endif %}{% endif %}
+Open it in the admin panel: {{ admin_url }}
+{% endautoescape %}

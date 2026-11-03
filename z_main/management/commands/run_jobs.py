@@ -3,7 +3,7 @@
 Runs every scheduled job now, then again every `--interval` seconds. Today that's renewal
 reminders (z_auth.renewals), feedback requests (z_auth.feedback_requests), blog newsletters
 (z_blog.newsletter: what a background send left, and issues of scheduled articles that went live), scheduled
-reports (z_devices.report_schedules), email retries (z_notification.retry: failed transactional
+reports (z_devices.report_schedules), the weekly new version plan (z_versions, Thursday 03:00), email retries (z_notification.retry: failed transactional
 emails sent again with back-off, rows stuck mid-send marked failed) and
 the history clean-up (z_devices.retention: data past each plan's history window + 30 days). A failing job is logged and retried next round; the loop keeps
 going. Used by the local start script; a server can run this as a service or schedule the
@@ -28,6 +28,7 @@ from z_devices.retention import prune_history
 from z_marketing.outreach import send_pending as send_outreach
 from z_notification.retry import run as retry_failed_emails
 from z_payments.services import reconcile as check_online_payments
+from z_versions.services import plan_due as make_version_plan
 
 # (label, job): each returns a result with .summary(). One failing job doesn't stop the others.
 JOBS = (
@@ -44,6 +45,7 @@ JOBS = (
     ("guide follow-ups", send_guide_followups),  # after the series: one Zinwe email a day per member
     ("scheduled reports", send_scheduled_reports),  # FR-22: daily / weekly / monthly reports by email
     ("history clean-up", prune_history),
+    ("new version plan", make_version_plan),  # Thursday 03:00 IST: the week's feedback + issues -> plan, PDF to the founder
 )
 
 

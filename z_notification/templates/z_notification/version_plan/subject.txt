@@ -1,0 +1,1 @@
+{% autoescape off %}{% if failed %}New version plan failed ({{ period }}){% else %}New version plan{% if plan.version %} {{ plan.version }}{% endif %}: {{ plan.headline }}{% endif %}{% endautoescape %}

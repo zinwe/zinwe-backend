@@ -82,6 +82,7 @@ INSTALLED_APPS = [
     "z_forms",
     "z_payments",
     "z_marketing",
+    "z_versions",
 ]
 
 MIDDLEWARE = [
@@ -326,6 +327,10 @@ ZINWE_OUTREACH_DKIM_SELECTOR = env_str("ZINWE_OUTREACH_DKIM_SELECTOR", "zmail")
 # draft from the contact's Useful Info; empty: drafts are the templates with the name and business filled in.
 ANTHROPIC_API_KEY = env_str("ANTHROPIC_API_KEY", "")
 ZINWE_WA_MODEL = env_str("ZINWE_WA_MODEL", "claude-opus-5-5")
+# Weekly new version plan (z_versions): Claude drafts it from the week's feedback and issue reports.
+ZINWE_PLAN_MODEL = env_str("ZINWE_PLAN_MODEL", "claude-opus-5-5")
+# Founder mail: internal reports and notifications (the weekly new version plan). Empty: not emailed.
+ZINWE_FOUNDER_EMAIL = env_str("ZINWE_FOUNDER_EMAIL", "vishalshakaya.feelsafe@gmail.com")
 EMAIL_HOST = env_str("EMAIL_HOST", "localhost")
 EMAIL_PORT = int(env_str("EMAIL_PORT", "25"))
 EMAIL_HOST_USER = env_str("EMAIL_HOST_USER", "")
