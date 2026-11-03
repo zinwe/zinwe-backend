@@ -42,10 +42,11 @@ HEADERS = {
     "info": ("useful info", "info", "notes"),
     "opt_in": ("opt-in", "opt in", "optin", "opted in", "consent"),
 }
-OPT_IN = {"y", "yes"}  # only numbers that opted in, or were introduced, may get a WhatsApp message
+OPT_IN = {"y", "yes", "true"}  # opted in or introduced; any other value loads the contact locked
+LOCKED = "Not opted in yet. Mark them as opted in, with how they agreed, before messaging."
 REQUIRED = {"firm": "Business Name", "phone": "Phone", "segment": "Segment", "country": "Country", "city": "City"}
 TEMPLATE_COLUMNS = ["Business Name", "Phone", "Segment", "Country", "City", "First Name", "Source", "Opt-in", "Useful Info"]
-ACTIONS = ("interested", "signed", "notnow", "stop", "pause", "resume")
+ACTIONS = ("interested", "signed", "notnow", "stop", "pause", "resume", "optin")
 COLD = [WaMessage.Kind.FIRST, WaMessage.Kind.FOLLOWUP, WaMessage.Kind.TOUCH]  # count against the daily limit
 
 
@@ -133,11 +134,10 @@ def parse_file(upload: Any, name: str, size: int) -> list[dict[str, Any]]:
         }
         phone = normalize_phone(cell("phone"), item["country"])
         item["phone"] = phone or cell("phone")[:20]
+        item["opted_in"] = cell("opt_in").lower() in OPT_IN
         missing = [label for f, label in REQUIRED.items() if not cell(f)]
         if missing:
             item.update(result="bad", message=f"Missing {', '.join(missing)}")
-        elif cell("opt_in").lower() not in OPT_IN:
-            item.update(result="bad", message="No opt-in: email or LinkedIn first, WhatsApp once they agree")
         elif not phone:
             item.update(result="bad", message="Not a phone number. Add the country code")
         elif phone in stopped:
@@ -150,6 +150,8 @@ def parse_file(upload: Any, name: str, size: int) -> list[dict[str, Any]]:
             item.update(result="warn", message="Check: may be an office landline")
         else:
             item.update(result="ready", message="Ready")
+        if item["result"] != "bad" and not item["opted_in"]:
+            item.update(result="locked", message="Added locked: no messages until they opt in")
         if phone:
             seen.add(phone)
         out.append(item)
@@ -174,7 +176,8 @@ def add_rows(rows: list[dict[str, Any]], choices: dict[str, dict[str, Any]], act
             defaults=dict(
                 campaign=campaign, first_name=item["first_name"], firm=item["firm"],
                 segment=str(pick.get("segment") or item["segment"])[:120], country=item["country"], city=item["city"],
-                source=source, info=item["info"], added_by=actor,
+                source=source, info=item["info"], added_by=actor, opted_in=item["opted_in"],
+                opt_in_note="Opt-in in the uploaded sheet" if item["opted_in"] else "",
             ),
         )
         added += int(made)
@@ -274,6 +277,8 @@ def _claude(template_text: str, contact: WaContact, their_last: str) -> str | No
 
 def draft(contact: WaContact, kind: str) -> dict[str, Any]:
     """The text to send next: {text, template, by, media}. `by` is "claude" when Claude personalised it."""
+    if not contact.opted_in:
+        raise WaError(LOCKED)
     template = next_nurture(contact) if kind == "nurture" else _template_for(contact, kind)
     if template is None:
         raise WaError("No after-YES message is left for this contact." if kind == "nurture" else "Add a template of this kind first.")
@@ -315,7 +320,7 @@ def queue() -> list[dict[str, Any]]:
             out.append({"contact": contact, "kind": "nurture", "template": template.name})
     for c in WaCampaign.objects.filter(status=WaCampaign.Status.LIVE):
         room = max(0, c.daily_limit - _sent_today(c))
-        due = c.contacts.exclude(paused_until__gt=now)
+        due = c.contacts.filter(opted_in=True).exclude(paused_until__gt=now)
         touches = due.filter(status=Status.MESSAGED, step__in=[1, 2, 3], next_date__lte=now, needs_reply=False)
         firsts = due.filter(status=Status.READY, step=0).filter(Q(next_date__isnull=True) | Q(next_date__lte=now))
         for contact in list(touches.order_by("next_date", "id")) + list(firsts.order_by("id")):
@@ -340,6 +345,8 @@ def replies() -> list[WaContact]:
 def mark_sent(contact: WaContact, kind: str, text: str, actor: str) -> WaContact:
     if contact.status == Status.STOP or blocked(contact.phone):
         raise WaError("This number asked to stop. Don't message it.")
+    if not contact.opted_in:
+        raise WaError(LOCKED)
     text = text.strip()
     if not text:
         raise WaError("Write the message first.")
@@ -377,6 +384,8 @@ def record_reply(contact: WaContact, text: str, actor: str) -> WaContact:
     if not text:
         raise WaError("Paste what they wrote.")
     WaMessage.objects.create(contact=contact, kind=Kind.THEIRS, text=text[:2000], by=actor)
+    if not contact.opted_in:  # they wrote to us first, so answering them is fine
+        contact.opted_in, contact.opt_in_note = True, f"They messaged us on WhatsApp, {today():%d %b %Y}"
     if contact.status in (Status.READY, Status.MESSAGED, Status.NOTNOW):
         contact.status = Status.REPLIED
     contact.needs_reply, contact.next_date = True, None
@@ -392,9 +401,17 @@ def _stop(contact: WaContact, reason: str) -> None:
 
 
 @transaction.atomic
-def act(contact: WaContact, action: str) -> WaContact:
+def act(contact: WaContact, action: str, note: str = "") -> WaContact:
     if action not in ACTIONS:
         raise WaError("Unknown action.")
+    if action == "optin":
+        if not note.strip():
+            raise WaError("Say how they agreed, for example: said yes by email on 5 Nov.")
+        contact.opted_in, contact.opt_in_note = True, note.strip()[:200]
+        contact.save(update_fields=["opted_in", "opt_in_note"])
+        return contact
+    if action in ("interested", "signed") and not contact.opted_in:  # a YES is their agreement
+        contact.opted_in, contact.opt_in_note = True, f"Said yes, {today():%d %b %Y}"
     if action in ("interested", "signed") and contact.yes_date is None:
         # A YES starts the after-YES sequence and ends the no-reply touches.
         contact.yes_date, contact.nurture_day, contact.next_date = today(), -1, None

@@ -358,6 +358,9 @@ class WaContact(models.Model):
     city = models.CharField(max_length=80)
     source = models.CharField(max_length=160)  # where the number was found
     info = models.JSONField(default=dict, blank=True)  # Useful Info: website, team_size, notes...
+    # Locked until they opt in: Zinwe never drafts, queues or records a send for a contact who hasn't (owner, 3 Nov 2026).
+    opted_in = models.BooleanField(default=True)
+    opt_in_note = models.CharField(max_length=200, blank=True)  # how they agreed, in staff's words
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.READY, db_index=True)
     step = models.PositiveSmallIntegerField(default=0)  # 0 nothing sent, 1 first, 2 follow-up, 3 touch 3, 4 touch 4
     next_date = models.DateField(null=True, blank=True)  # when the next no-reply message is due

@@ -78,12 +78,13 @@ class UploadTests(WaBase):
         self.assertEqual(got[3], ("bad", "Repeat row, skipped"))
         self.assertEqual(got[4][0], "warn")
         self.assertEqual(got[5], ("bad", "Missing Business Name"))
-        self.assertEqual(got[6], ("bad", "No opt-in: email or LinkedIn first, WhatsApp once they agree"))
+        self.assertEqual(got[6], ("locked", "Added locked: no messages until they opt in"))
         self.assertFalse(WaContact.objects.filter(firm="Verma Crafts").exists())  # review adds nothing
 
         choices = {"6": {"include": False}, "4": {"include": True, "campaign": self.campaign.id, "segment": "Exporters"}}
         r = self.api.post(f"{BASE}/contacts/upload/", {"file": sheet(rows), "add": "1", "choices": json.dumps(choices)}, format="multipart")
-        self.assertEqual(r.json(), {"added": 1})
+        self.assertEqual(r.json(), {"added": 2})  # the row without opt-in comes in locked
+        self.assertFalse(WaContact.objects.get(firm="Cold Lead").opted_in)
         added = WaContact.objects.get(phone="+919810000201")
         self.assertEqual((added.campaign, added.segment, added.info), (self.campaign, "Exporters", {"website": "verma.example"}))
         self.assertEqual(added.added_by, "staff@zinwe.io")
@@ -347,3 +348,52 @@ class MediaTests(WaBase):
         stored, storage = self.warm.media.name, self.warm.media.storage
         self.assertEqual(self.api.delete(f"{BASE}/templates/{self.warm.pk}/").status_code, 204)
         self.assertFalse(storage.exists(stored))
+
+
+class OptInTests(WaBase):
+    def locked(self, phone: str = "+919810000501") -> WaContact:
+        return self.contact(phone, opted_in=False)
+
+    def test_an_upload_without_opt_in_adds_them_locked(self) -> None:
+        rows = [["Cold Lead", "98100 00400", "Traders", "India", "Delhi", "", "Google Maps", "", "FALSE"],
+                ["Warm Lead", "98100 00401", "Traders", "India", "Delhi", "", "Fair", "", "Y"]]
+        r = self.api.post(f"{BASE}/contacts/upload/", {"file": sheet(rows), "add": "1", "choices": "{}"}, format="multipart")
+        self.assertEqual(r.json(), {"added": 2})
+        cold, warm = WaContact.objects.get(firm="Cold Lead"), WaContact.objects.get(firm="Warm Lead")
+        self.assertEqual((cold.opted_in, warm.opted_in), (False, True))
+        self.assertEqual(warm.opt_in_note, "Opt-in in the uploaded sheet")
+
+    def test_locked_contacts_are_never_queued_drafted_or_sent(self) -> None:
+        self.campaign.status = WaCampaign.Status.LIVE
+        self.campaign.save()
+        c = self.locked()
+        self.assertNotIn(c.pk, [q["contact"].pk for q in whatsapp.queue()])
+        with self.assertRaisesMessage(whatsapp.WaError, "Not opted in"):
+            whatsapp.draft(c, "first")
+        with self.assertRaisesMessage(whatsapp.WaError, "Not opted in"):
+            whatsapp.mark_sent(c, "first", "Hi", "staff@zinwe.io")
+        r = self.api.post(f"{BASE}/contacts/{c.pk}/draft/", {"kind": "first"}, format="json")
+        self.assertEqual(r.status_code, 400)
+
+    def test_opting_in_needs_a_note_then_they_are_queued(self) -> None:
+        self.campaign.status = WaCampaign.Status.LIVE
+        self.campaign.save()
+        c = self.locked()
+        url = f"{BASE}/contacts/{c.pk}/act/"
+        self.assertEqual(self.api.post(url, {"action": "optin"}, format="json").status_code, 400)
+        data = self.api.post(url, {"action": "optin", "note": "Said yes by email, 5 Nov"}, format="json").json()
+        self.assertEqual((data["opted_in"], data["opt_in_note"]), (True, "Said yes by email, 5 Nov"))
+        self.assertIn(c.pk, [q["contact"].pk for q in whatsapp.queue()])
+
+    def test_a_yes_or_their_own_message_counts_as_agreement(self) -> None:
+        a, b = self.locked("+919810000502"), self.locked("+919810000503")
+        whatsapp.act(a, "interested")
+        whatsapp.record_reply(b, "Hello, saw your site", "staff@zinwe.io")
+        a.refresh_from_db()
+        b.refresh_from_db()
+        self.assertTrue(a.opted_in and b.opted_in)
+        self.assertIn("Said yes", a.opt_in_note)
+        self.assertIn("messaged us", b.opt_in_note)
+
+    def test_contacts_from_before_count_as_opted_in(self) -> None:
+        self.assertTrue(self.contact("+919810000504").opted_in)

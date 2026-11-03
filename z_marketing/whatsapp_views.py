@@ -51,9 +51,10 @@ class WaContactSerializer(serializers.ModelSerializer):
         fields = [
             "id", "campaign", "campaign_name", "phone", "first_name", "firm", "segment", "country", "city", "source", "info",
             "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "last", "track", "yes_date",
-            "nurture_day", "first_sent",
+            "nurture_day", "first_sent", "opted_in", "opt_in_note",
         ]
         read_only_fields = [
+            "opted_in", "opt_in_note",
             "phone", "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "yes_date", "nurture_day",
             "first_sent",
         ]
@@ -155,7 +156,7 @@ class WaContactActionView(Staff):
             elif action == "reply":
                 whatsapp.record_reply(c, str(request.data.get("text", "")), actor)
             elif action == "act":
-                whatsapp.act(c, str(request.data.get("action", "")))
+                whatsapp.act(c, str(request.data.get("action", "")), str(request.data.get("note", "")))
             else:
                 return Response({"detail": "Unknown action."}, status=status.HTTP_404_NOT_FOUND)
         except WaError as exc:
