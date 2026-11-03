@@ -8,7 +8,9 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from z_auth import billing
-from z_auth.models import Announcement, Feedback, Invoice, ManualPayment, Plan, ReleaseNote, Subscription, Testimonial
+from z_auth.models import (
+    Announcement, Feedback, Invoice, Issue, ManualPayment, Plan, ReleaseNote, Subscription, Testimonial,
+)
 from z_devices.models import AgentRelease
 from z_devices.services import release_adoption
 from z_notification.models import Notification
@@ -616,3 +618,29 @@ class ReleaseNoteSerializer(serializers.ModelSerializer):
         if not value.strip():
             raise serializers.ValidationError('Which version is it, e.g. "1.1"?')
         return value.strip()
+
+
+class IssueRowSerializer(serializers.ModelSerializer):
+    """One reported issue in the admin's Issues inbox."""
+
+    customer = serializers.SerializerMethodField()
+    has_screenshot = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Issue
+        fields = [
+            "id", "description", "page", "context", "contact_ok", "status", "reply", "replied_at", "resolved_at",
+            "created_at", "customer", "has_screenshot",
+        ]
+
+    def get_has_screenshot(self, obj: Issue) -> bool:
+        return bool(obj.screenshot)
+
+    def get_customer(self, obj: Issue) -> dict[str, Any]:
+        company = getattr(obj.owner, "owned_company", None)
+        return {
+            "id": obj.owner_id,
+            "email": obj.owner.email,
+            "full_name": obj.owner.full_name,
+            "company": company.name if company else None,
+        }

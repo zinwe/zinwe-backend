@@ -38,6 +38,7 @@ from z_auth.models import (
     CustomerRemark,
     Feedback,
     Invoice,
+    Issue,
     ManualPayment,
     Plan,
     Subscription,
@@ -725,6 +726,7 @@ def badges() -> dict[str, int]:
         "support_waiting": _support_waiting(),
         "forms_new": new_count(),
         "logs_attention": OpsEvent.objects.filter(unresolved=True).count(),
+        "issues_new": Issue.objects.filter(status=Issue.Status.NEW).count(),
     }
 
 
@@ -808,3 +810,73 @@ def _revenue_series(months: int) -> list[dict[str, Any]]:
         total = by_month.get((year, month), Decimal("0"))
         out.append({"month": f"{year:04d}-{month:02d}", "revenue_inr": str(total or Decimal("0"))})
     return out
+
+
+# --- Issues: problems owners report from the dashboard ---------------------------------------
+
+
+def issue_rows(wanted: str | None = None) -> list[Issue]:
+    rows = Issue.objects.select_related("owner__owned_company")
+    return list(rows.filter(status=wanted) if wanted else rows)
+
+
+def issue_counts() -> dict[str, int]:
+    counts = dict(Issue.objects.values_list("status").annotate(n=Count("id")))
+    return {s: counts.get(s, 0) for s in Issue.Status.values}
+
+
+def _issue_email_html(paragraphs: list[str]) -> str:
+    return "".join(f"<p>{html_lib.escape(p).replace(chr(10), '<br>')}</p>" for p in paragraphs if p.strip())
+
+
+def _quote(issue: Issue) -> str:
+    text = " ".join(issue.description.split())
+    return text if len(text) <= 160 else text[:157].rstrip() + "..."
+
+
+def reply_to_issue(issue: Issue, message: str, staff: User) -> Issue:
+    """Email the owner the team's reply about their report; a new report moves to "Looking into it"."""
+    message = (message or "").strip()
+    if not message:
+        raise AdminActionError("Write a reply first.")
+    if not issue.contact_ok:
+        raise AdminActionError("They asked not to get emails about this report.")
+    send_customer_email(
+        issue.owner, f"About the issue you reported (#{issue.pk})",
+        _issue_email_html([f"You told us: \u201c{_quote(issue)}\u201d", message]), staff,
+    )
+    issue.reply, issue.replied_at = message[:4000], timezone.now()
+    if issue.status == Issue.Status.NEW:
+        issue.status = Issue.Status.LOOKING
+    issue.save(update_fields=["reply", "replied_at", "status", "updated_at"])
+    track("admin.issue_reply", {"issue": issue.pk}, actor_email=staff.email, ref=issue.owner)
+    return issue
+
+
+def set_issue_status(issue: Issue, new_status: str, staff: User) -> tuple[Issue, str]:
+    """
+    Move a report along. Marking it Fixed emails the owner (when they agreed to updates).
+    Returns the issue and an email note: "" (none sent), "sent", or why it failed (the status is saved anyway).
+    """
+    if new_status not in Issue.Status.values:
+        raise AdminActionError(f"Unknown status '{new_status}'.")
+    was = issue.status
+    issue.status = new_status
+    issue.resolved_at = timezone.now() if new_status in (Issue.Status.FIXED, Issue.Status.CLOSED) else None
+    issue.save(update_fields=["status", "resolved_at", "updated_at"])
+    track("admin.issue_status", {"issue": issue.pk, "from": was, "to": new_status}, actor_email=staff.email, ref=issue.owner)
+    if new_status != Issue.Status.FIXED or was == Issue.Status.FIXED or not issue.contact_ok:
+        return issue, ""
+    try:
+        send_customer_email(
+            issue.owner, f"Fixed: the issue you reported (#{issue.pk})",
+            _issue_email_html([
+                f"Good news: the issue you reported is fixed. You told us: \u201c{_quote(issue)}\u201d",
+                "If you still see it, reply to this email or report it again from Help & support, and we'll look at it "
+                "straight away. Thank you for telling us.",
+            ]),
+            staff,
+        )
+    except AdminActionError as exc:
+        return issue, str(exc)
+    return issue, "sent"

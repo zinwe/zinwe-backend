@@ -1,6 +1,7 @@
 """Validation and response shapes for the owner portal: company, subscription, payments."""
 from __future__ import annotations
 
+import json
 import os
 import re
 from decimal import Decimal
@@ -14,7 +15,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from .billing import amount_due, can_renew, days_left, latest_payment, renewal_period
-from .models import Company, Feedback, ManualPayment, Plan, Subscription
+from .models import Company, Feedback, Issue, ManualPayment, Plan, Subscription
 from .serializers import PICK_ONE, REQUIRED_MESSAGES, PlanSerializer, StrippedChoiceField
 
 GSTIN_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
@@ -357,3 +358,84 @@ class FeedbackSerializer(serializers.ModelSerializer):
         model = Feedback
         fields = ["id", "rating", "message", "page", "created_at"]
         read_only_fields = ["id", "created_at"]
+
+
+SCREENSHOT_TYPES = {
+    # extension -> accepted leading bytes (a WebP is RIFF....WEBP: checked below)
+    ".png": (b"\x89PNG\r\n\x1a\n",),
+    ".jpg": (b"\xff\xd8\xff",),
+    ".jpeg": (b"\xff\xd8\xff",),
+    ".webp": (b"RIFF",),
+}
+BAD_SCREENSHOT_TYPE = "Attach a PNG, JPG or WebP image."
+CONTEXT_KEYS = ("url", "viewport", "screen", "pixel_ratio", "browser", "platform", "language", "timezone", "app", "online")
+
+
+def clean_context(value: Any) -> dict[str, str]:
+    """Browser details sent with a report: known keys only, short text; anything else is dropped."""
+    if isinstance(value, (str, bytes)):
+        try:
+            value = json.loads(value or "{}")
+        except ValueError:
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    return {k: str(value[k])[:300] for k in CONTEXT_KEYS if value.get(k) not in (None, "")}
+
+
+class ContextField(serializers.Field):
+    """Browser details: a JSON object, or its text in a multipart form; cleaned by clean_context."""
+
+    def to_internal_value(self, data: Any) -> dict[str, str]:
+        return clean_context(data)
+
+    def to_representation(self, value: Any) -> Any:
+        return value
+
+
+class IssueSerializer(serializers.ModelSerializer):
+    """POST /api/auth/issues/ in (JSON, or multipart with a screenshot), and the owner's own reports out."""
+
+    description = serializers.CharField(
+        max_length=2000, trim_whitespace=True,
+        error_messages={
+            "required": "Tell us what went wrong.",
+            "blank": "Tell us what went wrong.",
+            "max_length": "Keep it under 2,000 characters.",
+        },
+    )
+    page = serializers.CharField(required=False, allow_blank=True, max_length=120)
+    screenshot = serializers.FileField(
+        write_only=True, required=False, allow_null=True, allow_empty_file=False,
+        error_messages={"invalid": BAD_SCREENSHOT_TYPE, "empty": "That image is empty.", "no_name": BAD_SCREENSHOT_TYPE},
+    )
+    context = ContextField(write_only=True, required=False)
+    contact_ok = serializers.BooleanField(required=False, default=True)
+    has_screenshot = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Issue
+        fields = [
+            "id", "description", "page", "screenshot", "context", "contact_ok", "has_screenshot", "status", "reply",
+            "replied_at", "resolved_at", "created_at",
+        ]
+        read_only_fields = ["id", "status", "reply", "replied_at", "resolved_at", "created_at"]
+
+    def get_has_screenshot(self, obj: Issue) -> bool:
+        return bool(obj.screenshot)
+
+    def validate_screenshot(self, value: UploadedFile | None) -> UploadedFile | None:
+        if value is None:
+            return None
+        if value.size > settings.ZINWE_ISSUE_SCREENSHOT_MAX_BYTES:
+            limit_mb = settings.ZINWE_ISSUE_SCREENSHOT_MAX_BYTES // (1024 * 1024)
+            raise serializers.ValidationError(f"The image is too large. The limit is {limit_mb} MB.")
+        ext = os.path.splitext(value.name or "")[1].lower()
+        signatures = SCREENSHOT_TYPES.get(ext)
+        head = value.read(16)
+        value.seek(0)
+        if not signatures or not any(head.startswith(sig) for sig in signatures):
+            raise serializers.ValidationError(BAD_SCREENSHOT_TYPE)
+        if ext == ".webp" and head[8:12] != b"WEBP":
+            raise serializers.ValidationError(BAD_SCREENSHOT_TYPE)
+        return value

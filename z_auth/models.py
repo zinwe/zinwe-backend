@@ -10,6 +10,8 @@ from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
 from django.contrib.auth.models import PermissionsMixin
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
 from django.utils import timezone
 
 
@@ -811,3 +813,53 @@ class ReleaseNote(models.Model):
     @property
     def is_live(self) -> bool:
         return self.published_at is not None and self.published_at <= timezone.now()
+
+
+def issue_screenshot_upload_to(instance: "Issue", filename: str) -> str:
+    """issues/<yyyy>/<mm>/<random>.<ext> -- never trust the uploaded file name."""
+    ext = os.path.splitext(filename)[1].lower()[:8]
+    now = timezone.now()
+    return f"issues/{now:%Y}/{now:%m}/{uuid.uuid4().hex}{ext}"
+
+
+class Issue(models.Model):
+    """
+    A problem an owner reports from the dashboard (Report an issue): what went wrong, where, an optional screenshot
+    and the browser details, so the team can reproduce and fix it. Kept apart from Feedback (a 1-10 rating) so
+    ratings and testimonials stay clean. The team works it in the admin app's Issues inbox and can email the owner.
+    """
+
+    class Status(models.TextChoices):
+        NEW = "new", "New"
+        LOOKING = "looking", "Looking into it"
+        FIXED = "fixed", "Fixed"
+        CLOSED = "closed", "Closed"
+
+    owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="issues")
+    description = models.TextField(max_length=2000)
+    page = models.CharField(max_length=120, blank=True, help_text="Dashboard page it happened on.")
+    screenshot = models.FileField(
+        upload_to=issue_screenshot_upload_to, blank=True,
+        help_text="PNG, JPG or WebP, up to 5 MB. Never public: the owner and staff only.",
+    )
+    context = models.JSONField(default=dict, blank=True, help_text="Browser details sent with the report.")
+    contact_ok = models.BooleanField(default=True, help_text="The owner agreed to email updates about this report.")
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.NEW, db_index=True)
+    reply = models.TextField(blank=True, max_length=4000, help_text="The team's last reply, as emailed.")
+    replied_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self) -> str:
+        return f"Issue #{self.pk} from {self.owner}"
+
+
+@receiver(post_delete, sender=Issue)
+def _delete_issue_screenshot(sender: type[Issue], instance: Issue, **kwargs: Any) -> None:
+    """A screenshot is personal data: it goes with its report, including when the account is deleted."""
+    if instance.screenshot:
+        instance.screenshot.delete(save=False)

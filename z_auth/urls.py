@@ -54,6 +54,8 @@ urlpatterns = [
     path("quotes/<str:token>/pdf/", portal_views.PublicQuotePdfView.as_view(), name="quote-public-pdf"),
     path("quotes/<str:token>/upi-qr/", portal_views.PublicQuoteUpiQrView.as_view(), name="quote-public-upi-qr"),
     path("feedback/", portal_views.FeedbackView.as_view(), name="feedback"),
+    path("issues/", portal_views.IssueView.as_view(), name="issues"),
+    path("issues/<int:issue_id>/screenshot/", portal_views.IssueScreenshotView.as_view(), name="issue-screenshot"),
     path("subscription/payments/", portal_views.PaymentHistoryView.as_view(), name="subscription-payments"),
     path(
         "subscription/payments/<int:payment_id>/invoice/",

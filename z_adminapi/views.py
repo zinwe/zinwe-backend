@@ -14,7 +14,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from z_analytics.services import track
-from z_auth.models import Announcement, ManualPayment, Plan, Subscription, User
+from z_auth.models import Announcement, Issue, ManualPayment, Plan, Subscription, User
 from z_auth.portal_views import invoice_pdf_response
 from z_devices.models import AgentRelease
 from z_devices.services import ReleaseRefused, is_valid_version, publish_release
@@ -22,6 +22,7 @@ from z_main.client import get_client_ip
 
 from . import services
 from .serializers import (
+    IssueRowSerializer,
     AdminSubscriptionSerializer,
     AnnouncementSerializer,
     ApprovePaymentSerializer,
@@ -264,7 +265,7 @@ class SendPasswordResetView(StaffView):
 
 
 class BadgesView(StaffView):
-    """GET /api/admin/badges/ -- {payments_waiting, support_waiting, forms_new} for the sidebar."""
+    """GET /api/admin/badges/ -- {payments_waiting, support_waiting, forms_new, logs_attention, issues_new} for the sidebar."""
 
     def get(self, request: Request) -> Response:
         return Response(services.badges())
@@ -379,6 +380,45 @@ class FeedbackListView(StaffView):
                 "rows": FeedbackRowSerializer(services.feedback_rows(), many=True).data,
             }
         )
+
+
+class IssueListView(StaffView):
+    """GET /api/admin/issues/?status=new|looking|fixed|closed -- {counts: {status: n}, rows: [...]}, newest first."""
+
+    def get(self, request: Request) -> Response:
+        wanted = request.query_params.get("status") or None
+        if wanted and wanted not in Issue.Status.values:
+            return Response({"detail": f"Unknown status '{wanted}'."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {"counts": services.issue_counts(), "rows": IssueRowSerializer(services.issue_rows(wanted), many=True).data}
+        )
+
+
+class IssueDetailView(StaffView):
+    """
+    PATCH /api/admin/issues/<id>/ -- {status}. Fixed emails the owner when they agreed to updates;
+    the answer carries `email`: "" (none), "sent", or why it failed (the status is saved either way).
+    """
+
+    def patch(self, request: Request, pk: int) -> Response:
+        issue = get_object_or_404(Issue.objects.select_related("owner__owned_company"), pk=pk)
+        try:
+            issue, email = services.set_issue_status(issue, str(request.data.get("status", "")), request.user)
+        except services.AdminActionError as exc:
+            return _refused(exc)
+        return Response({**IssueRowSerializer(issue).data, "email": email})
+
+
+class IssueReplyView(StaffView):
+    """POST /api/admin/issues/<id>/reply/ -- {message}: emailed to the owner, saved on the report."""
+
+    def post(self, request: Request, pk: int) -> Response:
+        issue = get_object_or_404(Issue.objects.select_related("owner__owned_company"), pk=pk)
+        try:
+            issue = services.reply_to_issue(issue, str(request.data.get("message", "")), request.user)
+        except services.AdminActionError as exc:
+            return _refused(exc)
+        return Response(IssueRowSerializer(issue).data)
 
 
 class ReleaseListView(StaffView):

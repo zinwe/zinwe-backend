@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+from typing import Any
 
 from django.http import FileResponse, Http404, HttpResponse
 from django.shortcuts import get_object_or_404
@@ -16,8 +17,9 @@ from rest_framework.views import APIView
 
 from . import billing
 from .company import CompanyExists, get_company, register_company, update_company
-from .models import Feedback, ManualPayment
+from .models import Feedback, Issue, ManualPayment
 from .portal_serializers import (
+    IssueSerializer,
     CompanySerializer,
     FeedbackSerializer,
     PaymentSerializer,
@@ -232,6 +234,57 @@ class FeedbackView(APIView):
         serializer.is_valid(raise_exception=True)
         feedback = serializer.save(owner=request.user)
         return Response(FeedbackSerializer(feedback).data, status=status.HTTP_201_CREATED)
+
+
+class IssueView(APIView):
+    """
+    GET  /api/auth/issues/ -- the owner's own reports, newest first (last 20), with status and the team's reply.
+    POST /api/auth/issues/ -- {description, page?, context?, contact_ok?} as JSON, or multipart with a `screenshot`
+         (PNG, JPG or WebP, up to 5 MB). The team works it in the admin app's Issues inbox.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+    throttle_scope = "issues"
+
+    def get_throttles(self):  # type: ignore[no-untyped-def]
+        return [ScopedRateThrottle()] if self.request.method == "POST" else []
+
+    def get(self, request: Request) -> Response:
+        return Response(IssueSerializer(Issue.objects.filter(owner=request.user)[:20], many=True).data)
+
+    def post(self, request: Request) -> Response:
+        serializer = IssueSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        issue = serializer.save(owner=request.user)
+        return Response(IssueSerializer(issue).data, status=status.HTTP_201_CREATED)
+
+
+def screenshot_response(file: Any, name: str) -> FileResponse:
+    """Stream a stored screenshot inline (it was checked to be PNG, JPG or WebP on upload). 404 if it's gone."""
+    try:
+        handle = file.open("rb")
+    except FileNotFoundError as exc:
+        raise Http404("The screenshot file is missing.") from exc
+    ext = os.path.splitext(file.name)[1].lower()
+    content_type = {".png": "image/png", ".webp": "image/webp"}.get(ext, "image/jpeg")
+    response = FileResponse(handle, filename=f"{name}{ext}", content_type=content_type)
+    response["Content-Security-Policy"] = "default-src 'none'"
+    response["Cache-Control"] = "private, no-store"
+    return response
+
+
+class IssueScreenshotView(APIView):
+    """GET /api/auth/issues/<id>/screenshot/ -- the screenshot sent with a report: its owner, or staff."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request: Request, issue_id: int) -> FileResponse:
+        rows = Issue.objects.all() if request.user.is_staff else Issue.objects.filter(owner=request.user)
+        issue = rows.filter(pk=issue_id).first()
+        if issue is None or not issue.screenshot:
+            raise Http404("No screenshot.")
+        return screenshot_response(issue.screenshot, f"issue-{issue.pk}-screenshot")
 
 
 # --- Shared quotes (z_auth.quotes) ------------------------------------------------------------

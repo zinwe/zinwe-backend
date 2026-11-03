@@ -241,6 +241,7 @@ REST_FRAMEWORK = {
         "support": "30/hour",
         "payment_submit": "10/hour",
         "feedback": "20/hour",
+        "issues": "10/hour",
         "quote_email": "10/hour",
         "quote_public": "120/hour",
         "upi_qr": "60/hour",
@@ -479,6 +480,7 @@ if ZINWE_EMAIL_LOGO_URL.strip().lower() in {"text", "none", "off"}:
 # The sender's postal address in the footer of marketing emails (the series newsletter).
 ZINWE_POSTAL_ADDRESS = env_str("ZINWE_POSTAL_ADDRESS", "SKYTECHNO, New Delhi, India")
 ZINWE_PAYMENT_PROOF_MAX_BYTES = 5 * 1024 * 1024
+ZINWE_ISSUE_SCREENSHOT_MAX_BYTES = 5 * 1024 * 1024
 
 # --- Logging ----------------------------------------------------------------
 
