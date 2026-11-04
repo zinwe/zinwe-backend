@@ -154,4 +154,4 @@ class LockedPriceTests(_UpgradeBase):
         renewal = pricing.quote_for_subscription(sub)
         self.assertEqual((renewal.amount, renewal.total), (Decimal("999.00"), Decimal("1178.82")))
         upgrade = pricing.quote_for_subscription(sub, Plan.objects.get(code="businesses"))
-        self.assertEqual(upgrade.amount, Decimal("2834.00"))
+        self.assertEqual(upgrade.amount, Decimal("2915.00"))

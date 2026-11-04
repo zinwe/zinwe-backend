@@ -102,7 +102,16 @@ class PricingView(StaffView):
 
 
 class PricingDetailView(StaffView):
-    """PATCH /api/admin/pricing/<code>/ -- change a plan's prices (and which plan is recommended)."""
+    """
+    GET   /api/admin/pricing/<code>/ -- one plan's prices, price band and allowed discounts (F-12).
+    PATCH /api/admin/pricing/<code>/ -- change a plan's prices, band (and which plan is recommended).
+    """
+
+    def get(self, request: Request, code: str) -> Response:
+        from .pricing import plan_pricing
+
+        plan = get_object_or_404(Plan, code=code, is_active=True)
+        return Response(plan_pricing(plan, plan.subscriptions.filter(status=Subscription.Status.ACTIVE, is_trial=False).count()))
 
     def patch(self, request: Request, code: str) -> Response:
         from .pricing import PricingUpdateSerializer, plan_pricing

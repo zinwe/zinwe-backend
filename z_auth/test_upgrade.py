@@ -18,7 +18,7 @@ ME = "/api/auth/me/"
 
 def payment_form(**overrides):  # type: ignore[no-untyped-def]
     return {
-        "method": "upi", "amount_inr": "2834", "reference": "UTR-UP",
+        "method": "upi", "amount_inr": "2915", "reference": "UTR-UP",
         "paid_on": timezone.localdate().isoformat(), "payer_name": "Asha Verma", "accept_terms": "true",
         **overrides,
     }
@@ -63,7 +63,7 @@ class UpgradeTests(_UpgradeBase):
         verify_payment(payment.pk, self.staff)
         sub.refresh_from_db()
         payment.refresh_from_db()
-        self.assertEqual((sub.plan.code, sub.status, str(sub.amount_inr)), ("businesses", "active", "2834.00"))
+        self.assertEqual((sub.plan.code, sub.status, str(sub.amount_inr)), ("businesses", "active", "2915.00"))
         carried = old_end - payment.covers_from
         self.assertLess(abs((sub.ends_at - (add_months(payment.covers_from, 1) + carried)).total_seconds()), 5)
         active = PlanActivation.objects.get(user=self.owner, is_active=True)

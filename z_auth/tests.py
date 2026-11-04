@@ -327,7 +327,7 @@ class PlanTests(APITestCase):
                 "free": ("Free forever", "0.00", 0, 3, False, False, 10),
                 "startups": ("Startups", "971.00", 0, 10, True, False, 20),
                 "teams": ("Teams", "1799.00", 0, 25, True, False, 25),
-                "businesses": ("Businesses", "2834.00", 0, 50, True, True, 30),
+                "businesses": ("Businesses", "2915.00", 0, 50, True, True, 30),
             },
         )
         # 0024: Teams sits between Startups and Businesses (owner decision 2026-10-17).
@@ -358,7 +358,7 @@ class PlanTests(APITestCase):
         # Pricing (0017): list prices up 35%, then 28% / 30% off — what owners pay follows the list price.
         self.assertEqual(
             {code: (str(p.list_price_inr_monthly), p.discount_percent) for code, p in plans.items() if p.is_active},
-            {"free": ("0.00", 0), "startups": ("1349.00", 28), "teams": ("2499.00", 28), "businesses": ("4049.00", 30)},
+            {"free": ("0.00", 0), "startups": ("1349.00", 28), "teams": ("2499.00", 28), "businesses": ("4049.00", 28)},
         )
         for plan in active:
             self.assertTrue(plan.tagline, plan.code)

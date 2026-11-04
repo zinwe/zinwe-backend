@@ -211,13 +211,13 @@ class PlanListTests(PortalTestCase):
             plans["businesses"],
             {
                 "code": "businesses", "name": "Businesses", "tagline": plans["businesses"]["tagline"],
-                "price_inr_monthly": "2834.00", "list_price_inr_monthly": "4049.00", "discount_percent": 30,
+                "price_inr_monthly": "2915.00", "list_price_inr_monthly": "4049.00", "discount_percent": 28,
                 "price_usd_monthly": "34.00", "list_price_usd_monthly": "48.00", "quote": plans["businesses"]["quote"],
                 "prices": {
                     "INR": {
-                        "monthly": {"list": "4049.00", "price": "2834.00"},
+                        "monthly": {"list": "4049.00", "price": "2915.00"},
                         "yearly": {"list": "48588.00", "price": "28340.00"},
-                        "yearly_saving_percent": 17,
+                        "yearly_saving_percent": 19,  # F-12: 28% off the month, the year kept at Rs 28,340
                     },
                     "USD": {
                         "monthly": {"list": "48.00", "price": "34.00"},
@@ -371,7 +371,7 @@ class SubscriptionTests(PortalTestCase):
 
     def test_businesses_waits_for_payment(self) -> None:
         body = self.subscribe("businesses").json()
-        self.assertEqual((body["status"], body["is_trial"], body["amount_inr"]), ("pending_payment", False, "2834.00"))
+        self.assertEqual((body["status"], body["is_trial"], body["amount_inr"]), ("pending_payment", False, "2915.00"))
         self.assertFalse(PlanActivation.objects.exists())
         self.assertEqual(len(mail.outbox), 0)
         self.assertEqual(self.step(), "payment")
@@ -424,7 +424,7 @@ class SubscriptionTests(PortalTestCase):
         body = response.json()
         self.assertEqual(body["status"], "pending_payment")
         self.assertFalse(body["is_trial"])
-        self.assertEqual(body["amount_inr"], "2834.00")
+        self.assertEqual(body["amount_inr"], "2915.00")
         self.assertIsNone(body["starts_at"])
         self.assertEqual(len(mail.outbox), 0)
         self.assertEqual(self.step(), "payment")
@@ -438,7 +438,7 @@ class SubscriptionTests(PortalTestCase):
         body = self.subscribe("businesses").json()
         self.assertEqual(body["status"], "pending_payment")
         self.assertFalse(body["is_trial"])
-        self.assertEqual(body["amount_inr"], "2834.00")
+        self.assertEqual(body["amount_inr"], "2915.00")
 
     def test_legacy_free_trial_plan_can_be_used_once(self) -> None:
         # A free plan with trial_days (the old early-access shape) is a trial too.
@@ -761,7 +761,7 @@ class AdminReviewTests(MediaMixin, PortalTestCase):
         again = self.post(SUB_URL, {"plan": "businesses"})
         self.assertEqual(again.json().get("status"), "pending_payment", again.content)
         payment_id = self.post(
-            PAY_URL, payment_form(amount_inr="2834", method="bank_transfer"), fmt="multipart"
+            PAY_URL, payment_form(amount_inr="2915", method="bank_transfer"), fmt="multipart"
         ).json()["id"]
         self.use_token(None)
         self.client.force_login(self.admin)
@@ -770,7 +770,7 @@ class AdminReviewTests(MediaMixin, PortalTestCase):
 
         self.assertEqual(ManualPayment.objects.get(pk=payment_id).status, "verified")
         paid = Subscription.objects.get(owner=other, status="active")
-        self.assertEqual((paid.plan.code, paid.is_trial, str(paid.amount_inr)), ("businesses", False, "2834.00"))
+        self.assertEqual((paid.plan.code, paid.is_trial, str(paid.amount_inr)), ("businesses", False, "2915.00"))
         self.assertEqual(paid.ends_at, add_months(paid.starts_at, 1))
         activation = PlanActivation.objects.get(user=other, is_active=True)
         self.assertEqual((activation.plan.code, activation.source), ("businesses", "manual-payment"))
@@ -900,7 +900,7 @@ class JourneyTests(MediaMixin, PortalTestCase):
         plans = {p["code"]: p for p in self.get(PLANS_URL).json()}
         self.assertFalse(plans["businesses"]["trial_available"])
         body = self.post(SUB_URL, {"plan": "businesses"}).json()
-        self.assertEqual((body["status"], body["is_trial"], body["amount_inr"]), ("pending_payment", False, "2834.00"))
+        self.assertEqual((body["status"], body["is_trial"], body["amount_inr"]), ("pending_payment", False, "2915.00"))
         self.assertEqual(self.step()["step"], "payment")
         self.assertNotIn("Your free Zinwe Businesses trial has started", [m.subject for m in mail.outbox])
 

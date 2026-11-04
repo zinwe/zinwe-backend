@@ -6,7 +6,11 @@ Plans & pricing in the admin app (2026-10-23): what each plan costs, by region a
   discount, rounded to a whole unit); a year is its own price (empty = 12 months), shown against 12 x the
   monthly list price.
 
-GET /api/admin/pricing/ lists every plan with its prices; PATCH /api/admin/pricing/<code>/ changes them. Owners
+F-12: each paid plan has a price band for its monthly INR price (D1: list prices stay real, any discount is
+allowed as long as the price stays in the band). A change that takes the price outside it is refused, and each
+plan carries `allowed_discounts`, the whole-number discounts that keep it inside.
+
+GET /api/admin/pricing/ lists every plan with its prices; GET/PATCH /api/admin/pricing/<code>/ one plan. Owners
 already paying keep the price they signed up at (z_auth.pricing.quote_for_subscription); a change applies to new
 subscriptions, upgrades and changes of cycle.
 """
@@ -51,6 +55,28 @@ def _region(plan: Plan, currency: str) -> dict[str, Any]:
     }
 
 
+def _rupees(value: Decimal) -> str:
+    return f"₹{value:,.0f}"
+
+
+def band_error(plan: Plan, price: Decimal) -> str:
+    """ "Puts the price at ₹2,834, outside ₹2,899–₹3,000." """
+    low = _rupees(plan.band_min_inr) if plan.band_min_inr is not None else "₹0"
+    high = _rupees(plan.band_max_inr) if plan.band_max_inr is not None else "any price"
+    return f"Puts the price at {_rupees(price)}, outside {low}–{high}."
+
+
+def allowed_discounts(plan: Plan) -> list[int]:
+    """The whole-number discounts (0-90) on the INR monthly list price that keep the price in the plan's band."""
+    if not plan.requires_payment or not plan.list_price_inr_monthly or plan.list_price_inr_monthly <= 0:
+        return [] if plan.requires_payment else [0]
+    return [pct for pct in range(91) if plan.in_band(Plan.discounted(plan.list_price_inr_monthly, pct))]
+
+
+def _band(value: Decimal | None) -> str | None:
+    return str(value) if value is not None else None
+
+
 def plan_pricing(plan: Plan, subscribers: int = 0) -> dict[str, Any]:
     return {
         "code": plan.code,
@@ -61,6 +87,9 @@ def plan_pricing(plan: Plan, subscribers: int = 0) -> dict[str, Any]:
         "is_free": not plan.requires_payment,
         "subscribers": subscribers,
         "regions": {"INR": _region(plan, pricing.INR), "USD": _region(plan, pricing.USD)},
+        "band_min_inr": _band(plan.band_min_inr),
+        "band_max_inr": _band(plan.band_max_inr),
+        "allowed_discounts": allowed_discounts(plan),
     }
 
 
@@ -89,11 +118,20 @@ class RegionPriceInput(serializers.Serializer):
 
 
 class PricingUpdateSerializer(serializers.Serializer):
-    """PATCH /api/admin/pricing/<code>/: {INR: {...}, USD: {...}, is_recommended?}, each part optional."""
+    """
+    PATCH /api/admin/pricing/<code>/: {INR: {...}, USD: {...}, is_recommended?, band_min_inr?, band_max_inr?}, each
+    part optional. Refused (400 on `discount_percent`) when the INR monthly price would leave the plan's band.
+    """
 
     INR = RegionPriceInput(required=False)
     USD = RegionPriceInput(required=False)
     is_recommended = serializers.BooleanField(required=False)
+    band_min_inr = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False, allow_null=True,
+    )
+    band_max_inr = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False, allow_null=True,
+    )
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         plan: Plan = self.context["plan"]
@@ -110,7 +148,28 @@ class PricingUpdateSerializer(serializers.Serializer):
             yearly = region.get("yearly_price")
             if yearly is not None and month > 0 and yearly > month * 12:
                 raise serializers.ValidationError(f"{name}: a year can't cost more than 12 months.")
+        self._check_band(plan, attrs)
         return attrs
+
+    @staticmethod
+    def _check_band(plan: Plan, attrs: dict[str, Any]) -> None:
+        """F-12: the INR monthly price this change leads to must stay in the (new) band. The free plan has none."""
+        if not plan.requires_payment:
+            if attrs.get("band_min_inr") is not None or attrs.get("band_max_inr") is not None:
+                raise serializers.ValidationError("The free plan has no price band.")
+            return
+        banded = Plan(
+            band_min_inr=attrs["band_min_inr"] if "band_min_inr" in attrs else plan.band_min_inr,
+            band_max_inr=attrs["band_max_inr"] if "band_max_inr" in attrs else plan.band_max_inr,
+        )
+        if banded.band_min_inr is not None and banded.band_max_inr is not None and banded.band_min_inr > banded.band_max_inr:
+            raise serializers.ValidationError({"band_max_inr": ["The band's top can't be below its bottom."]})
+        region = attrs.get("INR")
+        price = (
+            Plan.discounted(region["list_monthly"], region["discount_percent"]) if region else plan.price_inr_monthly
+        )
+        if not banded.in_band(price):
+            raise serializers.ValidationError({"discount_percent": [band_error(banded, price)]})
 
     def save(self, **kwargs: Any) -> Plan:
         plan: Plan = self.context["plan"]
@@ -129,6 +188,10 @@ class PricingUpdateSerializer(serializers.Serializer):
             plan.price_usd_monthly = Plan.discounted(region["list_monthly"], region["discount_percent"])
             plan.price_usd_yearly = region.get("yearly_price") if region["list_monthly"] > 0 else None
             fields += ["list_price_usd_monthly", "price_usd_monthly", "price_usd_yearly"]
+        for field in ("band_min_inr", "band_max_inr"):
+            if field in data:
+                setattr(plan, field, data[field])
+                fields.append(field)
         if "is_recommended" in data:
             if data["is_recommended"]:
                 Plan.objects.exclude(pk=plan.pk).update(is_recommended=False)

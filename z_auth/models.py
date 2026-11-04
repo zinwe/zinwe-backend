@@ -148,6 +148,16 @@ class Plan(models.Model):
         default=0, validators=[MaxValueValidator(90)],
         help_text="Off the list price (0–90). The price owners pay is the list price minus this, rounded to a rupee.",
     )
+    # F-12 / D1: the lowest and highest monthly INR price the plan may sell at. The admin's Pricing page refuses a
+    # discount that takes the price outside it. Empty = no limit on that side.
+    band_min_inr = models.DecimalField(
+        "price band from (INR / month)", max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text="The lowest monthly price in rupees a discount may bring this plan to.",
+    )
+    band_max_inr = models.DecimalField(
+        "price band to (INR / month)", max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text="The highest monthly price in rupees this plan may sell at.",
+    )
     # International customers (company outside India) pay in USD, billed yearly (z_auth.pricing).
     price_usd_monthly = models.DecimalField(
         "price (USD / month)", max_digits=10, decimal_places=2, default=0,
@@ -203,6 +213,12 @@ class Plan(models.Model):
         """The list price minus the discount, rounded to a whole rupee (half up)."""
         value = Decimal(list_price) * (100 - discount_percent) / 100
         return value.quantize(Decimal("1"), rounding=ROUND_HALF_UP).quantize(Decimal("0.01"))
+
+    def in_band(self, price: Decimal) -> bool:
+        """F-12: is this monthly INR price inside the plan's price band (no band = always)?"""
+        return (self.band_min_inr is None or price >= self.band_min_inr) and (
+            self.band_max_inr is None or price <= self.band_max_inr
+        )
 
     def save(self, *args: Any, **kwargs: Any) -> None:
         # A list price makes the paid price follow it: list price minus the discount. Billing only ever
