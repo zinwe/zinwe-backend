@@ -960,12 +960,14 @@ class Zingle(models.Model):
     F-15: our own animated logo for a special day (Diwali, New Year...), scheduled by the team in the admin app
     (Publish -> Zingles). While one is live the website (with sign-in) and/or the dashboard show it in place of the
     logo; `still` is shown to people who prefer reduced motion. The live one is the latest `starts_at`.
+    `show_app` also shows it in the Windows app; `places = none` keeps it off the web (then `show_app` is required).
     """
 
     class Places(models.TextChoices):
         WEBSITE = "website", "Website and sign-in"
         DASHBOARD = "dashboard", "Dashboard"
         BOTH = "both", "Website, sign-in and dashboard"
+        NONE = "none", "Not on the web (Windows app only)"
 
     name = models.CharField(max_length=80)
     animated = models.FileField(upload_to=zingle_upload_to, help_text="GIF or WebP, up to 2 MB.")
@@ -974,6 +976,7 @@ class Zingle(models.Model):
     starts_at = models.DateTimeField(default=timezone.now)
     ends_at = models.DateTimeField(null=True, blank=True, help_text="Empty = until switched off.")
     places = models.CharField(max_length=10, choices=Places.choices, default=Places.BOTH)
+    show_app = models.BooleanField("Windows app", default=False, help_text="Also show it in the Windows app's title bar.")
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

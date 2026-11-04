@@ -44,9 +44,9 @@ class ZingleTests(APITestCase):
         }
         return self.client.post(ADMIN, data, format="multipart")
 
-    def public(self):  # type: ignore[no-untyped-def]
+    def public(self, query: str = ""):  # type: ignore[no-untyped-def]
         self.client.force_authenticate(None)
-        response = self.client.get(PUBLIC)
+        response = self.client.get(PUBLIC + query)
         self.client.force_authenticate(self.staff)
         return response
 
@@ -61,7 +61,8 @@ class ZingleTests(APITestCase):
         response = self.public()
         self.assertEqual(response["Cache-Control"], "public, max-age=300")
         body = response.json()
-        self.assertEqual(set(body), {"id", "animated_url", "still_url", "alt", "places"})
+        self.assertEqual(set(body), {"id", "animated_url", "still_url", "alt", "places", "app"})
+        self.assertIs(body["app"], False)
         self.assertEqual((body["id"], body["alt"], body["places"]), (row["id"], "Diyas light up around the Zinwe mark", "both"))
         self.client.force_authenticate(None)
         image = self.client.get(body["animated_url"])
@@ -112,3 +113,55 @@ class ZingleTests(APITestCase):
         owner = User.objects.create_user("owner@acme.in", "pw-12345678")
         self.client.force_authenticate(owner)
         self.assertEqual(self.client.get(ADMIN).status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_the_windows_app_reads_its_own_zingle(self) -> None:
+        now = timezone.now()
+        self.assertIsNone(self.public("?for=app").json())
+        app = self.create(name="App", show_app="true", starts_at=(now - timedelta(days=1)).isoformat()).json()
+        self.assertIs(app["show_app"], True)
+        web = self.create(name="Web", starts_at=(now - timedelta(hours=1)).isoformat()).json()
+        self.assertIs(web["show_app"], False)
+
+        response = self.public("?for=app")
+        self.assertEqual(response["Cache-Control"], "public, max-age=300")
+        body = response.json()
+        self.assertEqual(set(body), {"id", "animated_url", "still_url", "alt", "places", "app", "updated_at"})
+        self.assertEqual((body["id"], body["app"]), (app["id"], True))
+        self.assertEqual(body["updated_at"], Zingle.objects.get(pk=app["id"]).updated_at.isoformat())
+        # The web still reads the latest one, which isn't in the app; both are live somewhere.
+        self.assertEqual((self.public().json()["id"], self.public().json()["app"]), (web["id"], False))
+        statuses = {r["name"]: r["status"] for r in self.client.get(ADMIN).json()}
+        self.assertEqual(statuses, {"App": "live", "Web": "live"})
+
+    def test_places_none_is_the_app_only_and_never_on_the_web(self) -> None:
+        refused = self.create(places="none")
+        self.assertEqual(refused.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("places", refused.json())
+        self.assertEqual(self.create(places="nowhere", show_app="true").status_code, status.HTTP_400_BAD_REQUEST)
+
+        older = self.create(name="Older", starts_at=(timezone.now() - timedelta(days=1)).isoformat()).json()
+        app_only = self.create(name="App only", places="none", show_app="true")
+        self.assertEqual(app_only.status_code, status.HTTP_201_CREATED, app_only.content)
+        self.assertEqual(self.public().json()["id"], older["id"])
+        self.assertEqual(self.public("?for=app").json()["id"], app_only.json()["id"])
+
+        # Taking it off the app as well would show it nowhere: refused, on a PATCH too.
+        url = f"{ADMIN}{app_only.json()['id']}/"
+        self.assertEqual(self.client.patch(url, {"show_app": "false"}, format="multipart").status_code,
+                         status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.client.patch(f"{ADMIN}{older['id']}/", {"places": "none"}, format="multipart").status_code,
+                         status.HTTP_400_BAD_REQUEST)
+
+    def test_a_change_clears_both_cached_answers(self) -> None:
+        row = self.create(show_app="true").json()
+        self.assertEqual((self.public().json()["id"], self.public("?for=app").json()["id"]), (row["id"], row["id"]))
+        # Leaving the app: the app answer goes at once, the web one now says app = false.
+        self.client.patch(f"{ADMIN}{row['id']}/", {"show_app": "false"}, format="multipart")
+        self.assertIsNone(self.public("?for=app").json())
+        self.assertIs(self.public().json()["app"], False)
+        self.client.patch(f"{ADMIN}{row['id']}/", {"show_app": "true", "places": "none"}, format="multipart")
+        self.assertIsNone(self.public().json())
+        self.assertEqual(self.public("?for=app").json()["places"], "none")
+        self.client.delete(f"{ADMIN}{row['id']}/")
+        self.assertIsNone(self.public().json())
+        self.assertIsNone(self.public("?for=app").json())

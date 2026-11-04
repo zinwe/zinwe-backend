@@ -493,8 +493,9 @@ class WebsiteAnnouncementsView(APIView):
 
 class ZingleView(APIView):
     """
-    GET /api/auth/zingle/ -- the Zingle live now (F-15): {id, animated_url, still_url, alt, places}, or null.
-    Public and the same for everyone, so cached 5 minutes.
+    GET /api/auth/zingle/ -- the Zingle live now on the web (F-15): {id, animated_url, still_url, alt, places, app},
+    or null. `?for=app` -- the one live in the Windows app, with `updated_at` too. Public and the same for everyone,
+    so cached 5 minutes.
     """
 
     permission_classes = [AllowAny]
@@ -505,7 +506,7 @@ class ZingleView(APIView):
         from .zingles import CACHE_SECONDS, public_zingle
 
         # A JSON `null` when none is live (DRF would send an empty body for None).
-        response = JsonResponse(public_zingle(), safe=False)
+        response = JsonResponse(public_zingle(app=request.query_params.get("for") == "app"), safe=False)
         response["Cache-Control"] = f"public, max-age={CACHE_SECONDS}"
         return response
 
