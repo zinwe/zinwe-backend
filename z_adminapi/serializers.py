@@ -382,10 +382,25 @@ class UpdateReleaseSerializer(serializers.Serializer):
 # --- Announcements (notification bars on the dashboard and website) ---------------------------
 
 
+# extension -> leading bytes of an announcement picture (a WebP is RIFF....WEBP: checked by _check_image)
+ANNOUNCEMENT_IMAGE_TYPES = {
+    ".png": (b"\x89PNG\r\n\x1a\n",), ".jpg": (b"\xff\xd8\xff",), ".jpeg": (b"\xff\xd8\xff",), ".webp": (b"RIFF",),
+}
+
+
 class AnnouncementSerializer(serializers.ModelSerializer):
-    """GET/POST /api/admin/announcements/ and PATCH /<id>/: one pushed message plus its live status."""
+    """
+    GET/POST /api/admin/announcements/ and PATCH /<id>/: one pushed message plus its live status.
+    JSON, or multipart with an optional `image` (PNG, JPG or WebP, up to 2 MB); `remove_image=true` takes it off.
+    """
 
     status = serializers.SerializerMethodField()
+    image = serializers.FileField(write_only=True, required=False)
+    remove_image = serializers.BooleanField(write_only=True, required=False, default=False)
+    image_url = serializers.SerializerMethodField()
+    # On by default: a multipart form that leaves them out would otherwise read as "off".
+    is_active = serializers.BooleanField(required=False, default=True)
+    dismissible = serializers.BooleanField(required=False, default=True)
     created_by = serializers.SerializerMethodField()
     offer_plan = serializers.SlugRelatedField(
         slug_field="code", queryset=Plan.objects.filter(is_active=True), required=False, allow_null=True,
@@ -397,8 +412,9 @@ class AnnouncementSerializer(serializers.ModelSerializer):
         model = Announcement
         fields = (
             "id", "title", "body", "kind", "placement", "audience", "plan_codes", "owner_emails", "cta_label",
-            "cta_href", "offer_plan", "offer_price_inr", "offer_uses", "starts_at", "ends_at", "is_active",
-            "dismissible", "priority", "status", "created_by", "created_at", "updated_at",
+            "cta_href", "offer_plan", "offer_price_inr", "offer_uses", "image", "remove_image", "image_url",
+            "starts_at", "ends_at", "is_active", "dismissible", "priority", "status", "created_by", "created_at",
+            "updated_at",
         )
         read_only_fields = ("id", "status", "created_by", "offer_uses", "created_at", "updated_at")
 
@@ -421,6 +437,16 @@ class AnnouncementSerializer(serializers.ModelSerializer):
 
     def get_created_by(self, obj: Announcement) -> str:
         return obj.created_by.email if obj.created_by else ""
+
+    def get_image_url(self, obj: Announcement) -> str | None:
+        from z_auth.announcements import image_url
+
+        return image_url(obj)
+
+    def validate_image(self, value: Any) -> Any:
+        from z_auth.zingles import _check_image
+
+        return _check_image(value, ANNOUNCEMENT_IMAGE_TYPES, "Upload a PNG, JPG or WebP picture.")
 
     def validate_title(self, value: str) -> str:
         if not value.strip():
@@ -491,7 +517,25 @@ class AnnouncementSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"offer_plan": "Pick a paid plan."})
             if merged.get("placement") == Announcement.Placement.WEBSITE:
                 raise serializers.ValidationError({"placement": "Offers show on the dashboard (owners pay there)."})
+        if attrs.get("image") and attrs.get("remove_image"):
+            raise serializers.ValidationError({"image": "Upload a new picture or remove it, not both."})
         return attrs
+
+    def create(self, validated_data: dict[str, Any]) -> Announcement:
+        validated_data.pop("remove_image", None)
+        return super().create(validated_data)
+
+    def update(self, instance: Announcement, validated_data: dict[str, Any]) -> Announcement:
+        # A new picture replaces the old one, or `remove_image` takes it off: the old file is deleted once saved.
+        remove = validated_data.pop("remove_image", False)
+        old = instance.image if (remove or "image" in validated_data) and instance.image else None
+        old_file = (old.storage, old.name) if old else None
+        if remove:
+            validated_data["image"] = ""
+        instance = super().update(instance, validated_data)
+        if old_file and old_file[1] != instance.image.name:
+            old_file[0].delete(old_file[1])
+        return instance
 
 
 # --- Subscriptions (billing view: country, currency, tax, invoices) -----------------------------

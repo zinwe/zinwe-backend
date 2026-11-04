@@ -540,6 +540,33 @@ class ZingleFileView(APIView):
         return response
 
 
+class AnnouncementImageView(APIView):
+    """GET /api/auth/announcements/<id>/image/ -- a message's picture (public, long-cached: its URL is versioned)."""
+
+    permission_classes = [AllowAny]
+    authentication_classes: list = []
+    throttle_classes: list = []
+
+    def get(self, request: Request, announcement_id: int) -> FileResponse:
+        import os
+
+        from .models import Announcement
+        from .zingles import CONTENT_TYPES
+
+        file = get_object_or_404(Announcement, pk=announcement_id).image
+        if not file:
+            raise Http404("No image.")
+        try:
+            handle = file.open("rb")
+        except FileNotFoundError as exc:
+            raise Http404("The image file is missing.") from exc
+        content_type = CONTENT_TYPES.get(os.path.splitext(file.name)[1].lower(), "application/octet-stream")
+        response = FileResponse(handle, content_type=content_type)
+        response["Cache-Control"] = "public, max-age=31536000, immutable"
+        response["Content-Security-Policy"] = "default-src 'none'"
+        return response
+
+
 class AnnouncementsView(APIView):
     """
     GET /api/auth/announcements/ -- the dashboard notification-bar items for the signed-in owner:

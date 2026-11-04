@@ -700,6 +700,12 @@ class RenewalReminder(models.Model):
         return f"{self.get_kind_display()} reminder for subscription #{self.subscription_id}"
 
 
+def announcement_image_upload_to(instance: "Announcement", filename: str) -> str:
+    """announcements/<random>.<ext> -- never trust the uploaded file name."""
+    ext = os.path.splitext(filename)[1].lower()[:8]
+    return f"announcements/{uuid.uuid4().hex}{ext}"
+
+
 class Announcement(models.Model):
     """
     A message the Zinwe team pushes from the admin panel: an offer, a discount, news, an update, a wish or a
@@ -709,6 +715,7 @@ class Announcement(models.Model):
 
     F-11: placement "popup" is a moments pop-up on the dashboard instead of a bar. Its rhythm per owner (first visit,
     then after 2 days, then a week, at most 3 times, never more than one a day) is kept in AnnouncementView.
+    An optional `image` (PNG, JPG or WebP, up to 2 MB) shows on top of a pop-up; it is public, like the message.
     """
 
     class Kind(models.TextChoices):
@@ -759,6 +766,10 @@ class Announcement(models.Model):
         "button link", max_length=300, blank=True,
         help_text="A path on zinwe.io (e.g. /app/upgrade?plan=businesses or /plans) or an https:// link.",
     )
+    image = models.FileField(
+        upload_to=announcement_image_upload_to, blank=True,
+        help_text="Optional picture: PNG, JPG or WebP, up to 2 MB. Public, like the message.",
+    )
     starts_at = models.DateTimeField(default=timezone.now)
     ends_at = models.DateTimeField(null=True, blank=True, help_text="Empty = until switched off.")
     is_active = models.BooleanField(default=True)
@@ -776,6 +787,13 @@ class Announcement(models.Model):
 
     def __str__(self) -> str:
         return f"{self.get_kind_display()}: {self.title}"
+
+
+@receiver(post_delete, sender=Announcement)
+def _delete_announcement_image(sender: type[Announcement], instance: Announcement, **kwargs: Any) -> None:
+    """The picture goes with its message."""
+    if instance.image:
+        instance.image.delete(save=False)
 
 
 class AnnouncementView(models.Model):

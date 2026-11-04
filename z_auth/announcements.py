@@ -14,7 +14,8 @@ Notification-bar items: the slim bars on the owner dashboard and the public webs
   next plan adds, or — when every PC slot is taken — that a new PC won't connect until they upgrade.
 
 Each item is a plain dict the frontend renders and can remember-dismiss by ``id`` (an edited message
-gets a new id, so it shows again).
+gets a new id, so it shows again). ``image_url`` is the message's optional picture
+(``/api/auth/announcements/<id>/image/?v=<updated>``, public) or null.
 """
 from __future__ import annotations
 
@@ -56,7 +57,7 @@ SHORT_MODULE_NAMES: dict[str, str] = {
 
 def _item(
     ident: str, kind: str, title: str, body: str = "", cta_label: str = "", cta_href: str = "",
-    dismissible: bool = True,
+    dismissible: bool = True, image_url: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": ident,
@@ -66,7 +67,15 @@ def _item(
         "cta_label": cta_label,
         "cta_href": cta_href,
         "dismissible": dismissible,
+        "image_url": image_url,
     }
+
+
+def image_url(announcement: Announcement) -> str | None:
+    """The picture's public path (relative to the API origin), versioned so a new upload isn't served stale."""
+    if not announcement.image:
+        return None
+    return f"/api/auth/announcements/{announcement.pk}/image/?v={int(announcement.updated_at.timestamp())}"
 
 
 # --- Pushed from the admin panel ------------------------------------------------------
@@ -118,6 +127,7 @@ def _as_item(announcement: Announcement) -> dict[str, Any]:
         label,
         href,
         announcement.dismissible,
+        image_url(announcement),
     )
 
 

@@ -26,7 +26,9 @@ MAX_BYTES = 2 * 1024 * 1024
 # extension -> leading bytes (a WebP is RIFF....WEBP: checked below)
 ANIMATED_TYPES = {".gif": (b"GIF87a", b"GIF89a"), ".webp": (b"RIFF",)}
 STILL_TYPES = {".png": (b"\x89PNG\r\n\x1a\n",)}
-CONTENT_TYPES = {".gif": "image/gif", ".webp": "image/webp", ".png": "image/png"}
+CONTENT_TYPES = {
+    ".gif": "image/gif", ".webp": "image/webp", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+}
 
 
 def file_url(zingle: Zingle, which: str) -> str:

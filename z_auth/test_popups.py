@@ -48,7 +48,7 @@ class PopupTests(APITestCase):
         self.assertEqual(body["popups"], [{
             "id": f"a{a.pk}-{int(a.updated_at.timestamp())}", "kind": "wish", "title": "Happy Diwali",
             "body": "From all of us", "cta_label": "Say hi", "cta_href": "/app/chat", "dismissible": True,
-            "announcement_id": a.pk,
+            "image_url": None, "announcement_id": a.pk,
         }])
         # Never on the public website.
         self.client.credentials()

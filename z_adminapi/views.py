@@ -570,8 +570,11 @@ class AnnouncementListView(StaffView):
     """
     GET /api/admin/announcements/ -- every pushed message, newest first, with its live status.
     POST -- push one: {title, body?, kind, placement, audience, plan_codes?, cta_label?, cta_href?,
-    starts_at?, ends_at?, is_active?, dismissible?, priority?}. Owners see it on their next page load.
+    starts_at?, ends_at?, is_active?, dismissible?, priority?}, as JSON or multipart with an optional `image` (PNG,
+    JPG or WebP, up to 2 MB). Owners see it on their next page load.
     """
+
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get(self, request: Request) -> Response:
         rows = Announcement.objects.select_related("created_by").order_by("-created_at", "-id")
@@ -606,7 +609,12 @@ class AnnouncementReachView(StaffView):
 
 
 class AnnouncementDetailView(StaffView):
-    """PATCH /api/admin/announcements/<id>/ -- edit / switch on or off; DELETE -- remove it for good."""
+    """
+    PATCH /api/admin/announcements/<id>/ -- edit / switch on or off (JSON, or multipart with a new `image` or
+    `remove_image=true`); DELETE -- remove it for good.
+    """
+
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def patch(self, request: Request, pk: int) -> Response:
         announcement = get_object_or_404(Announcement, pk=pk)
