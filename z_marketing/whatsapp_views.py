@@ -12,7 +12,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from . import wa_media, whatsapp
+from . import wa_media, wa_structure, whatsapp
 from .contact_file import FileProblem
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
 from .views import Staff
@@ -20,12 +20,28 @@ from .whatsapp import WaError, WaFieldError
 
 
 class WaTemplateSerializer(serializers.ModelSerializer):
+    """`parts` set = the outreach structure (wa_structure.py) and `text` is composed from it; empty = free text."""
+
     media = serializers.SerializerMethodField()
+    text = serializers.CharField(max_length=1000, required=False, allow_blank=True, trim_whitespace=False)
 
     class Meta:
         model = WaTemplate
-        fields = ["id", "name", "kind", "text", "track", "day", "media", "updated_at"]
+        fields = ["id", "name", "kind", "text", "parts", "track", "day", "media", "updated_at"]
         read_only_fields = ["updated_at"]
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        if "parts" in attrs:
+            attrs["parts"] = wa_structure.clean(attrs["parts"])
+        parts = attrs.get("parts", getattr(self.instance, "parts", {}) or {})
+        if parts:
+            missing = wa_structure.problems(parts)
+            if missing:
+                raise serializers.ValidationError(missing)  # one message per part: {"problem": [...]}
+            attrs["text"] = wa_structure.compose(parts)
+        elif not (attrs.get("text") or getattr(self.instance, "text", "")).strip():
+            raise serializers.ValidationError({"text": "Write the message."})
+        return attrs
 
     def get_media(self, obj: WaTemplate) -> dict[str, Any] | None:
         return wa_media.describe(obj)
@@ -46,12 +62,18 @@ class WaContactSerializer(serializers.ModelSerializer):
     campaign_name = serializers.CharField(source="campaign.name", read_only=True, default="")
     last = serializers.SerializerMethodField()
     greet_as = serializers.SerializerMethodField()
+    salutation = serializers.SerializerMethodField()
     short_name = serializers.SerializerMethodField()
 
     def get_greet_as(self, obj: WaContact) -> str:
         from .wa_names import address
 
         return address(obj)["greeting"]
+
+    def get_salutation(self, obj: WaContact) -> str:
+        from .wa_names import address
+
+        return address(obj)["salutation"]
 
     def get_short_name(self, obj: WaContact) -> str:
         from .wa_names import address
@@ -63,7 +85,7 @@ class WaContactSerializer(serializers.ModelSerializer):
         fields = [
             "id", "campaign", "campaign_name", "phone", "first_name", "firm", "segment", "country", "city", "source", "info",
             "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "last", "track", "yes_date",
-            "nurture_day", "first_sent", "opted_in", "opt_in_note", "greet_as", "short_name",
+            "nurture_day", "first_sent", "opted_in", "opt_in_note", "greet_as", "salutation", "short_name",
         ]
         read_only_fields = [
             "opted_in", "opt_in_note",

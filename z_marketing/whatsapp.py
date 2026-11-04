@@ -260,12 +260,15 @@ def template_file() -> bytes:
 
 
 def fill(text: str, contact: WaContact) -> str:
-    """{{FirstName}} is their first name only when it clearly is one, else "<Business> team" (wa_names.py);
+    """{{Greeting}} (and an opening "Hi {{FirstName}}") is "Hi Rohit", or "Hello <Business> team" without a real name;
+    {{FirstName}} is their first name only when it clearly is one, else "<Business> team" (wa_names.py);
     {{Business}} is the short clean name; {{HowWeKnow}} is one true line on where we found them."""
     from .wa_names import address
 
     a = address(contact)
-    for key, value in (("{{FirstName}}", a["greeting"]), ("{{Firm}}", a["business"]), ("{{Business}}", a["business"]),
+    # An opening "Hi {{FirstName}}" becomes the salutation: "Hi Rohit", or "Hello Webgross team" without a real name.
+    text = re.sub(r"^\s*(Hi|Hello)\s+\{\{FirstName\}\}", "{{Greeting}}", text)
+    for key, value in (("{{Greeting}}", a["salutation"]), ("{{FirstName}}", a["greeting"]), ("{{Firm}}", a["business"]), ("{{Business}}", a["business"]),
                        ("{{City}}", contact.city), ("{{HowWeKnow}}", a["how_we_know"])):
         text = text.replace(key, value)
     text = re.sub(r"[ \t]+\n", "\n", text)  # a blank {{HowWeKnow}} leaves no trailing space
@@ -307,7 +310,9 @@ ANSWERS = [
 SYSTEM = (
     "You personalise WhatsApp messages that Vishal, founder of Zinwe (data protection and team tools for small offices "
     "on Windows PCs), sends by hand to small businesses. Rewrite the template for this one business using only the "
-    "details given. Address them exactly as address_as, the way the template does; never use any other name for them "
+    "details given. Keep the template's structure: the greeting line exactly as given (open_with), then one paragraph "
+    "each for the problem, the solution, the reward line and the ask, in that order. Address them exactly as "
+    "address_as, the way the template does; never use any other name for them "
     "(first_name is empty when we don't know a person's name). If useful_info has notes, you may open with one short line "
     "drawn only from them. Keep its meaning, its "
     "offer and every instruction about replying (YES, HAAN, STOP, LATER). Keep it under 400 characters, plain text, "
@@ -330,7 +335,7 @@ def _claude(template_text: str, contact: WaContact, their_last: str) -> str | No
 
         a = address(contact)
         details = {
-            "address_as": a["greeting"], "first_name": a["first_name"], "business": a["business"], "segment": contact.segment, "city": contact.city,
+            "open_with": a["salutation"], "address_as": a["greeting"], "first_name": a["first_name"], "business": a["business"], "segment": contact.segment, "city": contact.city,
             "country": contact.country, "useful_info": contact.info, "their_last_message": their_last,
         }
         response = client.messages.create(
@@ -350,7 +355,7 @@ def _claude(template_text: str, contact: WaContact, their_last: str) -> str | No
 
 
 def draft(contact: WaContact, kind: str) -> dict[str, Any]:
-    """The text to send next: {text, template, by, media}. `by` is "claude" when Claude personalised it."""
+    """The text to send next: {text, template, by, media, creative, notes}. `by` is "claude" when Claude personalised it."""
     if not contact.opted_in:
         raise WaError(LOCKED)
     template = next_nurture(contact) if kind == "nurture" else _template_for(contact, kind)
@@ -361,7 +366,13 @@ def draft(contact: WaContact, kind: str) -> dict[str, Any]:
     personal = _claude(base, contact, last.text if last else "")
     from .wa_media import describe
 
-    return {"text": personal or base, "template": template.name, "by": "claude" if personal else "template", "media": describe(template)}
+    parts = template.parts or {}
+    return {
+        "text": personal or base, "template": template.name, "by": "claude" if personal else "template",
+        "media": describe(template),
+        # From the outreach structure, never sent: what to attach, and context for whoever replies next.
+        "creative": parts.get("creative", ""), "notes": fill(parts["notes"], contact) if parts.get("notes") else "",
+    }
 
 
 # --- Today ---------------------------------------------------------------------------------------------------------

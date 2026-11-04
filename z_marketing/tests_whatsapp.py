@@ -147,7 +147,7 @@ class FlowTests(WaBase):
         r = self.api.post(f"{BASE}/contacts/{c.id}/draft/", {"kind": "first"}, format="json")
         body = r.json()
         self.assertEqual(body["by"], "template")
-        self.assertTrue(body["text"].startswith("Hi Gupta Exim team, this is Vishal"))  # no name: greet the business
+        self.assertTrue(body["text"].startswith("Hello Gupta Exim team, this is Vishal"))  # no name: greet the business
         self.assertIn("Gupta Exim", body["text"])
 
     @override_settings(ANTHROPIC_API_KEY="test-key")
@@ -472,9 +472,9 @@ class NameTests(WaBase):
         c = self.contact(first_name="Excel", firm="Excel Range Media - SEO Services in Delhi", source="Google Maps",
                          info={"rating": "4.9", "wa_business_name": "Excel Range Media"})
         text = whatsapp.fill(t.text, c)
-        self.assertEqual(text, "Hi Excel Range Media team, Vishal from Zinwe here. I found you on Google Maps, where you're rated 4.9.\n\nAbout Excel Range Media?")
+        self.assertEqual(text, "Hello Excel Range Media team, Vishal from Zinwe here. I found you on Google Maps, where you're rated 4.9.\n\nAbout Excel Range Media?")
         c.source = ""
-        self.assertEqual(whatsapp.fill(t.text, c).split("\n")[0], "Hi Excel Range Media team, Vishal from Zinwe here.")
+        self.assertEqual(whatsapp.fill(t.text, c).split("\n")[0], "Hello Excel Range Media team, Vishal from Zinwe here.")
 
     def test_first_templates_got_how_we_know(self) -> None:
         firsts = WaTemplate.objects.filter(kind="first")
@@ -525,3 +525,48 @@ class AddOneTests(WaBase):
         r = self.api.post(self.URL, {**self.GOOD, "phone": "+91 98100 00888"}, format="json")
         self.assertEqual(r.json()["phone"], "This number asked to stop. It can't be added.")
         self.assertEqual(WaContact.objects.count(), 1)
+
+
+class StructureTests(WaBase):
+    PARTS = {
+        "creative": "After they reply: a clip of the alert", "intro": "Vishal from Zinwe here. {{HowWeKnow}}",
+        "problem": "Client files often go to a pen drive.", "solution": "Zinwe alerts you and can set USB to read-only.",
+        "reward": "Cherry on top: manage team activity, chat and share tasks without switching apps. Free forever.",
+        "cta": "Useful for {{Business}}? Reply STOP to opt out.", "notes": "Value point V2. If YES, send the YES reply.",
+    }
+
+    def test_structured_template_is_composed_in_order(self) -> None:
+        r = self.api.post(f"{BASE}/templates/", {"name": "AG test", "kind": "first", "parts": self.PARTS}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.json()["text"], (
+            "{{Greeting}}, Vishal from Zinwe here. {{HowWeKnow}}\n\nClient files often go to a pen drive.\n\n"
+            "Zinwe alerts you and can set USB to read-only.\n\nCherry on top: manage team activity, chat and share tasks "
+            "without switching apps. Free forever.\n\nUseful for {{Business}}? Reply STOP to opt out."))
+        self.assertNotIn("clip", r.json()["text"])  # creative and notes are never sent
+
+    def test_missing_parts_and_two_problems_are_refused(self) -> None:
+        r = self.api.post(f"{BASE}/templates/", {"name": "x", "kind": "first", "parts": {"intro": "Hi", "problem": "a\nb"}}, format="json")
+        self.assertEqual(r.status_code, 400)
+        errors = {k: v[0] for k, v in r.json().items()}
+        self.assertEqual(errors["problem"], "One line only: one problem, one solution.")
+        self.assertIn("solution", errors)
+        self.assertEqual(self.api.post(f"{BASE}/templates/", {"name": "y", "kind": "first", "text": " "}, format="json").status_code, 400)
+
+    def test_greeting_hello_business_team_without_a_real_name(self) -> None:
+        t = WaTemplate.objects.create(name="s", kind="first", parts=self.PARTS, text="{{Greeting}}, hi\n\nx")
+        self.campaign.first = t
+        self.campaign.save()
+        nameless = self.contact(first_name="", firm="Webgross - Digital Marketing Agency in Delhi")
+        self.assertTrue(whatsapp.draft(nameless, "first")["text"].startswith("Hello Webgross team, hi"))
+        named = self.contact("+919810000102", first_name="Rohit", firm="Pixel Studio")
+        body = whatsapp.draft(named, "first")
+        self.assertTrue(body["text"].startswith("Hi Rohit, hi"))
+        self.assertEqual((body["creative"], body["notes"]), (self.PARTS["creative"], self.PARTS["notes"]))
+        # Older free-text templates that open "Hi {{FirstName}}" get the same greeting.
+        self.assertTrue(whatsapp.fill("Hi {{FirstName}}, there", nameless).startswith("Hello Webgross team, there"))
+
+    def test_the_90_day_first_messages_are_structured(self) -> None:
+        t = WaTemplate.objects.get(name__startswith="IT-1 ")
+        self.assertEqual(set(t.parts), {"creative", "intro", "problem", "solution", "reward", "cta", "notes"})
+        self.assertTrue(t.text.startswith("{{Greeting}}, Vishal from Zinwe here."))
+        self.assertTrue(t.parts["reward"].startswith("Cherry on top"))

@@ -285,6 +285,9 @@ class WaTemplate(models.Model):
     media = models.FileField(upload_to="wa-media/", blank=True)
     media_kind = models.CharField(max_length=5, blank=True)  # image or video
     media_name = models.CharField(max_length=160, blank=True)  # the name it was uploaded with
+    # The outreach structure (wa_structure.py): creative, intro, problem, solution, reward, cta, details, notes.
+    # Empty = a free-text template. When set, `text` is composed from it on save.
+    parts = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
