@@ -653,3 +653,26 @@ class LanguageTests(WaBase):
         bad = self.api.post(f"{BASE}/templates/", {"name": "x", "kind": "followup", "language": "en", "text": "y",
                                                    "twin": WaTemplate.objects.get(name="One gentle follow-up").id}, format="json")
         self.assertEqual(bad.status_code, 400)
+
+
+class AddToCampaignTests(WaBase):
+    def test_add_contacts_by_hand_skips_messaged_and_stopped(self) -> None:
+        free = self.contact("+919810000501", campaign=None)
+        other = WaCampaign.objects.create(name="Other", first=self.first)
+        elsewhere = self.contact("+919810000502", campaign=other)
+        started = self.contact("+919810000503", campaign=other, step=1, status=Status.MESSAGED)
+        stopped = self.contact("+919810000504", campaign=None, status=Status.STOP)
+        url = f"{BASE}/campaigns/{self.campaign.id}/contacts/"
+        r = self.api.post(url, {"ids": [free.id, elsewhere.id, started.id, stopped.id]}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual((r.json()["added"], r.json()["skipped"]), (2, 2))
+        self.assertEqual(r.json()["campaign"]["stats"]["contacts"], 2)
+        started.refresh_from_db()
+        self.assertEqual(started.campaign, other)  # mid-sequence: stays put
+        self.assertEqual(self.api.post(url, {"ids": []}, format="json").status_code, 400)
+
+    def test_stats_count_opted_in_and_ready(self) -> None:
+        self.contact("+919810000601")
+        self.contact("+919810000602", opted_in=False)
+        s = whatsapp.stats(self.campaign)
+        self.assertEqual((s["contacts"], s["opted_in"], s["ready"]), (2, 1, 1))

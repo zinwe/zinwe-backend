@@ -561,7 +561,20 @@ def stats(campaign: WaCampaign | None = None) -> dict[str, int]:
         "interested": contacts.filter(status__in=[Status.INTERESTED, Status.SIGNED]).count(),
         "signed": contacts.filter(status=Status.SIGNED).count(),
         "stopped": contacts.filter(status=Status.STOP).count(),
+        # Who can actually get a message: opted in, and of those, not messaged yet.
+        "opted_in": contacts.filter(opted_in=True).exclude(status=Status.STOP).count(),
+        "ready": contacts.filter(opted_in=True, step=0, status=Status.READY).count(),
     }
+
+
+@transaction.atomic
+def add_to_campaign(campaign: WaCampaign, ids: list[Any]) -> dict[str, int]:
+    """Move contacts into a campaign by hand. Only those not messaged yet and not stopped move: a contact mid-sequence
+    stays where it is, so nobody gets two first messages."""
+    wanted = WaContact.objects.filter(pk__in=[int(i) for i in ids if str(i).isdigit()][:2000])
+    movable = wanted.filter(step=0, yes_date__isnull=True).exclude(status=Status.STOP).exclude(campaign=campaign)
+    added = movable.update(campaign=campaign)
+    return {"added": added, "skipped": wanted.count() - added}
 
 
 def daily(days: int = 14) -> list[dict[str, Any]]:

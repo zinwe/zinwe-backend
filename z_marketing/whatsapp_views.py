@@ -290,6 +290,13 @@ class WaCampaignDetailView(Staff):
 class WaCampaignActionView(Staff):
     def post(self, request: Request, pk: int, action: str) -> Response:
         c = get_object_or_404(WaCampaign, pk=pk)
+        if action == "contacts":  # {ids}: add contacts by hand
+            ids = request.data.get("ids")
+            if not isinstance(ids, list) or not ids:
+                return Response({"detail": "Pick at least one contact."}, status=status.HTTP_400_BAD_REQUEST)
+            result = whatsapp.add_to_campaign(c, ids)
+            self.audit(request, "wa_campaign_add_contacts", c, **result)
+            return Response({**result, "campaign": WaCampaignSerializer(c).data})
         if action not in ("start", "pause"):
             return Response({"detail": "Unknown action."}, status=status.HTTP_404_NOT_FOUND)
         if action == "start" and not c.contacts.exclude(status=WaContact.Status.STOP).exists():
