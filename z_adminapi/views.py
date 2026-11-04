@@ -455,6 +455,61 @@ class IssueReplyView(StaffView):
         return Response(IssueRowSerializer(issue).data)
 
 
+class ZingleListView(StaffView):
+    """
+    GET  /api/admin/zingles/ -- every Zingle, latest start first, with its status (F-15).
+    POST (multipart) -- {name, animated (GIF/WebP <= 2 MB), still (PNG), alt, starts_at, ends_at?, places, is_active?}.
+    """
+
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get(self, request: Request) -> Response:
+        from z_auth.models import Zingle
+        from z_auth.zingles import ZingleSerializer
+
+        return Response(ZingleSerializer(Zingle.objects.all(), many=True).data)
+
+    def post(self, request: Request) -> Response:
+        from z_auth.zingles import ZingleSerializer
+
+        data = ZingleSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        zingle = data.save()
+        _audit(request, "zingle_created", {"id": zingle.pk, "name": zingle.name})
+        return Response(ZingleSerializer(zingle).data, status=status.HTTP_201_CREATED)
+
+
+class ZingleDetailView(StaffView):
+    """GET / PATCH (multipart, files optional) / DELETE /api/admin/zingles/<id>/ (F-15)."""
+
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get(self, request: Request, pk: int) -> Response:
+        from z_auth.models import Zingle
+        from z_auth.zingles import ZingleSerializer
+
+        return Response(ZingleSerializer(get_object_or_404(Zingle, pk=pk)).data)
+
+    def patch(self, request: Request, pk: int) -> Response:
+        from z_auth.models import Zingle
+        from z_auth.zingles import ZingleSerializer
+
+        data = ZingleSerializer(get_object_or_404(Zingle, pk=pk), data=request.data, partial=True)
+        data.is_valid(raise_exception=True)
+        zingle = data.save()
+        _audit(request, "zingle_updated", {"id": pk, "fields": sorted(data.validated_data)})
+        return Response(ZingleSerializer(zingle).data)
+
+    def delete(self, request: Request, pk: int) -> Response:
+        from z_auth.models import Zingle
+
+        zingle = get_object_or_404(Zingle, pk=pk)
+        name = zingle.name
+        zingle.delete()
+        _audit(request, "zingle_deleted", {"id": pk, "name": name})
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class ReleaseListView(StaffView):
     """
     GET /api/admin/releases/ -- every published Windows agent release (newest first) + PC adoption.

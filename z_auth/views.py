@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
@@ -487,6 +488,55 @@ class WebsiteAnnouncementsView(APIView):
     def get(self, request: Request) -> Response:
         response = Response({"announcements": website_announcements()})
         response["Cache-Control"] = "public, max-age=60"
+        return response
+
+
+class ZingleView(APIView):
+    """
+    GET /api/auth/zingle/ -- the Zingle live now (F-15): {id, animated_url, still_url, alt, places}, or null.
+    Public and the same for everyone, so cached 5 minutes.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes: list = []
+    throttle_classes: list = []
+
+    def get(self, request: Request) -> JsonResponse:
+        from .zingles import CACHE_SECONDS, public_zingle
+
+        # A JSON `null` when none is live (DRF would send an empty body for None).
+        response = JsonResponse(public_zingle(), safe=False)
+        response["Cache-Control"] = f"public, max-age={CACHE_SECONDS}"
+        return response
+
+
+class ZingleFileView(APIView):
+    """GET /api/auth/zingle/<id>/<animated|still>/ -- a Zingle's image (public, long-cached: its URL is versioned)."""
+
+    permission_classes = [AllowAny]
+    authentication_classes: list = []
+    throttle_classes: list = []
+
+    def get(self, request: Request, zingle_id: int, which: str) -> FileResponse:
+        import os
+
+        from .models import Zingle
+        from .zingles import CONTENT_TYPES
+
+        if which not in ("animated", "still"):
+            raise Http404("No such image.")
+        zingle = get_object_or_404(Zingle, pk=zingle_id)
+        file = zingle.animated if which == "animated" else zingle.still
+        if not file:
+            raise Http404("No image.")
+        try:
+            handle = file.open("rb")
+        except FileNotFoundError as exc:
+            raise Http404("The image file is missing.") from exc
+        content_type = CONTENT_TYPES.get(os.path.splitext(file.name)[1].lower(), "application/octet-stream")
+        response = FileResponse(handle, content_type=content_type)
+        response["Cache-Control"] = "public, max-age=31536000, immutable"
+        response["Content-Security-Policy"] = "default-src 'none'"
         return response
 
 

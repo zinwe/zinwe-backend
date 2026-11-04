@@ -924,3 +924,46 @@ def _delete_issue_screenshot(sender: type[Issue], instance: Issue, **kwargs: Any
     """A screenshot is personal data: it goes with its report, including when the account is deleted."""
     if instance.screenshot:
         instance.screenshot.delete(save=False)
+
+
+def zingle_upload_to(instance: "Zingle", filename: str) -> str:
+    """zingles/<random>.<ext> -- never trust the uploaded file name."""
+    ext = os.path.splitext(filename)[1].lower()[:8]
+    return f"zingles/{uuid.uuid4().hex}{ext}"
+
+
+class Zingle(models.Model):
+    """
+    F-15: our own animated logo for a special day (Diwali, New Year...), scheduled by the team in the admin app
+    (Publish -> Zingles). While one is live the website (with sign-in) and/or the dashboard show it in place of the
+    logo; `still` is shown to people who prefer reduced motion. The live one is the latest `starts_at`.
+    """
+
+    class Places(models.TextChoices):
+        WEBSITE = "website", "Website and sign-in"
+        DASHBOARD = "dashboard", "Dashboard"
+        BOTH = "both", "Website, sign-in and dashboard"
+
+    name = models.CharField(max_length=80)
+    animated = models.FileField(upload_to=zingle_upload_to, help_text="GIF or WebP, up to 2 MB.")
+    still = models.FileField(upload_to=zingle_upload_to, help_text="PNG, the still frame for reduced motion.")
+    alt = models.CharField(max_length=120, help_text="What the logo shows, for screen readers.")
+    starts_at = models.DateTimeField(default=timezone.now)
+    ends_at = models.DateTimeField(null=True, blank=True, help_text="Empty = until switched off.")
+    places = models.CharField(max_length=10, choices=Places.choices, default=Places.BOTH)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-starts_at", "-id"]
+
+    def __str__(self) -> str:
+        return f"Zingle: {self.name}"
+
+
+@receiver(post_delete, sender=Zingle)
+def _delete_zingle_files(sender: type[Zingle], instance: Zingle, **kwargs: Any) -> None:
+    for file in (instance.animated, instance.still):
+        if file:
+            file.delete(save=False)
