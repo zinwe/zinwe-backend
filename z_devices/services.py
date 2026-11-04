@@ -673,6 +673,29 @@ LOGGED_WORK_STATES = {Device.WorkState.WORKING, Device.WorkState.ON_BREAK, Devic
 ACTIVE_WORK_STATES = (Device.WorkState.WORKING, Device.WorkState.ON_BREAK)
 # What the owner approves or questions: breaks, and since FR-16 log-outs too.
 APPROVED_STATES = {Device.WorkState.ON_BREAK, Device.WorkState.ENDED}
+# F-02: one request per person and kind within this window. A second break (or log-out) this close to one still
+# waiting is logged for the timeline but doesn't ask the owner again; deciding the first settles it too.
+APPROVAL_SAME_WITHIN = timedelta(minutes=5)
+# F-05b: the widget's End day note is a text area now.
+WORK_NOTE_MAX = 1000
+
+
+def _same_request(owner_id: int, member_id: int | None, device_id: int, state: str, at: Any) -> QuerySet:
+    """Break / log-out rows of the same person (this PC when no member) and state within 5 minutes of `at`."""
+    rows = WorkLog.objects.filter(
+        owner_id=owner_id, state=state, at__range=(at - APPROVAL_SAME_WITHIN, at + APPROVAL_SAME_WITHIN)
+    )
+    return rows.filter(member_id=member_id) if member_id else rows.filter(device_id=device_id, member__isnull=True)
+
+
+def _approval_for(device: Device, state: str, at: Any) -> str:
+    """PENDING for a break or log-out, unless one of the same person and kind already waits (F-02)."""
+    if state not in APPROVED_STATES:
+        return ""
+    waiting = _same_request(device.owner_id, device.member_id, device.pk, state, at).filter(
+        approval=WorkLog.Approval.PENDING
+    )
+    return "" if waiting.exists() else WorkLog.Approval.PENDING
 
 
 def _log_work_change(device: Device, data: dict[str, Any], now: Any) -> WorkLog | None:
@@ -693,13 +716,14 @@ def _log_work_change(device: Device, data: dict[str, Any], now: Any) -> WorkLog 
     # Breaks and log-outs wait for the owner's OK, after the fact (FR-16: log-outs like breaks).
     needs_ok = new_state in APPROVED_STATES
     reason = (data.get(f"{prefix}_reason") or "").strip()[:120] if prefix else ""
-    note = (data.get(f"{prefix}_note") or "").strip()[:280] if prefix else ""
+    note = (data.get(f"{prefix}_note") or "").strip()[:WORK_NOTE_MAX] if prefix else ""
+    approval = _approval_for(device, new_state, at) if needs_ok else ""
     log = WorkLog.objects.create(
         owner_id=device.owner_id, device=device, member_id=device.member_id,
         state=new_state, previous_state=device.work_state or "", at=at, reason=reason, note=note,
-        approval=WorkLog.Approval.PENDING if needs_ok else "",
+        approval=approval,
     )
-    if needs_ok:
+    if approval:
         web_push.announce(device.owner_id, "approval", [log.pk])
     return log
 
@@ -747,11 +771,11 @@ def _log_work_events(device: Device, events: list[dict[str, Any]], now: Any) -> 
             owner_id=device.owner_id, device=device, member_id=device.member_id,
             state=state, previous_state=previous, at=at,
             reason=(event.get("reason") or "").strip()[:120] if explained else "",
-            note=(event.get("note") or "").strip()[:280] if explained else "",
-            approval=WorkLog.Approval.PENDING if explained else "",
+            note=(event.get("note") or "").strip()[:WORK_NOTE_MAX] if explained else "",
+            approval=_approval_for(device, state, at) if explained else "",
         )
         added += 1
-        if explained:
+        if log.approval:
             waiting.append(log.pk)
     web_push.announce(device.owner_id, "approval", waiting)
     return added
@@ -909,6 +933,9 @@ def decide_break(owner: User, log: WorkLog, decision: str, note: str = "") -> Wo
     """
     Approve or deny a break or a log-out (FR-16) after the fact: the member isn't blocked. The member is told
     in their Zinwe widget, with the owner's note if any. Deciding again overwrites.
+
+    F-02: any other break (or log-out) of the same person within 5 minutes that still waits, or that was logged
+    without asking because this one was waiting, gets the same decision, so the request doesn't come back.
     """
     if log.owner_id != owner.id:
         raise PermissionError("Not your team's break.")
@@ -918,6 +945,9 @@ def decide_break(owner: User, log: WorkLog, decision: str, note: str = "") -> Wo
     log.decision_note = note.strip()[:280]
     log.decided_at = timezone.now()
     log.save(update_fields=["approval", "decision_note", "decided_at"])
+    _same_request(log.owner_id, log.member_id, log.device_id, log.state, log.at).exclude(pk=log.pk).filter(
+        approval__in=[WorkLog.Approval.PENDING, ""]
+    ).update(approval=decision, decision_note=log.decision_note, decided_at=log.decided_at)
     if log.member_id and log.member and log.member.is_active:
         is_break = log.state == WorkLog.State.ON_BREAK
         what = (f"{log.reason} break" if log.reason else "break") if is_break else "log-out"

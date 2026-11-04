@@ -258,7 +258,7 @@ class WorkEventSerializer(serializers.Serializer):
     )
     # The break reason/note for a break, the log-out reason/note for a log out; empty otherwise.
     reason = serializers.CharField(max_length=120, required=False, allow_blank=True, allow_null=True, default="")
-    note = serializers.CharField(max_length=280, required=False, allow_blank=True, allow_null=True, default="")
+    note = serializers.CharField(max_length=1000, required=False, allow_blank=True, allow_null=True, default="")
 
 
 class ConsentSerializer(serializers.Serializer):
@@ -293,14 +293,14 @@ class HeartbeatSerializer(serializers.Serializer):
         max_length=120, required=False, allow_blank=True, allow_null=True, default=""
     )
     break_note = serializers.CharField(
-        max_length=280, required=False, allow_blank=True, allow_null=True, default=""
+        max_length=1000, required=False, allow_blank=True, allow_null=True, default=""
     )
     # Why the member logged out (picked in the widget) and their note. Optional (older agents).
     end_reason = serializers.CharField(
         max_length=120, required=False, allow_blank=True, allow_null=True, default=""
     )
     end_note = serializers.CharField(
-        max_length=280, required=False, allow_blank=True, allow_null=True, default=""
+        max_length=1000, required=False, allow_blank=True, allow_null=True, default=""
     )
     # Every log in / break / back / log out the widget recorded since the last heartbeat, with its exact
     # time (newer agents). When present it replaces the "state changed between heartbeats" guess, so short

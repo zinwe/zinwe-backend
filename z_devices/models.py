@@ -607,7 +607,7 @@ class WorkLog(models.Model):
         max_length=120, blank=True, help_text="Reason the member picked for a break or for logging out."
     )
     note = models.CharField(
-        max_length=280, blank=True, help_text="Message the member added to a break or to logging out."
+        max_length=1000, blank=True, help_text="Message the member added to a break or to logging out."
     )
 
     class Approval(models.TextChoices):

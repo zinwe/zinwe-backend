@@ -357,3 +357,70 @@ class LogOutApprovalTests(DeviceTestCase):  # FR-16
         self.as_owner()
         response = self.client.post(f"/api/devices/work-log/{start.pk}/decision/", {"decision": "approved"}, format="json")
         self.assertEqual(response.status_code, 400)
+
+
+class OneRequestPerBreakTests(DeviceTestCase):  # F-02
+    def setUp(self) -> None:
+        super().setUp()
+        self.token = self.enroll().json()["device_token"]
+        self.start = timezone.now() - timedelta(minutes=30)
+
+    def beat(self, *steps):  # type: ignore[no-untyped-def]
+        """[(seconds after start, state), ...] sent as work_events."""
+        self.as_device(self.token)
+        events = [{"at": (self.start + timedelta(seconds=s)).isoformat(), "state": st, "reason": "Lunch", "note": ""}
+                  for s, st in steps]
+        return self.client.post(HEARTBEAT_URL, {"work_state": steps[-1][1], "work_events": events}, format="json")
+
+    def decide(self, log_id: int, decision: str):  # type: ignore[no-untyped-def]
+        self.as_owner()
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(f"{WORK_LOG_URL}{log_id}/decision/", {"decision": decision}, format="json")
+
+    def test_a_second_break_within_5_minutes_does_not_ask_again(self) -> None:
+        self.beat((0, "working"), (60, "on_break"), (90, "working"), (150, "on_break"))
+        breaks = list(WorkLog.objects.filter(state="on_break").order_by("at").values_list("approval", flat=True))
+        # Both are on the timeline (time adds up); only the first waits for the owner.
+        self.assertEqual(breaks, ["pending", ""])
+
+    def test_a_break_later_in_the_day_asks_again(self) -> None:
+        self.beat((0, "working"), (60, "on_break"), (90, "working"), (60 + 6 * 60, "on_break"))
+        self.assertEqual(WorkLog.objects.filter(state="on_break", approval="pending").count(), 2)
+
+    def test_deciding_settles_the_others_within_5_minutes(self) -> None:
+        self.beat((0, "working"), (60, "on_break"), (90, "working"), (150, "on_break"))
+        # A duplicate that slipped in as pending (older data) is settled too.
+        first, second = WorkLog.objects.filter(state="on_break").order_by("at")
+        WorkLog.objects.filter(pk=second.pk).update(approval="pending")
+        self.assertEqual(self.decide(first.id, "approved").status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            list(WorkLog.objects.filter(state="on_break").values_list("approval", flat=True)), ["approved", "approved"]
+        )
+
+    def test_another_members_break_is_not_settled(self) -> None:
+        self.beat((0, "working"), (60, "on_break"))
+        from .models import Member
+
+        ravi = Member.objects.create(owner=self.owner, name="Ravi Iyer", email="ravi@acme.in")
+        other = self.enroll(email=ravi.email, member_id=ravi.member_code, machine_id="ravi-pc", hostname="RAVI-PC")
+        self.as_device(other.json()["device_token"])
+        self.client.post(HEARTBEAT_URL, {"work_state": "working"}, format="json")
+        self.client.post(HEARTBEAT_URL, {"work_state": "on_break"}, format="json")
+        mine, theirs = WorkLog.objects.filter(state="on_break").order_by("id")
+        self.assertEqual(theirs.approval, "pending")  # a different person asks on their own
+        self.decide(mine.id, "approved")
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.approval, "pending")
+
+
+class LongEndDayNoteTests(DeviceTestCase):  # F-05b
+    def test_end_day_note_up_to_1000_characters(self) -> None:
+        token = self.enroll().json()["device_token"]
+        self.as_device(token)
+        self.client.post(HEARTBEAT_URL, {"work_state": "working"}, format="json")
+        note = "Done today.\n" + "x" * 988
+        response = self.client.post(HEARTBEAT_URL, {"work_state": "ended", "end_note": note}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.assertEqual(WorkLog.objects.get(state="ended").note, note)
+        too_long = self.client.post(HEARTBEAT_URL, {"work_state": "working", "end_note": "x" * 1001}, format="json")
+        self.assertEqual(too_long.status_code, status.HTTP_400_BAD_REQUEST)
