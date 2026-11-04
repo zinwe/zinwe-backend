@@ -383,15 +383,40 @@ class FeedbackListView(StaffView):
 
 
 class IssueListView(StaffView):
-    """GET /api/admin/issues/?status=new|looking|fixed|closed -- {counts: {status: n}, rows: [...]}, newest first."""
+    """
+    GET /api/admin/issues/?status=new|looking|fixed|closed&source=owner|member|staff -- {counts: {status: n},
+    rows: [...]}, newest first. Counts follow the source filter.
+    """
 
     def get(self, request: Request) -> Response:
         wanted = request.query_params.get("status") or None
         if wanted and wanted not in Issue.Status.values:
             return Response({"detail": f"Unknown status '{wanted}'."}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(
-            {"counts": services.issue_counts(), "rows": IssueRowSerializer(services.issue_rows(wanted), many=True).data}
-        )
+        source = request.query_params.get("source") or None
+        if source and source not in Issue.Source.values:
+            return Response({"detail": f"Unknown source '{source}'."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            "counts": services.issue_counts(source),
+            "rows": IssueRowSerializer(services.issue_rows(wanted, source), many=True).data,
+        })
+
+
+class IssueReportView(StaffView):
+    """
+    POST /api/admin/issues/report/ -- a staff member reports a problem from the admin app (F-13): multipart
+    {description, page?, context?, screenshot?}. It lands in the same Issues inbox, tagged Staff, with no customer.
+    """
+
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def post(self, request: Request) -> Response:
+        from z_auth.portal_serializers import IssueSerializer
+
+        data = IssueSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        issue = data.save(owner=None, source=Issue.Source.STAFF, reporter=request.user, contact_ok=False)
+        _audit(request, "issue_report", {"issue": issue.pk})
+        return Response(IssueRowSerializer(issue).data, status=status.HTTP_201_CREATED)
 
 
 class IssueDetailView(StaffView):
@@ -401,7 +426,7 @@ class IssueDetailView(StaffView):
     """
 
     def patch(self, request: Request, pk: int) -> Response:
-        issue = get_object_or_404(Issue.objects.select_related("owner__owned_company"), pk=pk)
+        issue = get_object_or_404(Issue.objects.select_related("owner__owned_company", "member", "reporter"), pk=pk)
         try:
             issue, email = services.set_issue_status(issue, str(request.data.get("status", "")), request.user)
         except services.AdminActionError as exc:
@@ -413,7 +438,7 @@ class IssueReplyView(StaffView):
     """POST /api/admin/issues/<id>/reply/ -- {message}: emailed to the owner, saved on the report."""
 
     def post(self, request: Request, pk: int) -> Response:
-        issue = get_object_or_404(Issue.objects.select_related("owner__owned_company"), pk=pk)
+        issue = get_object_or_404(Issue.objects.select_related("owner__owned_company", "member", "reporter"), pk=pk)
         try:
             issue = services.reply_to_issue(issue, str(request.data.get("message", "")), request.user)
         except services.AdminActionError as exc:

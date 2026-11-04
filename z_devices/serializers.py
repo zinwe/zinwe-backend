@@ -247,6 +247,57 @@ class MemberFeedbackSerializer(serializers.Serializer):
     message = serializers.CharField(required=False, allow_blank=True, max_length=2000, trim_whitespace=True)
 
 
+class MemberIssueSerializer(serializers.Serializer):
+    """
+    POST /api/devices/issues/ (Device auth) -- Report an issue from the Zinwe window (F-13): {description, page?,
+    context?, screenshot_b64?}. The screenshot is a PNG or JPG, base64, up to 5 MB once decoded.
+    """
+
+    description = serializers.CharField(
+        max_length=2000, trim_whitespace=True,
+        error_messages={
+            "required": "Tell us what went wrong.",
+            "blank": "Tell us what went wrong.",
+            "max_length": "Keep it under 2,000 characters.",
+        },
+    )
+    page = serializers.CharField(required=False, allow_blank=True, max_length=120, default="")
+    context = serializers.JSONField(required=False, default=dict)
+    screenshot_b64 = serializers.CharField(required=False, allow_blank=True, allow_null=True, default="")
+
+    def validate_context(self, value: Any) -> dict[str, str]:
+        from z_auth.portal_serializers import clean_context
+
+        return clean_context(value)
+
+    def validate_screenshot_b64(self, value: str | None) -> tuple[bytes, str] | None:
+        """The decoded image and its extension, or None."""
+        import base64
+        import binascii
+
+        from django.conf import settings
+
+        from z_auth.portal_serializers import BAD_SCREENSHOT_TYPE, SCREENSHOT_TYPES
+
+        if not value:
+            return None
+        limit = settings.ZINWE_ISSUE_SCREENSHOT_MAX_BYTES
+        if "," in value[:100] and value.startswith("data:"):
+            value = value.split(",", 1)[1]  # a data: URL
+        if len(value) > (limit // 3 + 1) * 4 + 8:
+            raise serializers.ValidationError(f"The image is too large. The limit is {limit // (1024 * 1024)} MB.")
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise serializers.ValidationError(BAD_SCREENSHOT_TYPE) from exc
+        if len(raw) > limit:
+            raise serializers.ValidationError(f"The image is too large. The limit is {limit // (1024 * 1024)} MB.")
+        for ext in (".png", ".jpg"):
+            if any(raw.startswith(sig) for sig in SCREENSHOT_TYPES[ext]):
+                return raw, ext
+        raise serializers.ValidationError("Attach a PNG or JPG image.")
+
+
 MAX_WORK_EVENTS = 200
 
 

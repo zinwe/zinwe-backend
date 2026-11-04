@@ -827,7 +827,16 @@ class Issue(models.Model):
     A problem an owner reports from the dashboard (Report an issue): what went wrong, where, an optional screenshot
     and the browser details, so the team can reproduce and fix it. Kept apart from Feedback (a 1-10 rating) so
     ratings and testimonials stay clean. The team works it in the admin app's Issues inbox and can email the owner.
+
+    F-13: members report from their Zinwe window too (`source=member`: `owner` is their company's owner, `member` /
+    `device` who sent it; the owner doesn't see it), and staff from the admin app (`source=staff`: no owner, the
+    staff user is `reporter`). Only the team reads those.
     """
+
+    class Source(models.TextChoices):
+        OWNER = "owner", "Owner dashboard"
+        MEMBER = "member", "Member's Zinwe window"
+        STAFF = "staff", "Staff admin"
 
     class Status(models.TextChoices):
         NEW = "new", "New"
@@ -835,7 +844,18 @@ class Issue(models.Model):
         FIXED = "fixed", "Fixed"
         CLOSED = "closed", "Closed"
 
-    owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="issues")
+    owner = models.ForeignKey("z_auth.User", null=True, blank=True, on_delete=models.CASCADE, related_name="issues")
+    source = models.CharField(max_length=10, choices=Source.choices, default=Source.OWNER, db_index=True)
+    member = models.ForeignKey(
+        "z_devices.Member", on_delete=models.SET_NULL, null=True, blank=True, related_name="issues"
+    )
+    device = models.ForeignKey(
+        "z_devices.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="issues"
+    )
+    reporter = models.ForeignKey(
+        "z_auth.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="reported_issues",
+        help_text="The staff member who reported it (staff reports).",
+    )
     description = models.TextField(max_length=2000)
     page = models.CharField(max_length=120, blank=True, help_text="Dashboard page it happened on.")
     screenshot = models.FileField(
@@ -855,7 +875,7 @@ class Issue(models.Model):
         ordering = ["-created_at", "-id"]
 
     def __str__(self) -> str:
-        return f"Issue #{self.pk} from {self.owner}"
+        return f"Issue #{self.pk} from {self.owner or self.reporter or 'staff'}"
 
 
 @receiver(post_delete, sender=Issue)

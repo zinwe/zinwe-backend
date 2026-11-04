@@ -33,6 +33,7 @@ urlpatterns = [
     path("subscriptions/<int:pk>/", views.SubscriptionDetailView.as_view(), name="subscription-detail"),
     path("feedback/", views.FeedbackListView.as_view(), name="feedback"),
     path("issues/", views.IssueListView.as_view(), name="issues"),
+    path("issues/report/", views.IssueReportView.as_view(), name="issue-report"),
     path("issues/<int:pk>/", views.IssueDetailView.as_view(), name="issue-detail"),
     path("issues/<int:pk>/reply/", views.IssueReplyView.as_view(), name="issue-reply"),
     path("testimonials/", views.TestimonialListView.as_view(), name="testimonials"),

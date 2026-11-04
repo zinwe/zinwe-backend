@@ -273,6 +273,43 @@ class DeviceFeedbackView(APIView):
         return Response({"id": feedback.pk}, status=status.HTTP_201_CREATED)
 
 
+class DeviceIssueView(APIView):
+    """
+    POST /api/devices/issues/ (Device auth) -- Report an issue from the member's Zinwe window (F-13): {description,
+    page?, context?, screenshot_b64?} -> 201 {id}. It goes to the Zinwe team's Issues inbox, filed under the company
+    it came from; the owner doesn't see it, and nobody emails the member about it.
+    """
+
+    authentication_classes = [DeviceTokenAuthentication]
+    permission_classes = [IsDevice]
+    throttle_classes = [DeviceScopedThrottle]
+    throttle_scope = "member_issues"
+
+    def post(self, request: Request) -> Response:
+        from django.core.files.base import ContentFile
+
+        from z_auth.models import Issue
+
+        from .serializers import MemberIssueSerializer
+
+        serializer = MemberIssueSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        v = serializer.validated_data
+        device = request.auth
+        context = {
+            **v["context"], "app": "Zinwe window", "agent_version": device.agent_version, "platform": device.os_version,
+        }
+        issue = Issue(
+            owner=device.owner, source=Issue.Source.MEMBER, member=device.member, device=device,
+            description=v["description"], page=v["page"] or "Zinwe window", context=context, contact_ok=False,
+        )
+        if v.get("screenshot_b64"):
+            raw, ext = v["screenshot_b64"]
+            issue.screenshot.save(f"screenshot{ext}", ContentFile(raw), save=False)
+        issue.save()
+        return Response({"id": issue.pk}, status=status.HTTP_201_CREATED)
+
+
 class DeviceMessagesReadView(APIView):
     """POST /api/devices/messages/read/ -- the agent reports the member opened the admin's messages."""
 

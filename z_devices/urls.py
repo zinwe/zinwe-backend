@@ -57,6 +57,7 @@ urlpatterns = [
     path("messages/", views.DeviceMessagesView.as_view(), name="messages"),
     path("messages/read/", views.DeviceMessagesReadView.as_view(), name="messages-read"),
     path("feedback/", views.DeviceFeedbackView.as_view(), name="feedback"),
+    path("issues/", views.DeviceIssueView.as_view(), name="issues"),
     path("notifications/", views.OwnerFeedView.as_view(), name="owner-feed"),
     path("notifications/settings/", views.NotificationPrefsView.as_view(), name="notification-prefs"),
     path("notifications/push/", views.PushStatusView.as_view(), name="push-status"),

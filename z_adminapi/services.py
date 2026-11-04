@@ -815,13 +815,16 @@ def _revenue_series(months: int) -> list[dict[str, Any]]:
 # --- Issues: problems owners report from the dashboard ---------------------------------------
 
 
-def issue_rows(wanted: str | None = None) -> list[Issue]:
-    rows = Issue.objects.select_related("owner__owned_company")
+def issue_rows(wanted: str | None = None, source: str | None = None) -> list[Issue]:
+    rows = Issue.objects.select_related("owner__owned_company", "member", "reporter")
+    if source:
+        rows = rows.filter(source=source)
     return list(rows.filter(status=wanted) if wanted else rows)
 
 
-def issue_counts() -> dict[str, int]:
-    counts = dict(Issue.objects.values_list("status").annotate(n=Count("id")))
+def issue_counts(source: str | None = None) -> dict[str, int]:
+    rows = Issue.objects.filter(source=source) if source else Issue.objects.all()
+    counts = dict(rows.values_list("status").annotate(n=Count("id")))
     return {s: counts.get(s, 0) for s in Issue.Status.values}
 
 
@@ -839,6 +842,8 @@ def reply_to_issue(issue: Issue, message: str, staff: User) -> Issue:
     message = (message or "").strip()
     if not message:
         raise AdminActionError("Write a reply first.")
+    if issue.source != Issue.Source.OWNER or issue.owner_id is None:
+        raise AdminActionError("Only reports from an owner's dashboard can be answered by email.")
     if not issue.contact_ok:
         raise AdminActionError("They asked not to get emails about this report.")
     send_customer_email(
@@ -865,7 +870,7 @@ def set_issue_status(issue: Issue, new_status: str, staff: User) -> tuple[Issue,
     issue.resolved_at = timezone.now() if new_status in (Issue.Status.FIXED, Issue.Status.CLOSED) else None
     issue.save(update_fields=["status", "resolved_at", "updated_at"])
     track("admin.issue_status", {"issue": issue.pk, "from": was, "to": new_status}, actor_email=staff.email, ref=issue.owner)
-    if new_status != Issue.Status.FIXED or was == Issue.Status.FIXED or not issue.contact_ok:
+    if new_status != Issue.Status.FIXED or was == Issue.Status.FIXED or not issue.contact_ok or issue.owner_id is None:
         return issue, ""
     try:
         send_customer_email(

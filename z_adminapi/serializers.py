@@ -625,18 +625,29 @@ class IssueRowSerializer(serializers.ModelSerializer):
 
     customer = serializers.SerializerMethodField()
     has_screenshot = serializers.SerializerMethodField()
+    # F-13: where it came from; who sent it for a member's (the Zinwe window) or a staff report.
+    member_name = serializers.SerializerMethodField()
+    reporter_email = serializers.SerializerMethodField()
 
     class Meta:
         model = Issue
         fields = [
             "id", "description", "page", "context", "contact_ok", "status", "reply", "replied_at", "resolved_at",
-            "created_at", "customer", "has_screenshot",
+            "created_at", "customer", "has_screenshot", "source", "member_name", "reporter_email",
         ]
 
     def get_has_screenshot(self, obj: Issue) -> bool:
         return bool(obj.screenshot)
 
-    def get_customer(self, obj: Issue) -> dict[str, Any]:
+    def get_member_name(self, obj: Issue) -> str | None:
+        return obj.member.name if obj.member_id else None
+
+    def get_reporter_email(self, obj: Issue) -> str | None:
+        return obj.reporter.email if obj.reporter_id else None
+
+    def get_customer(self, obj: Issue) -> dict[str, Any] | None:
+        if obj.owner_id is None:
+            return None  # a staff report
         company = getattr(obj.owner, "owned_company", None)
         return {
             "id": obj.owner_id,

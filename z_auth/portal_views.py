@@ -251,7 +251,9 @@ class IssueView(APIView):
         return [ScopedRateThrottle()] if self.request.method == "POST" else []
 
     def get(self, request: Request) -> Response:
-        return Response(IssueSerializer(Issue.objects.filter(owner=request.user)[:20], many=True).data)
+        # Only what the owner sent: their members' reports from the Zinwe window go to the Zinwe team (F-13).
+        rows = Issue.objects.filter(owner=request.user, source=Issue.Source.OWNER)[:20]
+        return Response(IssueSerializer(rows, many=True).data)
 
     def post(self, request: Request) -> Response:
         serializer = IssueSerializer(data=request.data)
@@ -280,7 +282,9 @@ class IssueScreenshotView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request: Request, issue_id: int) -> FileResponse:
-        rows = Issue.objects.all() if request.user.is_staff else Issue.objects.filter(owner=request.user)
+        rows = Issue.objects.all() if request.user.is_staff else Issue.objects.filter(
+            owner=request.user, source=Issue.Source.OWNER
+        )
         issue = rows.filter(pk=issue_id).first()
         if issue is None or not issue.screenshot:
             raise Http404("No screenshot.")
