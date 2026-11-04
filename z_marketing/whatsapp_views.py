@@ -16,7 +16,7 @@ from . import wa_media, whatsapp
 from .contact_file import FileProblem
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
 from .views import Staff
-from .whatsapp import WaError
+from .whatsapp import WaError, WaFieldError
 
 
 class WaTemplateSerializer(serializers.ModelSerializer):
@@ -132,9 +132,19 @@ class WaTodayView(Staff):
 
 
 class WaContactListView(Staff):
+    """GET every contact · POST one typed in the admin (Add contact): 400 {field: message} when something's off."""
+
     def get(self, request: Request) -> Response:
         rows = WaContact.objects.select_related("campaign").prefetch_related("messages")
         return Response(WaContactSerializer(rows, many=True).data)
+
+    def post(self, request: Request) -> Response:
+        try:
+            contact = whatsapp.add_one(request.data, request.user.email)
+        except WaFieldError as exc:
+            return Response({"detail": str(exc), **exc.errors}, status=status.HTTP_400_BAD_REQUEST)
+        self.audit(request, "wa_add_contact", contact, opted_in=contact.opted_in)
+        return Response(WaContactSerializer(contact).data, status=status.HTTP_201_CREATED)
 
 
 class WaContactDetailView(Staff):

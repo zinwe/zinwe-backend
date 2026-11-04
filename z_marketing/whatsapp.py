@@ -54,6 +54,14 @@ class WaError(Exception):
     """Refused, with a message for staff."""
 
 
+class WaFieldError(WaError):
+    """Refused because of the form: {field: message} for each field to fix."""
+
+    def __init__(self, errors: dict[str, str]) -> None:
+        self.errors = errors
+        super().__init__("Check the highlighted fields.")
+
+
 def today() -> date:
     return timezone.localdate()
 
@@ -182,6 +190,48 @@ def add_rows(rows: list[dict[str, Any]], choices: dict[str, dict[str, Any]], act
         )
         added += int(made)
     return added
+
+
+@transaction.atomic
+def add_one(data: dict[str, Any], actor: str) -> WaContact:
+    """
+    One contact typed in the admin (Add contact): the same checks as a sheet row. Required: business name, phone,
+    segment, country, city. Not opted in = added locked, as from a sheet. Raises WaFieldError with what to fix.
+    """
+    text = lambda key, size: str(data.get(key) or "").strip()[:size]  # noqa: E731
+    firm, segment, country, city = text("firm", 160), text("segment", 120), text("country", 40), text("city", 80)
+    raw_phone = text("phone", 30)
+    errors: dict[str, str] = {}
+    for field, value in (("firm", firm), ("phone", raw_phone), ("segment", segment), ("country", country), ("city", city)):
+        if not value:
+            errors[field] = f"Add the {REQUIRED[field].lower()}."
+    if country and country not in COUNTRY_CODES:
+        errors["country"] = "Pick India or USA."
+    phone = normalize_phone(raw_phone, country) if raw_phone and "country" not in errors else None
+    if raw_phone and country in COUNTRY_CODES and not phone:
+        errors["phone"] = "Not a phone number. Use the country code, or 10 digits for India or the USA."
+    elif phone and blocked(phone):
+        errors["phone"] = "This number asked to stop. It can't be added."
+    elif phone:
+        same = WaContact.objects.filter(phone=phone).first()
+        if same:
+            errors["phone"] = f"Already a contact: {same.firm}."
+    campaign = None
+    if data.get("campaign"):
+        campaign = WaCampaign.objects.filter(pk=data.get("campaign")).first()
+        if campaign is None:
+            errors["campaign"] = "That campaign no longer exists."
+    if errors:
+        raise WaFieldError(errors)
+    opted_in = str(data.get("opted_in", "")).lower() in OPT_IN
+    note = text("opt_in_note", 200)
+    notes = text("notes", 500)
+    return WaContact.objects.create(
+        phone=phone, campaign=campaign, first_name=text("first_name", 80), firm=firm, segment=segment, country=country,
+        city=city, source=text("source", 160) or f"Added by hand {today():%d %b %Y}", info={"notes": notes} if notes else {},
+        added_by=actor, opted_in=opted_in,
+        opt_in_note=(note or f"Marked opted in when added, {today():%d %b %Y}") if opted_in else "",
+    )
 
 
 def template_file() -> bytes:

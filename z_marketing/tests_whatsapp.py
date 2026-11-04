@@ -486,3 +486,42 @@ class NameTests(WaBase):
         c = self.contact(first_name="IT", firm="It Solutions & Services (itss)", source="Google Maps")
         data = self.api.get(f"{BASE}/contacts/{c.pk}/").json()
         self.assertEqual((data["greet_as"], data["short_name"]), ("It Solutions & Services team", "It Solutions & Services"))
+
+
+class AddOneTests(WaBase):
+    URL = f"{BASE}/contacts/"
+    GOOD = {"firm": "Pixel Studio", "phone": "98100 00777", "segment": "Agencies", "country": "India", "city": "Noida"}
+
+    def test_add_one_opted_in_with_campaign(self) -> None:
+        r = self.api.post(self.URL, {**self.GOOD, "first_name": "Riya", "opted_in": True, "opt_in_note": "Replied to our email",
+                                     "campaign": self.campaign.id, "notes": "New office in Sector 62"}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        c = WaContact.objects.get(phone="+919810000777")
+        self.assertEqual((c.firm, c.first_name, c.campaign, c.opted_in, c.opt_in_note, c.added_by),
+                         ("Pixel Studio", "Riya", self.campaign, True, "Replied to our email", "staff@zinwe.io"))
+        self.assertEqual(c.info, {"notes": "New office in Sector 62"})
+        self.assertTrue(c.source.startswith("Added by hand"))
+
+    def test_not_opted_in_is_added_locked(self) -> None:
+        r = self.api.post(self.URL, self.GOOD, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        body = r.json()
+        self.assertEqual((body["opted_in"], body["opt_in_note"]), (False, ""))
+
+    def test_field_errors(self) -> None:
+        r = self.api.post(self.URL, {"phone": "123", "country": "India"}, format="json")
+        self.assertEqual(r.status_code, 400)
+        body = r.json()
+        self.assertEqual(set(body) - {"detail"}, {"firm", "segment", "city", "phone"})
+        self.assertIn("Not a phone number", body["phone"])
+        r = self.api.post(self.URL, {**self.GOOD, "country": "UK"}, format="json")
+        self.assertEqual(r.json()["country"], "Pick India or USA.")
+
+    def test_duplicates_and_blocked_numbers(self) -> None:
+        self.contact("+919810000777")
+        r = self.api.post(self.URL, self.GOOD, format="json")
+        self.assertEqual(r.json()["phone"], "Already a contact: Gupta Exim.")
+        WaBlock.objects.create(phone="+919810000888", reason="Asked to stop")
+        r = self.api.post(self.URL, {**self.GOOD, "phone": "+91 98100 00888"}, format="json")
+        self.assertEqual(r.json()["phone"], "This number asked to stop. It can't be added.")
+        self.assertEqual(WaContact.objects.count(), 1)
