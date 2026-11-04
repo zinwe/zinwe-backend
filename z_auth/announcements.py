@@ -116,8 +116,11 @@ def _as_item(announcement: Announcement) -> dict[str, Any]:
     label = announcement.cta_label if announcement.cta_href else ""
     href = announcement.cta_href if announcement.cta_label else ""
     if announcement.offer_plan_id and announcement.offer_price_inr and not href:
-        # An offer with no button of its own gets one that applies it.
-        label = f"Upgrade for ₹{announcement.offer_price_inr:,.2f} + GST"[:40]
+        # An offer with no link of its own gets one that applies it: the staff's button text if they wrote one,
+        # else the price (whole rupees without ".00").
+        price = announcement.offer_price_inr
+        amount = f"{int(price):,}" if price == int(price) else f"{price:,.2f}"
+        label = (announcement.cta_label or f"Upgrade for ₹{amount} + GST")[:40]
         href = offer_link(announcement)
     return _item(
         f"a{announcement.pk}-{int(announcement.updated_at.timestamp())}",

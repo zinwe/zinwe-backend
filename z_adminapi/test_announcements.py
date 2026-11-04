@@ -147,7 +147,12 @@ class WhoSeesWhatTests(AdminApiTestCase):
         self.as_user(self.owner)
         bar = next(a for a in self.client.get(OWNER_URL).json()["announcements"] if a["title"] == "Offer")
         self.assertEqual(bar["cta_href"], f"/app/upgrade?plan=businesses&offer={offer.pk}")
-        self.assertIn("1.00", bar["cta_label"])
+        self.assertEqual(bar["cta_label"], "Upgrade for ₹1 + GST")  # whole rupees read without ".00"
+        offer.cta_label = "Get the offer"
+        offer.save()
+        bar = next(a for a in self.client.get(OWNER_URL).json()["announcements"] if a["title"] == "Offer")
+        self.assertEqual(bar["cta_label"], "Get the offer")  # the staff's own text, still applying the offer
+        self.assertEqual(bar["cta_href"], f"/app/upgrade?plan=businesses&offer={offer.pk}")
 
     def test_an_edit_shows_again(self) -> None:
         a = push()
