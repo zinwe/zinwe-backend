@@ -47,7 +47,7 @@ LOCKED = "Not opted in yet. Mark them as opted in, with how they agreed, before 
 REQUIRED = {"firm": "Business Name", "phone": "Phone", "segment": "Segment", "country": "Country", "city": "City"}
 TEMPLATE_COLUMNS = ["Business Name", "Phone", "Segment", "Country", "City", "First Name", "Source", "Opt-in", "Useful Info"]
 ACTIONS = ("interested", "signed", "notnow", "stop", "pause", "resume", "optin")
-COLD = [WaMessage.Kind.FIRST, WaMessage.Kind.FOLLOWUP, WaMessage.Kind.TOUCH]  # count against the daily limit
+COLD = [WaMessage.Kind.FIRST, WaMessage.Kind.FOLLOWUP, WaMessage.Kind.TOUCH, WaMessage.Kind.CUSTOM]  # count against the daily limit
 
 
 class WaError(Exception):
@@ -354,11 +354,16 @@ def _claude(template_text: str, contact: WaContact, their_last: str) -> str | No
     return text[:1000] or None
 
 
-def draft(contact: WaContact, kind: str) -> dict[str, Any]:
+def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict[str, Any]:
     """The text to send next: {text, template, by, media, creative, notes}. `by` is "claude" when Claude personalised it."""
     if not contact.opted_in:
         raise WaError(LOCKED)
-    template = next_nurture(contact) if kind == "nurture" else _template_for(contact, kind)
+    if template_id:  # staff picked a template for a one-off message (Contacts → Send WhatsApp)
+        template = WaTemplate.objects.filter(pk=template_id).first()
+        if template is None:
+            raise WaError("That template no longer exists.")
+    else:
+        template = next_nurture(contact) if kind == "nurture" else _template_for(contact, kind)
     if template is None:
         raise WaError("No after-YES message is left for this contact." if kind == "nurture" else "Add a template of this kind first.")
     base = fill(template.text, contact)
@@ -435,7 +440,7 @@ def mark_sent(contact: WaContact, kind: str, text: str, actor: str) -> WaContact
     text = text.strip()
     if not text:
         raise WaError("Write the message first.")
-    if kind not in ("first", "followup", "touch3", "touch4", "nurture", "reply"):
+    if kind not in ("first", "followup", "touch3", "touch4", "nurture", "reply", "custom"):
         raise WaError("Unknown message type.")
     c = contact.campaign
     if kind == "nurture":
@@ -457,7 +462,7 @@ def mark_sent(contact: WaContact, kind: str, text: str, actor: str) -> WaContact
         contact.next_date = start + timedelta(days=c.touch4_days) if c and c.touch4_id else None
     elif kind == "touch4":
         contact.step, contact.next_date = 4, None
-    elif kind == "reply":
+    elif kind in ("reply", "custom"):  # a one-off message answers them too, and never moves the sequence
         contact.needs_reply = False
     contact.save()
     return contact

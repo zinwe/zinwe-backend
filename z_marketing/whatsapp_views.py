@@ -187,14 +187,16 @@ class WaContactDetailView(Staff):
 
 
 class WaContactActionView(Staff):
-    """draft {kind} · sent {kind, text} · reply {text} (what they wrote) · act {action}."""
+    """draft {kind, template?} · sent {kind, text} (kind custom = a one-off that doesn't move the sequence) ·
+    reply {text} (what they wrote) · act {action}."""
 
     def post(self, request: Request, pk: int, action: str) -> Response:
         c = _contact(pk)
         actor = request.user.email
         try:
             if action == "draft":
-                return Response(whatsapp.draft(c, str(request.data.get("kind", "first"))))
+                template = request.data.get("template")
+                return Response(whatsapp.draft(c, str(request.data.get("kind", "first")), int(template) if str(template or "").isdigit() else None))
             if action == "sent":
                 whatsapp.mark_sent(c, str(request.data.get("kind", "")), str(request.data.get("text", "")), actor)
             elif action == "reply":

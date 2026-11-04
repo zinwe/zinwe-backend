@@ -392,6 +392,7 @@ class WaMessage(models.Model):
         FOLLOWUP = "followup", "Follow-up"
         TOUCH = "touch", "No-reply touch"
         NURTURE = "nurture", "After-YES message"
+        CUSTOM = "custom", "One-off message"
         REPLY = "reply", "Our reply"
         THEIRS = "theirs", "Their message"
 

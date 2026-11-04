@@ -570,3 +570,26 @@ class StructureTests(WaBase):
         self.assertEqual(set(t.parts), {"creative", "intro", "problem", "solution", "reward", "cta", "notes"})
         self.assertTrue(t.text.startswith("{{Greeting}}, Vishal from Zinwe here."))
         self.assertTrue(t.parts["reward"].startswith("Cherry on top"))
+
+
+class OneOffTests(WaBase):
+    def test_draft_from_any_template_and_send_one_off(self) -> None:
+        c = self.contact(first_name="")
+        t = WaTemplate.objects.get(name__startswith="AG-1 ")
+        r = self.api.post(f"{BASE}/contacts/{c.id}/draft/", {"kind": "first", "template": t.id}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(r.json()["text"].startswith("Hello Gupta Exim team,"))
+        self.assertEqual(r.json()["template"], t.name)
+        r = self.api.post(f"{BASE}/contacts/{c.id}/sent/", {"kind": "custom", "text": "Hello, a quick one"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        c.refresh_from_db()
+        self.assertEqual((c.step, c.status), (0, Status.READY))  # the sequence didn't move
+        self.assertEqual(list(c.messages.values_list("kind", flat=True)), ["custom"])
+        self.assertEqual(whatsapp._sent_today(), 1)  # counts against the daily limit
+
+    def test_one_off_is_refused_for_locked_or_stopped_numbers(self) -> None:
+        locked = self.contact(opted_in=False)
+        r = self.api.post(f"{BASE}/contacts/{locked.id}/sent/", {"kind": "custom", "text": "Hi"}, format="json")
+        self.assertEqual(r.status_code, 400)
+        missing = self.api.post(f"{BASE}/contacts/{locked.id}/draft/", {"kind": "first", "template": 99999}, format="json")
+        self.assertEqual(missing.status_code, 400)
