@@ -583,8 +583,9 @@ class AnnouncementsView(APIView):
 
 class AnnouncementSeenView(APIView):
     """
-    POST /api/auth/announcements/<id>/seen/ -- {closed?: bool}: the dashboard showed this pop-up (F-11), or the
-    owner closed it for good. -> {announcement_id, views, last_seen_at, closed}.
+    POST /api/auth/announcements/<id>/seen/ -- {closed?: bool, clicked?: bool}: the dashboard showed this pop-up
+    (F-11), the owner closed it for good, or pressed its button. -> {announcement_id, views, last_seen_at, closed,
+    clicks}.
     """
 
     permission_classes = [IsAuthenticated]
@@ -593,10 +594,13 @@ class AnnouncementSeenView(APIView):
         from .models import Announcement
 
         announcement = get_object_or_404(Announcement, pk=announcement_id, placement=Announcement.Placement.POPUP)
-        view = record_popup_view(request.user, announcement, closed=request.data.get("closed") is True)
+        view = record_popup_view(
+            request.user, announcement, closed=request.data.get("closed") is True,
+            clicked=request.data.get("clicked") is True,
+        )
         return Response({
             "announcement_id": announcement.pk, "views": view.views, "last_seen_at": view.last_seen_at,
-            "closed": view.closed,
+            "closed": view.closed, "clicks": view.clicks,
         })
 
 

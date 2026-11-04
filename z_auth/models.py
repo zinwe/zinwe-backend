@@ -797,13 +797,18 @@ def _delete_announcement_image(sender: type[Announcement], instance: Announcemen
 
 
 class AnnouncementView(models.Model):
-    """F-11: how often one owner has seen one pop-up, and whether they closed it for good. Kept on the account."""
+    """
+    F-11: how often one owner has seen one pop-up, whether they closed it for good, and how often they pressed its
+    button. Kept on the account.
+    """
 
     owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="announcement_views")
     announcement = models.ForeignKey(Announcement, on_delete=models.CASCADE, related_name="views")
     views = models.PositiveSmallIntegerField(default=0)
     last_seen_at = models.DateTimeField(null=True, blank=True)
     closed = models.BooleanField(default=False)
+    clicks = models.PositiveSmallIntegerField(default=0, help_text="Times the owner pressed the pop-up's button.")
+    clicked_at = models.DateTimeField(null=True, blank=True, help_text="The last time they pressed it.")
 
     class Meta:
         constraints = [

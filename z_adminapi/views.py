@@ -568,7 +568,8 @@ class ReleaseDetailView(StaffView):
 
 class AnnouncementListView(StaffView):
     """
-    GET /api/admin/announcements/ -- every pushed message, newest first, with its live status.
+    GET /api/admin/announcements/ -- every pushed message, newest first, with its live status; `?placement=popup`
+    lists the pop-ups only. Each pop-up has `stats` {owners, views, closed, clicks, clicked_owners} (bars: null).
     POST -- push one: {title, body?, kind, placement, audience, plan_codes?, cta_label?, cta_href?,
     starts_at?, ends_at?, is_active?, dismissible?, priority?}, as JSON or multipart with an optional `image` (PNG,
     JPG or WebP, up to 2 MB). Owners see it on their next page load.
@@ -577,7 +578,15 @@ class AnnouncementListView(StaffView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get(self, request: Request) -> Response:
-        rows = Announcement.objects.select_related("created_by").order_by("-created_at", "-id")
+        from .serializers import popup_stats
+
+        rows = (
+            Announcement.objects.select_related("created_by", "offer_plan")
+            .annotate(**popup_stats("views__"))
+            .order_by("-created_at", "-id")
+        )
+        if request.query_params.get("placement") in Announcement.Placement.values:
+            rows = rows.filter(placement=request.query_params["placement"])
         return Response(AnnouncementSerializer(rows, many=True).data)
 
     def post(self, request: Request) -> Response:
@@ -589,6 +598,38 @@ class AnnouncementListView(StaffView):
             "audience": announcement.audience,
         }, announcement)
         return Response(AnnouncementSerializer(announcement).data, status=status.HTTP_201_CREATED)
+
+
+class OwnerSearchView(StaffView):
+    """
+    GET /api/admin/owners/search/?q=acme -- up to 10 account owners whose sign-in email, name or company matches,
+    for picking "specific people": [{id, email, full_name, company, plan}].
+    """
+
+    def get(self, request: Request) -> Response:
+        from django.db.models import Q
+
+        from z_auth.billing import current_subscription
+
+        q = (request.query_params.get("q") or "").strip()
+        if len(q) < 2:
+            return Response([])
+        owners = (
+            User.objects.filter(is_staff=False)
+            .filter(Q(email__icontains=q) | Q(full_name__icontains=q) | Q(owned_company__name__icontains=q))
+            .select_related("owned_company")
+            .order_by("email")[:10]
+        )
+        out = []
+        for owner in owners:
+            company = getattr(owner, "owned_company", None)
+            subscription = current_subscription(owner)
+            plan = subscription.plan if subscription is not None else None
+            out.append({
+                "id": owner.pk, "email": owner.email, "full_name": owner.full_name,
+                "company": company.name if company else "", "plan": plan.name if plan else "",
+            })
+        return Response(out)
 
 
 class AnnouncementReachView(StaffView):

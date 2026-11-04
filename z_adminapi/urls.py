@@ -44,6 +44,7 @@ urlpatterns = [
     path("announcements/", views.AnnouncementListView.as_view(), name="announcements"),
     path("zingles/", views.ZingleListView.as_view(), name="zingles"),
     path("zingles/<int:pk>/", views.ZingleDetailView.as_view(), name="zingle-detail"),
+    path("owners/search/", views.OwnerSearchView.as_view(), name="owner-search"),
     path("announcements/reach/", views.AnnouncementReachView.as_view(), name="announcement-reach"),
     path("announcements/<int:pk>/", views.AnnouncementDetailView.as_view(), name="announcement-detail"),
     path("release-notes/", views.ReleaseNoteListView.as_view(), name="release-notes"),

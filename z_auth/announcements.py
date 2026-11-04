@@ -172,10 +172,12 @@ def popups_for(user: User, ent: Entitlements | None = None) -> list[dict[str, An
     return []
 
 
-def record_popup_view(user: User, announcement: Announcement, closed: bool = False) -> AnnouncementView:
+def record_popup_view(
+    user: User, announcement: Announcement, closed: bool = False, clicked: bool = False
+) -> AnnouncementView:
     """
     POST .../announcements/<id>/seen/: the dashboard showed the pop-up (one view a day at most, so a reload or a
-    repeat doesn't use up its 3 views), or `closed` it for good.
+    repeat doesn't use up its 3 views), `closed` it for good, or the owner pressed its button (`clicked`).
     """
     now = timezone.now()
     view, _ = AnnouncementView.objects.get_or_create(owner=user, announcement=announcement)
@@ -185,7 +187,10 @@ def record_popup_view(user: User, announcement: Announcement, closed: bool = Fal
         view.last_seen_at = now
     if closed:
         view.closed = True
-    view.save(update_fields=["views", "last_seen_at", "closed"])
+    if clicked:
+        view.clicks += 1
+        view.clicked_at = now
+    view.save(update_fields=["views", "last_seen_at", "closed", "clicks", "clicked_at"])
     return view
 
 

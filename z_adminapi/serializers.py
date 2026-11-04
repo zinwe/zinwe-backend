@@ -388,6 +388,22 @@ ANNOUNCEMENT_IMAGE_TYPES = {
 }
 
 
+POPUP_STAT_KEYS = ("owners", "views", "closed", "clicks", "clicked_owners")
+
+
+def popup_stats(prefix: str = "") -> dict[str, Any]:
+    """Count / Sum expressions over AnnouncementView rows, for aggregate() (prefix "") or annotate() ("views__")."""
+    from django.db.models import Count, Q, Sum
+
+    return {
+        "stat_owners": Count(f"{prefix}id", filter=Q(**{f"{prefix}views__gt": 0}), distinct=True),
+        "stat_views": Sum(f"{prefix}views"),
+        "stat_closed": Count(f"{prefix}id", filter=Q(**{f"{prefix}closed": True}), distinct=True),
+        "stat_clicks": Sum(f"{prefix}clicks"),
+        "stat_clicked_owners": Count(f"{prefix}id", filter=Q(**{f"{prefix}clicks__gt": 0}), distinct=True),
+    }
+
+
 class AnnouncementSerializer(serializers.ModelSerializer):
     """
     GET/POST /api/admin/announcements/ and PATCH /<id>/: one pushed message plus its live status.
@@ -398,6 +414,7 @@ class AnnouncementSerializer(serializers.ModelSerializer):
     image = serializers.FileField(write_only=True, required=False)
     remove_image = serializers.BooleanField(write_only=True, required=False, default=False)
     image_url = serializers.SerializerMethodField()
+    stats = serializers.SerializerMethodField()
     # On by default: a multipart form that leaves them out would otherwise read as "off".
     is_active = serializers.BooleanField(required=False, default=True)
     dismissible = serializers.BooleanField(required=False, default=True)
@@ -413,10 +430,10 @@ class AnnouncementSerializer(serializers.ModelSerializer):
         fields = (
             "id", "title", "body", "kind", "placement", "audience", "plan_codes", "owner_emails", "cta_label",
             "cta_href", "offer_plan", "offer_price_inr", "offer_uses", "image", "remove_image", "image_url",
-            "starts_at", "ends_at", "is_active", "dismissible", "priority", "status", "created_by", "created_at",
-            "updated_at",
+            "starts_at", "ends_at", "is_active", "dismissible", "priority", "status", "stats", "created_by",
+            "created_at", "updated_at",
         )
-        read_only_fields = ("id", "status", "created_by", "offer_uses", "created_at", "updated_at")
+        read_only_fields = ("id", "status", "stats", "created_by", "offer_uses", "created_at", "updated_at")
 
     def get_offer_uses(self, obj: Announcement) -> int:
         """How many owners have paid with this offer."""
@@ -437,6 +454,19 @@ class AnnouncementSerializer(serializers.ModelSerializer):
 
     def get_created_by(self, obj: Announcement) -> str:
         return obj.created_by.email if obj.created_by else ""
+
+    def get_stats(self, obj: Announcement) -> dict[str, int] | None:
+        """A pop-up's numbers: owners who saw it, views in all, owners who closed it, button presses (and by how
+        many owners). Null for bars. The list annotates them (popup_stats); one row counts on its own."""
+        if obj.placement != Announcement.Placement.POPUP:
+            return None
+        annotated = getattr(obj, "stat_owners", None)
+        if annotated is not None:
+            row = {k: getattr(obj, f"stat_{k}") for k in POPUP_STAT_KEYS}
+        else:
+            row = obj.views.aggregate(**popup_stats())
+            row = {k: row[f"stat_{k}"] for k in POPUP_STAT_KEYS}
+        return {k: int(v or 0) for k, v in row.items()}
 
     def get_image_url(self, obj: Announcement) -> str | None:
         from z_auth.announcements import image_url
