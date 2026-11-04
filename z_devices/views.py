@@ -819,7 +819,7 @@ class ReportScheduleDetailView(APIView):
             plan.require(request.user, plan.REPORTS_PRO)  # pausing is always allowed
         data = ReportScheduleSerializer(schedule, data=request.data, partial=True, context={"owner": request.user})
         data.is_valid(raise_exception=True)
-        timing = {"frequency", "weekday", "month_day", "every_days", "send_hour", "is_active"}
+        timing = {"frequency", "weekday", "month_day", "every_days", "start_date", "send_hour", "is_active"}
         schedule = data.save()
         if timing & set(data.validated_data):
             schedule_first_run(schedule)

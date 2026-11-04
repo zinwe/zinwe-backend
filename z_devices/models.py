@@ -723,13 +723,13 @@ class PushSubscription(models.Model):
 class ReportSchedule(models.Model):
     """
     A report the owner gets by email on a schedule (FR-22): the whole team or one person, for the period that
-    just ended (yesterday, last week, last month or the last N days), sent around `send_hour` (local time; the
+    just ended (today or yesterday, last week, last month or the last N days), sent around `send_hour` (local time; the
     jobs loop runs hourly). Recipients: the owner, each person their own report, and/or a few other addresses.
     `next_run_at` is when it's next due; the jobs loop (report_schedules.send_due) sends it and moves it on.
     """
 
     class Frequency(models.TextChoices):
-        DAILY = "daily", "Every day (yesterday)"
+        DAILY = "daily", "Every day"
         WEEKLY = "weekly", "Every week (last Monday to Sunday)"
         MONTHLY = "monthly", "Every month (last month)"
         CUSTOM = "custom", "Every few days (the last N days)"
@@ -740,8 +740,22 @@ class ReportSchedule(models.Model):
     frequency = models.CharField(max_length=10, choices=Frequency.choices, default=Frequency.WEEKLY)
     weekday = models.PositiveSmallIntegerField(default=0, help_text="Weekly: the day it's sent, 0 = Monday.")
     month_day = models.PositiveSmallIntegerField(default=1, help_text="Monthly: the day of the month it's sent (1-28).")
-    every_days = models.PositiveSmallIntegerField(default=14, help_text="Custom: sent every N days, covering them (2-90).")
+    every_days = models.PositiveSmallIntegerField(
+        default=14, help_text="Custom: sent every N days, covering them (2-90; with a start date 1-90, or 0 = once)."
+    )
+    # F-09: "Pick dates": the first send day. Without it a custom schedule starts at its next send hour.
+    start_date = models.DateField(null=True, blank=True, help_text="Custom: the first day it's sent.")
     send_hour = models.PositiveSmallIntegerField(default=9, help_text="Local hour it's sent (0-23).")
+
+    class Covers(models.TextChoices):
+        TODAY = "today", "Today's work"
+        YESTERDAY = "yesterday", "Yesterday's work"
+
+    # F-10: a daily report sent in the evening covers that day; one sent in the morning, the day before.
+    covers = models.CharField(
+        max_length=10, choices=Covers.choices, default=Covers.YESTERDAY,
+        help_text="Daily (and a one-off pick-a-date send): the day it covers.",
+    )
     send_to_owner = models.BooleanField(default=True)
     send_to_members = models.BooleanField(default=False, help_text="Each person gets their own report, nobody else's.")
     extra_emails = models.JSONField(default=list, blank=True, help_text="Other addresses that get the report (max 5).")

@@ -296,6 +296,11 @@ def period_label(report: dict[str, Any]) -> str:
     return f"{first} to {end.day} {end:%b %Y}"
 
 
+def day_name(day: date) -> str:
+    """ "Mon 2 Nov"."""
+    return f"{day:%a} {day.day} {day:%b}"
+
+
 def hm(seconds: int) -> str:
     """3725 -> "1:02" (hours:minutes), what spreadsheets read as a time."""
     minutes = int(seconds) // 60

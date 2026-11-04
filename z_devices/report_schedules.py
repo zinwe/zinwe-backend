@@ -1,10 +1,11 @@
 """
 FR-22: scheduled reports. Each ReportSchedule covers the period that just ended and goes out around its hour:
 
-- daily:   yesterday, every day;
+- daily:   today or yesterday (`covers`, F-10), every day;
 - weekly:  last Monday to Sunday, on the chosen weekday;
 - monthly: last calendar month, on the chosen day of the month (1-28, so every month has it);
-- custom:  the last N days, every N days from the first send.
+- custom:  the last N days, every N days from the first send (from `start_date` when picked, F-09); with a
+           start date and `every_days=0`, once on that day, covering it like a daily one, then switched off.
 
 `send_due()` is a jobs-loop job (z_main run_jobs, hourly): it claims each due schedule by moving `next_run_at` on
 (so two runs never send it twice), then emails it (report_mail.send_report). A schedule whose owner's plan no
@@ -23,6 +24,7 @@ from z_auth.entitlements import entitlements_for
 
 from .models import ReportSchedule
 from .report_mail import send_report
+from .reports import day_name
 
 logger = logging.getLogger("zinwe.reports")
 
@@ -35,11 +37,18 @@ def _at(day: date, hour: int) -> datetime:
                                timezone.get_current_timezone())
 
 
-def next_run(schedule: ReportSchedule, after: datetime) -> datetime:
-    """The first send time strictly after `after` (aware)."""
-    if schedule.frequency == ReportSchedule.Frequency.CUSTOM and schedule.next_run_at is not None:
-        step = timedelta(days=max(2, schedule.every_days))
-        due = schedule.next_run_at
+def is_once(schedule: ReportSchedule) -> bool:
+    """F-09: a pick-a-date schedule that sends on its start date only."""
+    return schedule.frequency == ReportSchedule.Frequency.CUSTOM and schedule.every_days == 0
+
+
+def next_run(schedule: ReportSchedule, after: datetime) -> datetime | None:
+    """The first send time strictly after `after` (aware); None when a one-off send has nothing left to send."""
+    if schedule.frequency == ReportSchedule.Frequency.CUSTOM and (schedule.next_run_at or schedule.start_date):
+        due = schedule.next_run_at or _at(schedule.start_date, schedule.send_hour)
+        if is_once(schedule):
+            return due if schedule.next_run_at is None and due > after else None
+        step = timedelta(days=max(1, schedule.every_days))
         while due <= after:
             due += step
         return due
@@ -68,10 +77,17 @@ def period_for(schedule: ReportSchedule, run_day: date) -> tuple[date, date]:
     if schedule.frequency == ReportSchedule.Frequency.MONTHLY:
         end = run_day.replace(day=1) - timedelta(days=1)
         return end.replace(day=1), end
-    if schedule.frequency == ReportSchedule.Frequency.CUSTOM:
-        return run_day - timedelta(days=max(2, schedule.every_days)), run_day - timedelta(days=1)
+    if schedule.frequency == ReportSchedule.Frequency.CUSTOM and not is_once(schedule):
+        return run_day - timedelta(days=max(1, schedule.every_days)), run_day - timedelta(days=1)
+    if schedule.covers == ReportSchedule.Covers.TODAY:
+        return run_day, run_day
     yesterday = run_day - timedelta(days=1)
     return yesterday, yesterday
+
+
+def default_covers(send_hour: int) -> str:
+    """F-10 / D2: a daily report sent at 6 PM or later covers that day, an earlier one the day before."""
+    return ReportSchedule.Covers.TODAY if send_hour >= 18 else ReportSchedule.Covers.YESTERDAY
 
 
 def describe(schedule: ReportSchedule) -> str:
@@ -85,9 +101,16 @@ def describe(schedule: ReportSchedule) -> str:
         n = schedule.month_day
         suffix = "th" if 11 <= n <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
         return f"On the {n}{suffix} of every month {when}, for the month before"
+    covers = "for that day" if schedule.covers == ReportSchedule.Covers.TODAY else "for the day before"
+    if is_once(schedule) and schedule.start_date:
+        return f"Once on {day_name(schedule.start_date)} {when}, {covers}"
     if schedule.frequency == ReportSchedule.Frequency.CUSTOM:
-        return f"Every {schedule.every_days} days {when}, for those {schedule.every_days} days"
-    return f"Every day {when}, for the day before"
+        n = schedule.every_days
+        start = f" from {day_name(schedule.start_date)}" if schedule.start_date else ""
+        if n == 1:
+            return f"Every day{start} {when}, for the day before"
+        return f"Every {n} days{start} {when}, for those {n} days"
+    return f"Every day {when}, {covers}"
 
 
 def schedule_first_run(schedule: ReportSchedule, now: datetime | None = None) -> None:
@@ -114,8 +137,9 @@ def send_due(now: datetime | None = None) -> ScheduledReportsResult:
     for schedule in due:
         planned = schedule.next_run_at
         following = next_run(schedule, now)
-        # Claim it: only the run that moves next_run_at on sends it.
-        if not ReportSchedule.objects.filter(pk=schedule.pk, next_run_at=planned).update(next_run_at=following):
+        # Claim it: only the run that moves next_run_at on sends it. A one-off send is switched off as it goes.
+        once = {"is_active": False} if is_once(schedule) else {}
+        if not ReportSchedule.objects.filter(pk=schedule.pk, next_run_at=planned).update(next_run_at=following, **once):
             continue
         schedule.next_run_at = following
         if not entitlements_for(schedule.owner).has(plan.REPORTS_PRO):

@@ -11,10 +11,9 @@
 {% endfor %}    </table>
 {% if people %}    <p style="margin:0 0 8px;font-weight:600;">By person (time worked)</p>
     <table style="margin:0 0 18px;border-collapse:collapse;width:100%;">
-{% for p in people %}      <tr><td style="padding:6px 0;border-bottom:1px solid #e5e5e5;">{{ p.name }}</td><td style="padding:6px 0;text-align:right;border-bottom:1px solid #e5e5e5;">{{ p.worked }} <span style="color:#6b6b6b;">over {{ p.days }} day{{ p.days|pluralize }}</span></td></tr>
+{% for p in people %}      <tr><td style="padding:6px 0;border-bottom:1px solid #e5e5e5;">{{ p.name }}</td>{% if p.idle %}<td style="padding:6px 0;text-align:right;border-bottom:1px solid #e5e5e5;color:#6b6b6b;">No activity</td>{% else %}<td style="padding:6px 0;text-align:right;border-bottom:1px solid #e5e5e5;">{{ p.worked }} <span style="color:#6b6b6b;">over {{ p.days }} day{{ p.days|pluralize }}</span></td>{% endif %}</tr>
 {% endfor %}    </table>
-{% if more_people %}    <p style="margin:-8px 0 18px;color:#6b6b6b;font-size:13px;">...and {{ more_people }} more in the attached PDF.</p>
-{% endif %}{% endif %}    <p style="margin:0 0 20px;">The full report is attached as a PDF.</p>
+{% endif %}    <p style="margin:0 0 20px;">The full report is attached as a PDF.</p>
 {% if is_owner %}    <p style="margin:0 0 20px;"><a href="{{ report_url }}" style="display:inline-block;padding:10px 18px;background:#f26a0a;color:#141210;border-radius:6px;font-weight:600;text-decoration:none;">Open on your dashboard</a></p>
 {% endif %}{% if is_owner and scheduled %}    <p style="margin:0 0 16px;color:#6b6b6b;font-size:13px;">You can change or stop scheduled reports on the dashboard's Reports page.</p>
 {% endif %}    <p style="margin:0;color:#6b6b6b;">Sent by Zinwe for {{ company }}<br>SKYTECHNO, New Delhi</p>

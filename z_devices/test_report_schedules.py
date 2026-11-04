@@ -276,3 +276,81 @@ class ScheduleTests(ReportTestBase):
         schedule = self.create().json()
         self.assertEqual(self.client.delete(f"{URL}schedules/{schedule['id']}/").status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(ReportSchedule.objects.exists())
+
+
+class DailyCoversTests(ReportTestBase):  # F-10
+    def create(self, **data):  # type: ignore[no-untyped-def]
+        return self.client.post(f"{URL}schedules/", {"frequency": "daily", **data}, format="json")
+
+    def test_a_new_daily_schedule_covers_today_from_6_pm(self) -> None:
+        self.assertEqual(self.create(send_hour=21).json()["covers"], "today")
+        self.assertEqual(self.create(send_hour=18).json()["covers"], "today")
+        self.assertEqual(self.create(send_hour=9).json()["covers"], "yesterday")
+        evening = self.create(send_hour=21, covers="yesterday").json()  # the owner's choice wins
+        self.assertEqual(evening["covers"], "yesterday")
+        self.assertEqual(evening["description"], "Every day around 9 PM, for the day before")
+        changed = self.client.patch(f"{URL}schedules/{evening['id']}/", {"covers": "today"}, format="json").json()
+        self.assertEqual((changed["covers"], changed["description"]), ("today", "Every day around 9 PM, for that day"))
+        self.assertEqual(self.create(covers="tomorrow").status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_covers_today_is_the_send_day(self) -> None:
+        s = ReportSchedule(owner=self.owner, frequency="daily", covers="today")
+        self.assertEqual(period_for(s, date(2026, 11, 2)), (date(2026, 11, 2), date(2026, 11, 2)))
+        s.frequency = "weekly"  # other frequencies ignore it
+        self.assertEqual(period_for(s, date(2026, 11, 4)), (date(2026, 10, 26), date(2026, 11, 1)))
+
+    def test_the_team_mail_names_the_day_and_lists_everyone(self) -> None:
+        ravi, _ = self.second_person()
+        today = timezone.localdate()
+        self.a_day(today)
+        ReportSchedule.objects.create(owner=self.owner, frequency="daily", send_hour=21, covers="today",
+                                      next_run_at=timezone.now() - timedelta(minutes=5))
+        self.assertEqual(send_due().sent, 1)
+        sent = mail.outbox[0]
+        self.assertEqual(sent.subject, f"Team report · {today:%a} {today.day} {today:%b}")
+        self.assertIn("Asha Rao: 8 h 30 min over 1 day", sent.body)
+        self.assertIn("Ravi Kumar: No activity", sent.body)
+        html = sent.alternatives[0][0]
+        self.assertIn("Ravi Kumar", html)
+        self.assertIn("No activity", html)
+        self.assertEqual(ReportDelivery.objects.get().period_from, today)
+
+
+class PickDatesTests(ReportTestBase):  # F-09
+    def create(self, **data):  # type: ignore[no-untyped-def]
+        return self.client.post(f"{URL}schedules/", {"frequency": "custom", "send_hour": 21, **data}, format="json")
+
+    def test_once_on_a_picked_day_then_switched_off(self) -> None:
+        day = timezone.localdate() + timedelta(days=2)
+        response = self.create(start_date=day.isoformat(), every_days=0)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        body = response.json()
+        self.assertEqual((body["start_date"], body["every_days"], body["covers"]), (day.isoformat(), 0, "today"))
+        self.assertTrue(body["description"].startswith(f"Once on {day:%a} {day.day} {day:%b} around 9 PM"))
+        nxt = timezone.localtime(datetime.fromisoformat(body["next_run_at"]))
+        self.assertEqual((nxt.date(), nxt.hour), (day, 21))
+
+        # The day comes (moved to today so the period has started).
+        self.a_day(timezone.localdate())
+        ReportSchedule.objects.update(start_date=timezone.localdate(), next_run_at=timezone.now() - timedelta(minutes=5))
+        self.assertEqual(send_due().sent, 1)
+        schedule = ReportSchedule.objects.get()
+        self.assertFalse(schedule.is_active)
+        self.assertIsNone(schedule.next_run_at)
+        self.assertEqual(ReportDelivery.objects.get().period_from, timezone.localdate())
+        self.assertEqual(send_due().sent, 0)
+
+    def test_every_n_days_from_the_start_date(self) -> None:
+        day = timezone.localdate() + timedelta(days=1)
+        body = self.create(start_date=day.isoformat(), every_days=3).json()
+        self.assertEqual(body["description"], f"Every 3 days from {day:%a} {day.day} {day:%b} around 9 PM, for those 3 days")
+        schedule = ReportSchedule.objects.get()
+        first = schedule.next_run_at
+        self.assertEqual(timezone.localtime(first).date(), day)
+        self.assertEqual(next_run(schedule, first), first + timedelta(days=3))
+
+    def test_validation(self) -> None:
+        past = (timezone.localdate() - timedelta(days=1)).isoformat()
+        self.assertEqual(self.create(start_date=past, every_days=0).status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.create(every_days=0).status_code, status.HTTP_400_BAD_REQUEST)  # once needs a day
+        self.assertEqual(self.create(every_days=14).status_code, status.HTTP_201_CREATED)  # the old way still works

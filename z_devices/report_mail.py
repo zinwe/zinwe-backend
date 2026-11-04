@@ -6,6 +6,8 @@ Who gets what (privacy first, nobody sees a colleague's numbers unless the owner
   (and CSV when asked) with a short summary in the email;
 - with "each person gets their own report": every person in it receives only their own report (for a person's
   report, just that person). People with nothing recorded in the period are skipped.
+The team email lists every active person: those with nothing recorded show "No activity" (F-10). A one-day report's
+subject names the day: "Team report · Mon 2 Nov".
 Every send is recorded as a ReportDelivery (the Reports page's "Sent" list).
 """
 from __future__ import annotations
@@ -21,7 +23,7 @@ from z_notification.services import notify
 
 from .models import Member, ReportDelivery, ReportSchedule
 from .report_pdf import report_filename, report_pdf
-from .reports import build_report, clamp_period, clock, period_label, report_csv, report_title, size
+from .reports import build_report, clamp_period, clock, day_name, period_label, report_csv, report_title, size
 
 MAX_EXTRA_EMAILS = 5
 MAX_MANUAL_SENDS_PER_DAY = 20
@@ -92,6 +94,21 @@ def _summary(report: dict[str, Any]) -> list[tuple[str, str]]:
     return rows
 
 
+def _people(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """The team email's "By person" rows: everyone who did something, then every other active person (F-10)."""
+    if report.get("member"):
+        return []
+    rows = [{"name": p["name"], "worked": _duration(p["worked_seconds"]), "days": p["days_worked"], "idle": False}
+            for p in report["people"]]
+    return rows + [{"name": name, "worked": "No activity", "days": 0, "idle": True} for name in report["no_activity"]]
+
+
+def _subject_period(report: dict[str, Any]) -> str:
+    """ "Mon 2 Nov" for one day (the day in the owner's work zone), else the period."""
+    start, end = date.fromisoformat(report["from"]), date.fromisoformat(report["to"])
+    return day_name(end) if start == end else period_label(report)
+
+
 def _has_activity(report: dict[str, Any]) -> bool:
     t = report["totals"]
     return bool(t["person_days"] or t["active_seconds"] or t["alerts_all"])
@@ -133,11 +150,8 @@ def send_report(
             "period": period_label(report),
             "company": company,
             "summary": _summary(report),
-            "people": [
-                {"name": p["name"], "worked": _duration(p["worked_seconds"]), "days": p["days_worked"]}
-                for p in report["people"][:8]
-            ] if not report.get("member") else [],
-            "more_people": max(0, len(report["people"]) - 8) if not report.get("member") else 0,
+            "subject_period": _subject_period(report),
+            "people": _people(report),
             "report_url": _report_url(report),
             "scheduled": schedule is not None,
             "schedule_label": schedule.get_frequency_display() if schedule else "",

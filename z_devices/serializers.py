@@ -4,6 +4,7 @@ import json
 from datetime import timezone as dt_timezone
 from typing import Any
 
+from django.utils import timezone
 from rest_framework import serializers
 
 from . import blocklists, web_push
@@ -721,15 +722,16 @@ class ReportScheduleSerializer(serializers.ModelSerializer):
     description = serializers.SerializerMethodField()
     weekday = serializers.IntegerField(min_value=0, max_value=6, required=False)
     month_day = serializers.IntegerField(min_value=1, max_value=28, required=False)
-    every_days = serializers.IntegerField(min_value=2, max_value=90, required=False)
+    # 2-90 days; with a start date (F-09 "Pick dates") 1-90, or 0 = once.
+    every_days = serializers.IntegerField(min_value=0, max_value=90, required=False)
     send_hour = serializers.IntegerField(min_value=0, max_value=23, required=False)
     extra_emails = serializers.ListField(child=serializers.EmailField(), required=False, max_length=5)
 
     class Meta:
         model = ReportSchedule
         fields = [
-            "id", "member", "member_name", "frequency", "weekday", "month_day", "every_days", "send_hour",
-            "send_to_owner", "send_to_members", "extra_emails", "include_csv", "is_active", "description",
+            "id", "member", "member_name", "frequency", "weekday", "month_day", "every_days", "start_date", "send_hour",
+            "covers", "send_to_owner", "send_to_members", "extra_emails", "include_csv", "is_active", "description",
             "next_run_at", "last_sent_at", "last_status", "created_at",
         ]
         read_only_fields = ["next_run_at", "last_sent_at", "last_status", "created_at"]
@@ -757,6 +759,17 @@ class ReportScheduleSerializer(serializers.ModelSerializer):
 
         if not (pick("send_to_owner") or pick("send_to_members") or (pick("extra_emails") or [])):
             raise serializers.ValidationError("Choose who gets the report.")
+        custom = pick("frequency") == ReportSchedule.Frequency.CUSTOM
+        start, every = pick("start_date"), pick("every_days")
+        if custom and start is None and every < 2:
+            raise serializers.ValidationError({"every_days": ["Send it every 2 to 90 days, or pick a start date."]})
+        if attrs.get("start_date") is not None and attrs["start_date"] < timezone.localdate():
+            raise serializers.ValidationError({"start_date": ["Pick today or a later day."]})
+        if self.instance is None and "covers" not in attrs:
+            from .report_schedules import default_covers
+
+            # F-10 / D2: a new daily report sent in the evening covers that day.
+            attrs["covers"] = default_covers(pick("send_hour"))
         return attrs
 
 
