@@ -163,6 +163,8 @@ def address(contact: Any) -> dict[str, str]:
         "greeting": first or f"{business} team",
         # How a message opens: "Hi Rohit" when we know a real first name, else "Hello Webgross team".
         "salutation": f"Hi {first}" if first else f"Hello {business} team",
+        # The Hinglish opening: "Namaste Rohit ji", or "Namaste Webgross team".
+        "salutation_hi": f"Namaste {first} ji" if first else f"Namaste {business} team",
         "first_name": first,
         "business": business,
         # "I found you": unless they're greeted by name and the business is someone else's name for it

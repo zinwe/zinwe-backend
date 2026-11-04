@@ -259,7 +259,7 @@ def template_file() -> bytes:
 # --- Drafts --------------------------------------------------------------------------------------------------------
 
 
-def fill(text: str, contact: WaContact) -> str:
+def fill(text: str, contact: WaContact, language: str = "en") -> str:
     """{{Greeting}} (and an opening "Hi {{FirstName}}") is "Hi Rohit", or "Hello <Business> team" without a real name;
     {{FirstName}} is their first name only when it clearly is one, else "<Business> team" (wa_names.py);
     {{Business}} is the short clean name; {{HowWeKnow}} is one true line on where we found them."""
@@ -268,20 +268,43 @@ def fill(text: str, contact: WaContact) -> str:
     a = address(contact)
     # An opening "Hi {{FirstName}}" becomes the salutation: "Hi Rohit", or "Hello Webgross team" without a real name.
     text = re.sub(r"^\s*(Hi|Hello)\s+\{\{FirstName\}\}", "{{Greeting}}", text)
-    for key, value in (("{{Greeting}}", a["salutation"]), ("{{FirstName}}", a["greeting"]), ("{{Firm}}", a["business"]), ("{{Business}}", a["business"]),
+    for key, value in (("{{Greeting}}", a["salutation_hi"] if language == "hi" else a["salutation"]), ("{{FirstName}}", a["greeting"]), ("{{Firm}}", a["business"]), ("{{Business}}", a["business"]),
                        ("{{City}}", contact.city), ("{{HowWeKnow}}", a["how_we_know"])):
         text = text.replace(key, value)
     text = re.sub(r"[ \t]+\n", "\n", text)  # a blank {{HowWeKnow}} leaves no trailing space
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
+def language_for(contact: WaContact) -> str:
+    """en or hi: the language this contact gets cold messages in. Fixed by their first message once sent; else the
+    campaign's choice, and for a 50/50 campaign by their id, so every contact keeps one language."""
+    if contact.lang:
+        return contact.lang
+    choice = contact.campaign.language if contact.campaign else "en"
+    if choice == "ab":
+        return "hi" if contact.pk % 2 else "en"
+    return choice
+
+
+def _in_language(template: WaTemplate | None, language: str) -> WaTemplate | None:
+    """The template, or its twin in `language` when it has one."""
+    if template is not None and template.language != language and template.twin_id and template.twin.language == language:
+        return template.twin
+    return template
+
+
 def _template_for(contact: WaContact, kind: str) -> WaTemplate | None:
+    return _in_language(_template_for_any(contact, kind), language_for(contact))
+
+
+def _template_for_any(contact: WaContact, kind: str) -> WaTemplate | None:
     c = contact.campaign
+    english = WaTemplate.objects.filter(kind=kind, language=WaTemplate.Language.EN)
     if c is None:
-        return WaTemplate.objects.filter(kind=kind).first()
+        return english.first()
     pick = {"first": c.first, "followup": c.followup, "touch3": c.touch3, "touch4": c.touch4, "interested": c.interested,
             "question": c.question, "notnow": c.notnow}
-    return pick.get(kind) or WaTemplate.objects.filter(kind=kind).first()
+    return pick.get(kind) or english.first()
 
 
 def next_nurture(contact: WaContact) -> WaTemplate | None:
@@ -289,7 +312,7 @@ def next_nurture(contact: WaContact) -> WaTemplate | None:
     if contact.yes_date is None or contact.status not in (Status.INTERESTED, Status.SIGNED):
         return None
     return (
-        WaTemplate.objects.filter(kind=WaTemplate.Kind.NURTURE, track__in=["", contact.track], day__gt=contact.nurture_day)
+        WaTemplate.objects.filter(kind=WaTemplate.Kind.NURTURE, language=WaTemplate.Language.EN, track__in=["", contact.track], day__gt=contact.nurture_day)
         .order_by("day", "track", "id")
         .first()
     )
@@ -366,7 +389,7 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
         template = next_nurture(contact) if kind == "nurture" else _template_for(contact, kind)
     if template is None:
         raise WaError("No after-YES message is left for this contact." if kind == "nurture" else "Add a template of this kind first.")
-    base = fill(template.text, contact)
+    base = fill(template.text, contact, template.language)
     last = contact.messages.filter(kind=Kind.THEIRS).last()
     personal = _claude(base, contact, last.text if last else "")
     from .wa_media import describe
@@ -377,6 +400,7 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
         "media": describe(template),
         # From the outreach structure, never sent: what to attach, and context for whoever replies next.
         "creative": parts.get("creative", ""), "notes": fill(parts["notes"], contact) if parts.get("notes") else "",
+        "language": template.language,
     }
 
 
@@ -453,6 +477,9 @@ def mark_sent(contact: WaContact, kind: str, text: str, actor: str) -> WaContact
     start = contact.first_sent or today()
     if kind == "first":
         contact.status, contact.step, contact.first_sent = Status.MESSAGED, 1, today()
+        if not contact.lang:  # the language they were first written to, for the English vs Hinglish comparison
+            used = _template_for(contact, "first")
+            contact.lang = used.language if used else "en"
         contact.next_date = today() + timedelta(days=c.followup_days if c else 3)
     elif kind == "followup":
         contact.step = 2
@@ -550,6 +577,20 @@ def daily(days: int = 14) -> list[dict[str, Any]]:
         d = start + timedelta(days=i)
         r = by_day.get(d, {})
         out.append({"date": d.isoformat(), "sent": r.get("sent", 0), "replies": r.get("replies", 0)})
+    return out
+
+
+def by_language() -> list[dict[str, Any]]:
+    """English vs Hinglish, by the language of each contact's first message: replies, YES and stops."""
+    out = []
+    for code, label in (("en", "English"), ("hi", "Hinglish")):
+        s = WaContact.objects.filter(lang=code, step__gte=1)
+        out.append({
+            "language": code, "label": label, "messaged": s.count(),
+            "replied": s.filter(messages__kind=Kind.THEIRS).distinct().count(),
+            "interested": s.filter(status__in=[Status.INTERESTED, Status.SIGNED]).count(),
+            "stopped": s.filter(status=Status.STOP).count(),
+        })
     return out
 
 

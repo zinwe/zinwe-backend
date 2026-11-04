@@ -260,7 +260,7 @@ class SequenceTests(WaBase):
     def test_seeded_outreach_stops_after_day_7(self) -> None:
         self.assertEqual(WaCampaign().touch3_days, 7)
         self.assertFalse(WaTemplate.objects.filter(kind="touch4").exists())
-        outreach = WaTemplate.objects.filter(name__regex=r"^(IT-\d|AG-\d|Day [37] )")  # the IT firm and agency campaign
+        outreach = WaTemplate.objects.filter(name__regex=r"^(IT-\d|AG-\d|Day [37] )", language="en")  # the IT firm and agency campaign
         self.assertEqual(outreach.count(), 9)
         for text in outreach.values_list("text", flat=True):
             self.assertIn("Cherry on top", text)
@@ -566,7 +566,7 @@ class StructureTests(WaBase):
         self.assertTrue(whatsapp.fill("Hi {{FirstName}}, there", nameless).startswith("Hello Webgross team, there"))
 
     def test_the_90_day_first_messages_are_structured(self) -> None:
-        t = WaTemplate.objects.get(name__startswith="IT-1 ")
+        t = WaTemplate.objects.get(name__startswith="IT-1 ", language="en")
         self.assertEqual(set(t.parts), {"creative", "intro", "problem", "solution", "reward", "cta", "notes"})
         self.assertTrue(t.text.startswith("{{Greeting}}, Vishal from Zinwe here."))
         self.assertTrue(t.parts["reward"].startswith("Cherry on top"))
@@ -575,7 +575,7 @@ class StructureTests(WaBase):
 class OneOffTests(WaBase):
     def test_draft_from_any_template_and_send_one_off(self) -> None:
         c = self.contact(first_name="")
-        t = WaTemplate.objects.get(name__startswith="AG-1 ")
+        t = WaTemplate.objects.get(name__startswith="AG-1 ", language="en")
         r = self.api.post(f"{BASE}/contacts/{c.id}/draft/", {"kind": "first", "template": t.id}, format="json")
         self.assertEqual(r.status_code, 200, r.content)
         self.assertTrue(r.json()["text"].startswith("Hello Gupta Exim team,"))
@@ -593,3 +593,63 @@ class OneOffTests(WaBase):
         self.assertEqual(r.status_code, 400)
         missing = self.api.post(f"{BASE}/contacts/{locked.id}/draft/", {"kind": "first", "template": 99999}, format="json")
         self.assertEqual(missing.status_code, 400)
+
+
+class LanguageTests(WaBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.en = WaTemplate.objects.get(name__startswith="AG-1 ", language="en")
+        self.hi = self.en.twin
+        self.campaign.first, self.campaign.daily_limit = self.en, 50
+        self.campaign.status = WaCampaign.Status.LIVE
+        self.campaign.save()
+
+    def test_hinglish_twins_are_seeded_and_linked(self) -> None:
+        self.assertEqual((self.hi.language, self.hi.twin_id), ("hi", self.en.id))
+        self.assertEqual(WaTemplate.objects.filter(language="hi").count(), 9)
+        for t in WaTemplate.objects.filter(language="hi"):
+            self.assertIn("Cherry on top", t.text)
+            if t.kind == "first":
+                self.assertIn("STOP", t.text)
+                c = self.contact(f"+9198100{t.id:05d}", first_name="")
+                words = lambda x: len(whatsapp.fill(x.text, c, x.language).split())  # noqa: E731
+                self.assertLessEqual(words(t), words(t.twin) + 3, t.name)  # about as short as the English one
+
+    def test_hinglish_campaign_drafts_hinglish_with_namaste(self) -> None:
+        self.campaign.language = "hi"
+        self.campaign.save()
+        nameless = self.contact(first_name="", firm="Webgross - Digital Marketing Agency in Delhi")
+        body = whatsapp.draft(nameless, "first")
+        self.assertEqual(body["language"], "hi")
+        self.assertTrue(body["text"].startswith("Namaste Webgross team, Vishal, Zinwe se."))
+        named = self.contact("+919810000102", first_name="Rohit", firm="Pixel Studio")
+        self.assertTrue(whatsapp.draft(named, "first")["text"].startswith("Namaste Rohit ji,"))
+
+    def test_split_campaign_keeps_one_language_per_contact_and_compares(self) -> None:
+        self.campaign.language = "ab"
+        self.campaign.save()
+        people = [self.contact(f"+91981000030{i}") for i in range(4)]
+        langs = {c.id: whatsapp.draft(c, "first")["language"] for c in people}
+        self.assertEqual(sorted(langs.values()), ["en", "en", "hi", "hi"])
+        for c in people:
+            whatsapp.mark_sent(c, "first", "Hi", "staff@zinwe.io")
+            c.refresh_from_db()
+            self.assertEqual(c.lang, langs[c.id])  # fixed by the first message
+        replier = next(c for c in people if c.lang == "hi")
+        whatsapp.record_reply(replier, "Haan, batao", "staff@zinwe.io")
+        rows = {r["language"]: r for r in self.api.get(f"{BASE}/analytics/").json()["languages"]}
+        self.assertEqual((rows["en"]["messaged"], rows["en"]["replied"]), (2, 0))
+        self.assertEqual((rows["hi"]["messaged"], rows["hi"]["replied"]), (2, 1))
+
+    def test_english_stays_the_default(self) -> None:
+        c = self.contact()
+        self.assertEqual(whatsapp.draft(c, "first")["language"], "en")
+
+    def test_twin_link_goes_both_ways(self) -> None:
+        r = self.api.post(f"{BASE}/templates/", {"name": "Hi tip", "kind": "followup", "language": "hi", "text": "Ek tip",
+                                                 "twin": WaTemplate.objects.get(name="One gentle follow-up").id}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(WaTemplate.objects.get(name="One gentle follow-up").twin_id, r.json()["id"])
+        bad = self.api.post(f"{BASE}/templates/", {"name": "x", "kind": "followup", "language": "en", "text": "y",
+                                                   "twin": WaTemplate.objects.get(name="One gentle follow-up").id}, format="json")
+        self.assertEqual(bad.status_code, 400)

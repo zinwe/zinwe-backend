@@ -285,6 +285,13 @@ class WaTemplate(models.Model):
     media = models.FileField(upload_to="wa-media/", blank=True)
     media_kind = models.CharField(max_length=5, blank=True)  # image or video
     media_name = models.CharField(max_length=160, blank=True)  # the name it was uploaded with
+    class Language(models.TextChoices):
+        EN = "en", "English"
+        HI = "hi", "Hinglish"
+
+    language = models.CharField(max_length=2, choices=Language.choices, default=Language.EN)
+    # The same message in the other language (set both ways), so a campaign can send either and compare.
+    twin = models.ForeignKey("self", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
     # The outreach structure (wa_structure.py): creative, intro, problem, solution, reward, cta, details, notes.
     # Empty = a free-text template. When set, `text` is composed from it on save.
     parts = models.JSONField(default=dict, blank=True)
@@ -329,6 +336,13 @@ class WaCampaign(models.Model):
     notnow = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
     touch3 = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
     touch4 = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, related_name="+", null=True, blank=True)
+    class Language(models.TextChoices):
+        EN = "en", "English"
+        HI = "hi", "Hinglish"
+        SPLIT = "ab", "Half English, half Hinglish"
+
+    # Which language the cold messages go out in. "ab" splits contacts evenly so the two can be compared (Analytics).
+    language = models.CharField(max_length=2, choices=Language.choices, default=Language.EN)
     touch3_days = models.PositiveSmallIntegerField(default=7, help_text="Days after the first message.")
     touch4_days = models.PositiveSmallIntegerField(default=60, help_text="Days after the first message.")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -372,6 +386,8 @@ class WaContact(models.Model):
     track = models.CharField(max_length=4, choices=WaTemplate.Track.choices, default="", blank=True)
     yes_date = models.DateField(null=True, blank=True)
     nurture_day = models.SmallIntegerField(default=-1)
+    # The language of their first message (en or hi), kept so Analytics can compare reply rates.
+    lang = models.CharField(max_length=2, blank=True, default="")
     needs_reply = models.BooleanField(default=False)  # they wrote and nobody has answered yet
     paused_until = models.DateField(null=True, blank=True)
     added_by = models.EmailField(blank=True)

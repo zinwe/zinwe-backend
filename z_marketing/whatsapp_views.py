@@ -27,10 +27,21 @@ class WaTemplateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = WaTemplate
-        fields = ["id", "name", "kind", "text", "parts", "track", "day", "media", "updated_at"]
+        fields = ["id", "name", "kind", "language", "twin", "text", "parts", "track", "day", "media", "updated_at"]
         read_only_fields = ["updated_at"]
 
+    def save(self, **kwargs: Any) -> WaTemplate:
+        """A twin link goes both ways: the other-language version points back here."""
+        obj = super().save(**kwargs)
+        if obj.twin_id and obj.twin.twin_id != obj.id:
+            obj.twin.twin = obj
+            obj.twin.save(update_fields=["twin"])
+        return obj
+
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        twin = attrs.get("twin")
+        if twin is not None and twin.language == attrs.get("language", getattr(self.instance, "language", "en")):
+            raise serializers.ValidationError({"twin": "Pick a template in the other language."})
         if "parts" in attrs:
             attrs["parts"] = wa_structure.clean(attrs["parts"])
         parts = attrs.get("parts", getattr(self.instance, "parts", {}) or {})
@@ -111,7 +122,7 @@ class WaCampaignSerializer(serializers.ModelSerializer):
         model = WaCampaign
         fields = [
             "id", "name", "audience", "audience_name", "goal", "status", "daily_limit", "followup_days", "first", "followup",
-            "interested", "question", "notnow", "touch3", "touch4", "touch3_days", "touch4_days", "stats", "created_at",
+            "interested", "question", "notnow", "touch3", "touch4", "touch3_days", "touch4_days", "language", "stats", "created_at",
         ]
         read_only_fields = ["status", "created_at"]
 
@@ -353,6 +364,7 @@ class WaAnalyticsView(Staff):
             "total": whatsapp.stats(),
             "daily": whatsapp.daily(),
             "segments": whatsapp.by_segment(),
+            "languages": whatsapp.by_language(),
             "campaigns": [{"id": c.id, "name": c.name, "status": c.status, **whatsapp.stats(c)} for c in WaCampaign.objects.all()],
             "blocked": WaBlock.objects.count(),
         })
