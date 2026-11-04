@@ -1,9 +1,13 @@
 """
 Notification-bar items: the slim bars on the owner dashboard and the public website.
 
-- **Pushed messages** (offer, discount, news, new version, maintenance) are `Announcement` rows the
+- **Pushed messages** (offer, discount, news, new version, wish, maintenance) are `Announcement` rows the
   Zinwe team writes in the admin panel (Announcements page), each with a placement (dashboard,
   website, both), an audience (everyone / free / paid / chosen plans — dashboard only) and a time window.
+- **Pop-ups** (F-11, placement "popup") are the same rows shown as a moments pop-up on the dashboard, in their
+  own list. The server picks at most one a day per owner and follows a rhythm kept on the account
+  (AnnouncementView): first visit, again after 2 days, then after a week, at most 3 times; closing it stops it.
+  Free plans get every kind; paid plans only news, new versions, wishes and maintenance (D5).
 - **Configured banners** (``settings.ZINWE_ANNOUNCEMENTS``) still work, for an environment-wide note
   without the admin panel.
 - **The upgrade bar** (dashboard only) is derived live from the owner's plan and entitlements: what the
@@ -15,7 +19,7 @@ gets a new id, so it shows again).
 from __future__ import annotations
 
 import re
-
+from datetime import timedelta
 from typing import Any
 
 from django.conf import settings
@@ -24,9 +28,17 @@ from django.utils import timezone
 
 from .billing import current_subscription
 from .entitlements import Entitlements, devices_used, entitlements_for
-from .models import Announcement, Plan, Subscription, User
+from .models import Announcement, AnnouncementView, Plan, Subscription, User
 
-ALLOWED_KINDS = {"version", "offer", "discount", "news", "maintenance", "upgrade"}
+ALLOWED_KINDS = {"version", "offer", "discount", "news", "maintenance", "wish", "upgrade"}
+
+# F-11 / D5: what a pop-up may be about for an owner on a paid plan. Free plans get every kind.
+PAID_POPUP_KINDS = {
+    Announcement.Kind.NEWS, Announcement.Kind.VERSION, Announcement.Kind.WISH, Announcement.Kind.MAINTENANCE,
+}
+# Show it again this long after the 1st view, then after the 2nd; never after the 3rd.
+POPUP_GAPS = (timedelta(days=2), timedelta(days=7))
+POPUP_MAX_VIEWS = 3
 
 # Short names for "Businesses adds work hours, app usage and team chat".
 SHORT_MODULE_NAMES: dict[str, str] = {
@@ -78,7 +90,7 @@ def _reaches(announcement: Announcement, ent: Entitlements, email: str = "") -> 
         return bool(email) and email.strip().lower() in wanted
     if audience == Announcement.Audience.EVERYONE:
         return True
-    paid = bool(ent.on_active_plan and ent.plan and ent.plan.requires_payment)
+    paid = _is_paid(ent)
     if audience == Announcement.Audience.FREE:
         return not paid
     if audience == Announcement.Audience.PAID:
@@ -107,6 +119,64 @@ def _as_item(announcement: Announcement) -> dict[str, Any]:
         href,
         announcement.dismissible,
     )
+
+
+def _is_paid(ent: Entitlements) -> bool:
+    return bool(ent.on_active_plan and ent.plan and ent.plan.requires_payment)
+
+
+def popup_reaches(announcement: Announcement, ent: Entitlements, email: str = "") -> bool:
+    """A pop-up's audience, and on a paid plan only the kinds that aren't selling anything (D5)."""
+    if _is_paid(ent) and announcement.kind not in PAID_POPUP_KINDS:
+        return False
+    return _reaches(announcement, ent, email)
+
+
+def _popup_due(view: AnnouncementView | None, now: Any) -> bool:
+    """Never seen; or seen once, 2+ days ago; or twice, 7+ days ago. Closed or seen 3 times: never again."""
+    if view is None:
+        return True
+    if view.closed or view.views >= POPUP_MAX_VIEWS:
+        return False
+    if view.views == 0 or view.last_seen_at is None:
+        return True
+    return now - view.last_seen_at >= POPUP_GAPS[view.views - 1]
+
+
+def popups_for(user: User, ent: Entitlements | None = None) -> list[dict[str, Any]]:
+    """
+    F-11: the pop-up to show this owner now: none, or one (the highest priority that's due). Nothing when they
+    already saw a pop-up today.
+    """
+    ent = ent or entitlements_for(user)
+    now = timezone.now()
+    today = timezone.localtime(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    if AnnouncementView.objects.filter(owner=user, last_seen_at__gte=today).exists():
+        return []
+    live = [a for a in _live((Announcement.Placement.POPUP,)).select_related("offer_plan")
+            if popup_reaches(a, ent, user.email)]
+    views = {v.announcement_id: v for v in AnnouncementView.objects.filter(owner=user, announcement__in=live)}
+    for announcement in live:  # already in priority order
+        if _popup_due(views.get(announcement.pk), now):
+            return [{**_as_item(announcement), "announcement_id": announcement.pk}]
+    return []
+
+
+def record_popup_view(user: User, announcement: Announcement, closed: bool = False) -> AnnouncementView:
+    """
+    POST .../announcements/<id>/seen/: the dashboard showed the pop-up (one view a day at most, so a reload or a
+    repeat doesn't use up its 3 views), or `closed` it for good.
+    """
+    now = timezone.now()
+    view, _ = AnnouncementView.objects.get_or_create(owner=user, announcement=announcement)
+    seen_today = view.last_seen_at is not None and timezone.localdate(view.last_seen_at) == timezone.localdate(now)
+    if not seen_today:
+        view.views += 1
+        view.last_seen_at = now
+    if closed:
+        view.closed = True
+    view.save(update_fields=["views", "last_seen_at", "closed"])
+    return view
 
 
 def pushed_for_dashboard(ent: Entitlements, email: str = "") -> list[dict[str, Any]]:

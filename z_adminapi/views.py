@@ -536,7 +536,8 @@ class AnnouncementListView(StaffView):
 class AnnouncementReachView(StaffView):
     """
     GET /api/admin/announcements/reach/?audience=paid&plans=startups,businesses -- {customers, total}: how
-    many customers a dashboard message with this audience shows to right now.
+    many customers a dashboard message with this audience shows to right now. With `placement=popup&kind=offer`,
+    a pop-up's plan rule applies too (F-11: paid plans get news, new versions, wishes and maintenance only).
     """
 
     def get(self, request: Request) -> Response:
@@ -545,7 +546,8 @@ class AnnouncementReachView(StaffView):
             return Response({"detail": f"Unknown audience '{audience}'."}, status=status.HTTP_400_BAD_REQUEST)
         plans = [code for code in (request.query_params.get("plans") or "").split(",") if code]
         emails = [e.strip() for e in (request.query_params.get("emails") or "").split(",") if e.strip()]
-        return Response(services.announcement_reach(audience, plans, emails))
+        kind, placement = request.query_params.get("kind") or "", request.query_params.get("placement") or ""
+        return Response(services.announcement_reach(audience, plans, emails, kind=kind, placement=placement))
 
 
 class AnnouncementDetailView(StaffView):

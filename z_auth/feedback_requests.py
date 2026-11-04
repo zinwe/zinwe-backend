@@ -97,3 +97,36 @@ def send_feedback_requests(now: datetime | None = None, dry_run: bool = False) -
             result.failed += 1
             logger.warning("Feedback request to %s failed; will retry", owner.email)
     return result
+
+
+# --- F-11: the dashboard's "How are we doing?" card -----------------------------------------------------
+
+PROMPT_NOT_BEFORE = timedelta(days=3)  # never in the first 3 days of an account
+PROMPT_EVERY = timedelta(days=30)  # at most once in 30 days, and not within 30 days of feedback sent
+PROMPT_REPORTS = 1
+PROMPT_CHATS = 5
+PROMPT_ACTIVE_DAYS = 7
+
+
+def had_a_real_moment(user: User) -> bool:
+    """A report emailed, 5 chat lines sent to the team, or 7 days on which the team's work was recorded."""
+    from z_devices.models import Message, ReportDelivery, WorkLog
+
+    if ReportDelivery.objects.filter(owner=user, status__in=("sent", "partial")).count() >= PROMPT_REPORTS:
+        return True
+    chats = Message.objects.filter(owner=user, sender=Message.Sender.OWNER, kind=Message.Kind.CHAT)
+    if chats.count() >= PROMPT_CHATS:
+        return True
+    return len(WorkLog.objects.filter(owner=user).dates("at", "day")[:PROMPT_ACTIVE_DAYS]) >= PROMPT_ACTIVE_DAYS
+
+
+def feedback_prompt_due(user: User, now: datetime | None = None) -> bool:
+    """`me.feedback_prompt_due`: show the small feedback card after a real moment, not too early, not too often."""
+    now = now or timezone.now()
+    if user.is_staff or user.date_joined > now - PROMPT_NOT_BEFORE:
+        return False
+    if user.feedback_prompt_at is not None and user.feedback_prompt_at > now - PROMPT_EVERY:
+        return False
+    if Feedback.objects.filter(owner=user, source=Feedback.Source.OWNER, created_at__gte=now - PROMPT_EVERY).exists():
+        return False
+    return had_a_real_moment(user)

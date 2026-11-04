@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.exceptions import AuthenticationFailed
@@ -15,7 +17,8 @@ from rest_framework.views import APIView
 from z_main.client import get_client_ip, get_user_agent
 
 from . import entitlements, otp, services, social
-from .announcements import announcements_for, website_announcements
+from .announcements import announcements_for, popups_for, record_popup_view, website_announcements
+from .feedback_requests import feedback_prompt_due
 from .billing import current_subscription
 from .company import get_company
 from .models import Plan, User
@@ -350,6 +353,8 @@ class MeView(APIView):
                 "active_plan": PlanActivationSerializer(activation, context=ctx).data if activation else None,
                 # What the plan switches on + the PC limit; the dashboard locks sections from it.
                 "entitlements": entitlements.as_payload(user),
+                # F-11: show the small "How are we doing?" card now.
+                "feedback_prompt_due": feedback_prompt_due(user),
             }
         )
 
@@ -488,14 +493,48 @@ class WebsiteAnnouncementsView(APIView):
 class AnnouncementsView(APIView):
     """
     GET /api/auth/announcements/ -- the dashboard notification-bar items for the signed-in owner:
-    the admin panel's messages for their audience, configured banners, then the upgrade bar.
+    the admin panel's messages for their audience, configured banners, then the upgrade bar; and in `popups`
+    the moments pop-up to show now (F-11: none or one, same item shape plus `announcement_id`).
     """
 
     permission_classes = [IsAuthenticated]
     throttle_classes: list = []
 
     def get(self, request: Request) -> Response:
-        return Response({"announcements": announcements_for(request.user)})
+        return Response({"announcements": announcements_for(request.user), "popups": popups_for(request.user)})
+
+
+class AnnouncementSeenView(APIView):
+    """
+    POST /api/auth/announcements/<id>/seen/ -- {closed?: bool}: the dashboard showed this pop-up (F-11), or the
+    owner closed it for good. -> {announcement_id, views, last_seen_at, closed}.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request, announcement_id: int) -> Response:
+        from .models import Announcement
+
+        announcement = get_object_or_404(Announcement, pk=announcement_id, placement=Announcement.Placement.POPUP)
+        view = record_popup_view(request.user, announcement, closed=request.data.get("closed") is True)
+        return Response({
+            "announcement_id": announcement.pk, "views": view.views, "last_seen_at": view.last_seen_at,
+            "closed": view.closed,
+        })
+
+
+class FeedbackPromptView(APIView):
+    """POST /api/auth/feedback/prompt/ -- {action: "shown"|"dismissed"}: the feedback card was shown or put off (F-11)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request) -> Response:
+        action = request.data.get("action")
+        if action not in ("shown", "dismissed"):
+            return Response({"action": ['Send "shown" or "dismissed".']}, status=status.HTTP_400_BAD_REQUEST)
+        request.user.feedback_prompt_at = timezone.now()
+        request.user.save(update_fields=["feedback_prompt_at"])
+        return Response({"feedback_prompt_due": False, "feedback_prompt_at": request.user.feedback_prompt_at})
 
 
 class PlanActivateView(APIView):

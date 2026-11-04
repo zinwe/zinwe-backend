@@ -43,6 +43,17 @@ class AdminCrudTests(AdminApiTestCase):
         self.assertEqual(self.client.delete(f"{ADMIN_URL}{row['id']}/").status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Announcement.objects.exists())
 
+    def test_a_wish_as_a_popup(self) -> None:  # F-11
+        created = self.client.post(ADMIN_URL, {"title": "Happy Diwali", "kind": "wish", "placement": "popup"},
+                                   format="json")
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.content)
+        self.assertEqual((created.json()["kind"], created.json()["placement"]), ("wish", "popup"))
+        owner = self.make_owner()
+        give_plan(owner, "startups")
+        offer = self.client.get(f"{ADMIN_URL}reach/", {"placement": "popup", "kind": "offer"}).json()
+        wish = self.client.get(f"{ADMIN_URL}reach/", {"placement": "popup", "kind": "wish"}).json()
+        self.assertEqual((offer["customers"], wish["customers"]), (offer["total"] - 1, wish["total"]))
+
     def test_rules(self) -> None:
         bad_link = self.client.post(ADMIN_URL, {"title": "x", "cta_label": "Go", "cta_href": "javascript:alert(1)"}, format="json")
         self.assertIn("cta_href", bad_link.json())

@@ -401,7 +401,7 @@ class LogoutAndMeTests(PortalTestCase):
             {
                 "id", "email", "full_name", "phone", "is_staff", "date_joined", "email_verified", "terms", "tour_done",
                 "auth_provider", "avatar_url",
-                "onboarding", "company", "subscription", "active_plan", "entitlements",
+                "onboarding", "company", "subscription", "active_plan", "entitlements", "feedback_prompt_due",
             },
         )
         self.assertEqual(body["onboarding"], FRESH_ONBOARDING)

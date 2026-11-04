@@ -80,6 +80,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     # profile photo it gave us, for the onboarding "Signed in with …" card.
     auth_provider = models.CharField(max_length=20, blank=True, default="")
     avatar_url = models.URLField(max_length=500, blank=True, default="")
+    # F-11: when the dashboard last showed (or the owner put off) the "How are we doing?" card: at most once in 30 days.
+    feedback_prompt_at = models.DateTimeField(null=True, blank=True)
 
     objects = UserManager()
 
@@ -700,10 +702,13 @@ class RenewalReminder(models.Model):
 
 class Announcement(models.Model):
     """
-    A message the Zinwe team pushes from the admin panel: an offer, a discount, news, an update or a
+    A message the Zinwe team pushes from the admin panel: an offer, a discount, news, an update, a wish or a
     maintenance notice. Shown as a bar on the owner dashboard, on the public website (and sign-up /
     onboarding), or both, to the audience chosen, between `starts_at` and `ends_at`.
     The dashboard's own "upgrade" bar is derived from the owner's plan (z_auth.announcements), not stored.
+
+    F-11: placement "popup" is a moments pop-up on the dashboard instead of a bar. Its rhythm per owner (first visit,
+    then after 2 days, then a week, at most 3 times, never more than one a day) is kept in AnnouncementView.
     """
 
     class Kind(models.TextChoices):
@@ -712,11 +717,13 @@ class Announcement(models.Model):
         NEWS = "news", "News"
         VERSION = "version", "New version"
         MAINTENANCE = "maintenance", "Maintenance"
+        WISH = "wish", "Wish"
 
     class Placement(models.TextChoices):
         DASHBOARD = "dashboard", "Dashboard"
         WEBSITE = "website", "Website"
         BOTH = "both", "Dashboard and website"
+        POPUP = "popup", "Pop-up on the dashboard"
 
     class Audience(models.TextChoices):
         EVERYONE = "everyone", "Everyone"
@@ -769,6 +776,24 @@ class Announcement(models.Model):
 
     def __str__(self) -> str:
         return f"{self.get_kind_display()}: {self.title}"
+
+
+class AnnouncementView(models.Model):
+    """F-11: how often one owner has seen one pop-up, and whether they closed it for good. Kept on the account."""
+
+    owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="announcement_views")
+    announcement = models.ForeignKey(Announcement, on_delete=models.CASCADE, related_name="views")
+    views = models.PositiveSmallIntegerField(default=0)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+    closed = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["owner", "announcement"], name="one_view_row_per_owner_announcement"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.owner} saw {self.announcement_id} x{self.views}"
 
 
 class Invoice(models.Model):
