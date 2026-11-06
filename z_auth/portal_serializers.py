@@ -289,6 +289,8 @@ class PaymentSubmitSerializer(serializers.Serializer):
     billing_cycle = StrippedChoiceField(
         choices=Subscription.BillingCycle.choices, error_messages=CHOICE_MESSAGES, required=False,
     )
+    # F-21: a coupon code from the payment page (checked again on the server, monthly only).
+    coupon = serializers.CharField(max_length=40, required=False, allow_blank=True, default="")
     proof = serializers.FileField(
         required=False, allow_null=True, allow_empty_file=False,
         error_messages={

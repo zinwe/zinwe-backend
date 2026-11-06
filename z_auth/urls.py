@@ -33,6 +33,10 @@ urlpatterns = [
     path("zingle/<int:zingle_id>/<str:which>/", views.ZingleFileView.as_view(), name="zingle-file"),
     path("announcements/<int:announcement_id>/image/", views.AnnouncementImageView.as_view(), name="announcement-image"),
     path("announcements/<int:announcement_id>/seen/", views.AnnouncementSeenView.as_view(), name="announcement-seen"),
+    path(
+        "announcements/<int:announcement_id>/answer/", views.AnnouncementAnswerView.as_view(),
+        name="announcement-answer",
+    ),
     path("whats-new/", views.ReleaseNotesView.as_view(), name="whats-new"),
     path("testimonials/", views.TestimonialsView.as_view(), name="testimonials"),
     path("plans/", views.PlanListView.as_view(), name="plans"),
@@ -49,6 +53,7 @@ urlpatterns = [
         name="subscription-upgrade",
     ),
     path("subscription/upi-qr/", portal_views.UpiQrView.as_view(), name="subscription-upi-qr"),
+    path("subscription/coupon/", portal_views.CouponCheckView.as_view(), name="subscription-coupon"),
     path("subscription/checkout/", portal_views.CheckoutPreviewView.as_view(), name="subscription-checkout"),
     path("subscription/quote/", portal_views.QuoteView.as_view(), name="subscription-quote"),
     path("subscription/quote/pdf/", portal_views.QuotePdfView.as_view(), name="subscription-quote-pdf"),

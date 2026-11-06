@@ -27,6 +27,10 @@ class RazorpayOrder(models.Model):
     offer = models.ForeignKey(
         "z_auth.Announcement", null=True, blank=True, on_delete=models.SET_NULL, related_name="razorpay_orders",
     )
+    # F-21: the coupon this order was priced with (pending until paid; void if the order fails or is replaced).
+    coupon_use = models.ForeignKey(
+        "z_auth.CouponUse", null=True, blank=True, on_delete=models.SET_NULL, related_name="razorpay_orders",
+    )
     # What the order asked for, frozen (the quote) -- the amount Razorpay was told is amount_paise.
     due = models.JSONField(default=dict)
     amount_paise = models.PositiveIntegerField()

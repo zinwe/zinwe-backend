@@ -578,6 +578,106 @@ class ManualPayment(models.Model):
         return self.subscription.owner
 
 
+class Coupon(models.Model):
+    """
+    F-21: a coupon code the team hands out (WhatsApp, email, a pop-up...). It takes `percent_off` off today's monthly
+    price for the first month of monthly billing, never below the plan's price band minimum (`Plan.band_min_inr`).
+    One code per company, ever (CouponUse). Dates are Indian dates, both inclusive. The code can't change once used.
+    Logic in z_auth.coupons.
+    """
+
+    CODE_LENGTH = 11
+    PERCENT_MIN = 1
+    PERCENT_MAX = 40
+
+    class Channel(models.TextChoices):
+        WHATSAPP = "whatsapp", "WhatsApp"
+        EMAIL = "email", "Email"
+        POPUP = "popup", "Pop-up"
+        OTHER = "other", "Other"
+
+    code = models.CharField(max_length=CODE_LENGTH, unique=True, help_text="11 letters or digits, upper case.")
+    percent_off = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(PERCENT_MIN), MaxValueValidator(PERCENT_MAX)],
+    )
+    plan_codes = models.JSONField(default=list, blank=True, help_text="Plan codes it works on. Empty = any paid plan.")
+    starts_on = models.DateField(default=timezone.localdate)
+    ends_on = models.DateField(null=True, blank=True, help_text="Last day it works (inclusive). Empty = no end.")
+    max_uses = models.PositiveIntegerField(null=True, blank=True, help_text="Empty = no limit.")
+    channel = models.CharField(max_length=10, choices=Channel.choices, default=Channel.OTHER)
+    campaign = models.CharField(max_length=120, blank=True)
+    paused = models.BooleanField(default=False)
+    cancelled = models.BooleanField(default=False)
+    created_by = models.ForeignKey(
+        "z_auth.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self) -> str:
+        return f"{self.code} ({self.percent_off}% off)"
+
+    def status(self, today: Any = None) -> str:
+        """live · scheduled · ended · paused · cancelled, on Indian dates (both ends inclusive)."""
+        today = today or timezone.localdate()
+        if self.cancelled:
+            return "cancelled"
+        if self.ends_on is not None and today > self.ends_on:
+            return "ended"
+        if self.paused:
+            return "paused"
+        if today < self.starts_on:
+            return "scheduled"
+        return "live"
+
+
+class CouponUse(models.Model):
+    """
+    One company's use of a coupon: `pending` while the payment waits (a receipt being checked, a Razorpay checkout
+    open), `confirmed` once paid, `void` when it fell through (rejected, failed, abandoned). A company has at most one
+    pending or confirmed use, ever.
+    """
+
+    class State(models.TextChoices):
+        PENDING = "pending", "Pending"
+        CONFIRMED = "confirmed", "Confirmed"
+        VOID = "void", "Void"
+
+    coupon = models.ForeignKey(Coupon, on_delete=models.PROTECT, related_name="uses")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="coupon_uses")
+    owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="coupon_uses")
+    payment = models.OneToOneField(
+        ManualPayment, null=True, blank=True, on_delete=models.SET_NULL, related_name="coupon_use",
+    )
+    state = models.CharField(max_length=10, choices=State.choices, default=State.PENDING, db_index=True)
+    plan_code = models.CharField(max_length=50)
+    plan_name = models.CharField(max_length=120)
+    cycle = models.CharField(max_length=20, default="monthly")
+    currency = models.CharField(max_length=3, default="INR")
+    percent_off = models.PositiveSmallIntegerField()
+    capped = models.BooleanField(default=False)
+    amount_inr = models.DecimalField(max_digits=10, decimal_places=2, help_text="Before GST, after the coupon.")
+    amount_off = models.DecimalField(max_digits=10, decimal_places=2)
+    created_at = models.DateTimeField(default=timezone.now)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    voided_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company"], condition=models.Q(state__in=["pending", "confirmed"]),
+                name="one_coupon_use_per_company",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.coupon_id} by {self.company_id} ({self.state})"
+
+
 class Feedback(models.Model):
     """
     What someone thinks of Zinwe: a 1-10 rating plus an optional note, read by the team in the admin app. From the
@@ -608,6 +708,11 @@ class Feedback(models.Model):
     )
     message = models.TextField(blank=True, max_length=2000)
     page = models.CharField(max_length=120, blank=True, help_text="Dashboard page it was sent from.")
+    # F-22: the user interaction (feedback ask) it answered, and at which moment ("signout", "signin"...).
+    announcement = models.ForeignKey(
+        "z_auth.Announcement", null=True, blank=True, on_delete=models.SET_NULL, related_name="feedback",
+    )
+    trigger = models.CharField(max_length=20, blank=True)
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
 
     class Meta:
@@ -725,6 +830,28 @@ class Announcement(models.Model):
         VERSION = "version", "New version"
         MAINTENANCE = "maintenance", "Maintenance"
         WISH = "wish", "Wish"
+        # F-22 user interactions (always pop-ups): ask for a 1-10 rating, ask to upgrade.
+        FEEDBACK_ASK = "feedback_ask", "Ask for feedback"
+        UPGRADE_ASK = "upgrade_ask", "Ask to upgrade"
+
+    class Trigger(models.TextChoices):
+        """F-22: the moment a pop-up shows. Bars always show while live."""
+
+        SIGNIN = "signin", "When they sign in"  # today's behaviour: the dashboard visit
+        SIGNOUT = "signout", "When they sign out"
+        DAYS_AFTER_SIGNUP = "days_after_signup", "Days after sign-up"
+        FIRST_PC = "first_pc", "After the first PC connects"
+        BEFORE_PLAN_END = "before_plan_end", "Days before the plan ends"
+        DATE = "date", "On a date"
+
+    class Frequency(models.TextChoices):
+        """F-22: how often one owner sees it. Empty = the placement's default (pop-ups: rhythm; bars: until closed)."""
+
+        RHYTHM = "rhythm", "First visit, after 2 days, after a week"
+        ONCE = "once", "Once"
+        EVERY = "every", "Every time"
+        EVERY_14D = "every_14d", "Every 14 days"
+        UNTIL_CLOSED = "until_closed", "Until they close it"
 
     class Placement(models.TextChoices):
         DASHBOARD = "dashboard", "Dashboard"
@@ -738,6 +865,10 @@ class Announcement(models.Model):
         PAID = "paid", "Owners on a paid plan"
         PLANS = "plans", "Owners on the plans chosen"
         OWNERS = "owners", "Specific owners (by email)"
+        # F-22
+        NEW7 = "new7", "Signed up in the last 7 days"
+        PLAN_ENDING = "plan_ending", "Plan or trial ends within 7 days"
+        QUIET = "quiet", "Not signed in for a while"
 
     title = models.CharField(max_length=120)
     body = models.CharField(max_length=280, blank=True)
@@ -770,6 +901,19 @@ class Announcement(models.Model):
         upload_to=announcement_image_upload_to, blank=True,
         help_text="Optional picture: PNG, JPG or WebP, up to 2 MB. Public, like the message.",
     )
+    # F-22 user interactions. The defaults keep every older row exactly as it was.
+    trigger = models.CharField(max_length=20, choices=Trigger.choices, default=Trigger.SIGNIN)
+    trigger_days = models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="N, for days after sign-up / days before the plan ends.",
+    )
+    audience_days = models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="For the 'not signed in for a while' audience: how many days (default 14).",
+    )
+    frequency = models.CharField(max_length=20, choices=Frequency.choices, blank=True, default="")
+    coupon = models.ForeignKey(
+        "z_auth.Coupon", null=True, blank=True, on_delete=models.SET_NULL, related_name="announcements",
+        help_text="F-21: a coupon code the message hands out (its button opens the plan page with the code).",
+    )
     starts_at = models.DateTimeField(default=timezone.now)
     ends_at = models.DateTimeField(null=True, blank=True, help_text="Empty = until switched off.")
     is_active = models.BooleanField(default=True)
@@ -787,6 +931,14 @@ class Announcement(models.Model):
 
     def __str__(self) -> str:
         return f"{self.get_kind_display()}: {self.title}"
+
+    QUIET_DAYS = 14
+
+    @property
+    def effective_frequency(self) -> str:
+        if self.frequency:
+            return self.frequency
+        return self.Frequency.RHYTHM if self.placement == self.Placement.POPUP else self.Frequency.UNTIL_CLOSED
 
 
 @receiver(post_delete, sender=Announcement)

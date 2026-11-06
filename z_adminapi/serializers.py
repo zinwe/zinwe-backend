@@ -8,6 +8,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from z_auth import billing
+from z_auth.coupons import coupon_code
 from z_auth.models import (
     Announcement, Feedback, Invoice, Issue, ManualPayment, Plan, ReleaseNote, Subscription, Testimonial,
 )
@@ -58,6 +59,7 @@ def payment_dict(pay: ManualPayment, cycle: int | None) -> dict[str, Any]:
         # What was due when they paid, with tax (the quote frozen on the payment): compare the receipt with this.
         "currency": pay.currency,
         "due_total": (pay.due or {}).get("total") or None,
+        "coupon_code": coupon_code(pay.due),  # F-21: the code on the payment, or None
         # What staff read off the receipt when approving (J8-01), and who did.
         "staff_reference": pay.staff_reference,
         "staff_amount": str(pay.staff_amount) if pay.staff_amount is not None else None,
@@ -240,7 +242,17 @@ class FeedbackRowSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Feedback
-        fields = ["id", "rating", "message", "page", "created_at", "customer", "source", "member", "testimonial_id"]
+        fields = [
+            "id", "rating", "message", "page", "created_at", "customer", "source", "member", "testimonial_id",
+            "interaction", "trigger",
+        ]
+
+    interaction = serializers.SerializerMethodField()
+
+    def get_interaction(self, obj: Feedback) -> dict[str, Any] | None:
+        """F-22: the user interaction (feedback ask) it answered: {id, title}, or None."""
+        a = obj.announcement
+        return {"id": a.pk, "title": a.title} if a is not None else None
 
     def get_testimonial_id(self, obj: Feedback) -> int | None:
         testimonial = getattr(obj, "testimonial", None)
@@ -404,6 +416,37 @@ def popup_stats(prefix: str = "") -> dict[str, Any]:
     }
 
 
+class CouponRefField(serializers.RelatedField):
+    """F-22: a Coupon by id or by code (null clears it); shown as its id."""
+
+    default_error_messages = {"does_not_exist": "No such coupon code."}
+
+    def get_queryset(self) -> Any:
+        from z_auth.models import Coupon
+
+        return Coupon.objects.all()
+
+    def to_internal_value(self, data: Any) -> Any:
+        from z_auth.coupons import normalise
+
+        rows = self.get_queryset()
+        coupon = None
+        if isinstance(data, int) or (isinstance(data, str) and data.strip().isdigit()):
+            coupon = rows.filter(pk=int(data)).first()
+        if coupon is None and isinstance(data, str):
+            coupon = rows.filter(code=normalise(data)).first()
+        if coupon is None:
+            self.fail("does_not_exist")
+        return coupon
+
+    def to_representation(self, value: Any) -> Any:
+        return value.pk
+
+
+INTERACTION_KINDS = (Announcement.Kind.FEEDBACK_ASK, Announcement.Kind.UPGRADE_ASK)
+DAYS_TRIGGERS = (Announcement.Trigger.DAYS_AFTER_SIGNUP, Announcement.Trigger.BEFORE_PLAN_END)
+
+
 class AnnouncementSerializer(serializers.ModelSerializer):
     """
     GET/POST /api/admin/announcements/ and PATCH /<id>/: one pushed message plus its live status.
@@ -424,6 +467,15 @@ class AnnouncementSerializer(serializers.ModelSerializer):
         error_messages={"does_not_exist": "That plan isn't available.", "invalid": "That plan isn't available."},
     )
     offer_uses = serializers.SerializerMethodField()
+    # F-22 user interactions
+    coupon = CouponRefField(required=False, allow_null=True)
+    coupon_code = serializers.SerializerMethodField()
+    trigger_days = serializers.IntegerField(required=False, allow_null=True, min_value=1, max_value=365, error_messages={
+        "min_value": "From 1 to 365 days.", "max_value": "From 1 to 365 days.", "invalid": "A whole number of days.",
+    })
+    audience_days = serializers.IntegerField(required=False, allow_null=True, min_value=1, max_value=365, error_messages={
+        "min_value": "From 1 to 365 days.", "max_value": "From 1 to 365 days.", "invalid": "A whole number of days.",
+    })
 
     class Meta:
         model = Announcement
@@ -431,9 +483,20 @@ class AnnouncementSerializer(serializers.ModelSerializer):
             "id", "title", "body", "kind", "placement", "audience", "plan_codes", "owner_emails", "cta_label",
             "cta_href", "offer_plan", "offer_price_inr", "offer_uses", "image", "remove_image", "image_url",
             "starts_at", "ends_at", "is_active", "dismissible", "priority", "status", "stats", "created_by",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "trigger", "trigger_days", "audience_days", "frequency", "coupon",
+            "coupon_code",
         )
-        read_only_fields = ("id", "status", "stats", "created_by", "offer_uses", "created_at", "updated_at")
+        read_only_fields = (
+            "id", "status", "stats", "created_by", "offer_uses", "created_at", "updated_at", "coupon_code",
+        )
+
+    def to_representation(self, instance: Announcement) -> dict[str, Any]:
+        data = super().to_representation(instance)
+        data["frequency"] = instance.effective_frequency  # empty = the placement's default, shown as what it means
+        return data
+
+    def get_coupon_code(self, obj: Announcement) -> str | None:
+        return obj.coupon.code if obj.coupon_id else None
 
     def get_offer_uses(self, obj: Announcement) -> int:
         """How many owners have paid with this offer."""
@@ -524,10 +587,27 @@ class AnnouncementSerializer(serializers.ModelSerializer):
             name: getattr(self.instance, name)
             for name in (
                 "cta_label", "cta_href", "starts_at", "ends_at", "audience", "plan_codes", "owner_emails",
-                "placement", "offer_plan", "offer_price_inr",
+                "placement", "offer_plan", "offer_price_inr", "kind", "trigger", "trigger_days", "coupon",
             )
         }
+        # F-22: feedback and upgrade asks are pop-ups; a new one without a placement becomes one.
+        if self.instance is None and attrs.get("kind") in INTERACTION_KINDS and "placement" not in attrs:
+            attrs["placement"] = Announcement.Placement.POPUP
         merged = {**saved, **attrs}
+        is_popup = merged.get("placement") == Announcement.Placement.POPUP
+        if merged.get("kind") in INTERACTION_KINDS and not is_popup:
+            raise serializers.ValidationError({"placement": "Feedback and upgrade asks show as a pop-up."})
+        trigger = merged.get("trigger") or Announcement.Trigger.SIGNIN
+        if trigger != Announcement.Trigger.SIGNIN and not is_popup:
+            raise serializers.ValidationError({"trigger": "Only pop-ups have a moment. Bars show while they're live."})
+        if trigger in DAYS_TRIGGERS and not merged.get("trigger_days"):
+            raise serializers.ValidationError({"trigger_days": "Say after how many days."})
+        if merged.get("coupon") is not None and merged.get("offer_price_inr") is not None:
+            raise serializers.ValidationError({"coupon": "An offer price takes no coupon code. Pick one or the other."})
+        if merged.get("coupon") is not None and merged.get("placement") == Announcement.Placement.WEBSITE:
+            raise serializers.ValidationError({"placement": "A coupon code shows on the dashboard."})
+        if attrs.get("frequency") and attrs["frequency"] not in Announcement.Frequency.values:
+            raise serializers.ValidationError({"frequency": "Unknown frequency."})
         if bool(merged.get("cta_label", "").strip()) != bool(merged.get("cta_href", "").strip()):
             raise serializers.ValidationError({"cta_href": "Give the button both a text and a link, or neither."})
         starts, ends = merged.get("starts_at"), merged.get("ends_at")
@@ -582,13 +662,14 @@ class AdminSubscriptionSerializer(serializers.ModelSerializer):
     days_left = serializers.SerializerMethodField()
     latest_payment = serializers.SerializerMethodField()
     invoices = serializers.SerializerMethodField()
+    coupon_code = serializers.SerializerMethodField()
 
     class Meta:
         model = Subscription
         fields = (
             "id", "owner", "company", "region", "plan", "status", "currency", "billing_cycle", "amount_inr",
             "amount_due", "is_trial", "starts_at", "ends_at", "days_left", "payment_link", "latest_payment",
-            "invoices", "created_at",
+            "invoices", "coupon_code", "created_at",
         )
         read_only_fields = [f for f in fields if f != "payment_link"]
 
@@ -620,8 +701,13 @@ class AdminSubscriptionSerializer(serializers.ModelSerializer):
             return None
         return {
             "id": p.id, "status": p.status, "method": p.get_method_display(), "amount": str(p.amount_inr),
-            "currency": p.currency, "submitted_at": p.submitted_at,
+            "currency": p.currency, "submitted_at": p.submitted_at, "coupon_code": coupon_code(p.due),
         }
+
+    def get_coupon_code(self, obj: Subscription) -> str | None:
+        """F-21: the code on this subscription's latest payment, or None."""
+        p = billing.latest_payment(obj)
+        return coupon_code(p.due) if p is not None else None
 
     def get_invoices(self, obj: Subscription) -> list[dict[str, Any]]:
         return [

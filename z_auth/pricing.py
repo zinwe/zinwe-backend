@@ -72,6 +72,9 @@ class Quote:
     place_of_supply: str = ""
     export: bool = False
     note: str = ""
+    # F-21: {"code", "percent_off", "amount_off" ("145.65"), "capped"} when a coupon is applied, else None.
+    # `amount` is after it; `discount_amount` stays the launch discount only.
+    coupon: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """JSON-safe: Decimals as "0.00" strings."""
@@ -140,32 +143,36 @@ def yearly_saving_percent(plan: Plan, currency: str) -> int:
     return int(((1 - year / (month * 12)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def quote(
-    plan: Plan,
-    company: Company | None,
-    currency: str | None = None,
-    cycle: str | None = None,
-    cycle_amount: Decimal | None = None,
-) -> Quote:
+def coupon_discount(amount: Decimal, percent_off: int, lowest: Decimal | None) -> tuple[Decimal, bool]:
     """
-    What `company` pays for one billing cycle of `plan` (currency/cycle default from the country).
-    `cycle_amount` replaces the catalogue price (a subscriber's locked-in price), before tax.
+    F-21: (amount off, capped) for `percent_off` % off `amount`, never taking it below `lowest` (the plan's price band
+    minimum; None = no floor). Capped = the floor cut the discount short. 0 off when the amount is already at it.
     """
-    currency = currency or currency_for(company, plan)
-    cycle = valid_cycle(cycle) or cycle_for(currency)
-    months = months_in(cycle)
-    list_amount, amount = cycle_prices(plan, currency, cycle)
-    if cycle_amount is not None:
-        amount = money(cycle_amount)
-        list_amount = max(list_amount, amount)
-    q = Quote(
-        plan_code=plan.code, plan_name=plan.name, currency=currency, billing_cycle=cycle, months=months,
-        list_amount=list_amount, discount_amount=money(list_amount - amount), amount=amount,
-        region="IN" if currency == INR else "INTL",
-    )
+    off = money(Decimal(amount) * percent_off / 100)
+    if lowest is not None and amount - off < lowest:
+        return max(money(amount - lowest), Decimal("0.00")), True
+    return off, False
+
+
+def _apply_coupon(q: Quote, coupon: Any, plan: Plan) -> None:
+    """Take a coupon (z_auth.models.Coupon) off a monthly quote's amount; yearly quotes take none."""
+    if coupon is None or q.billing_cycle != MONTHLY or q.amount <= 0:
+        return
+    lowest = plan.band_min_inr if q.currency == INR else None
+    off, capped = coupon_discount(q.amount, coupon.percent_off, lowest)
+    if off <= 0:
+        return
+    q.amount = money(q.amount - off)
+    q.coupon = {"code": coupon.code, "percent_off": coupon.percent_off, "amount_off": str(off), "capped": capped}
+
+
+def _add_tax(q: Quote, company: Company | None) -> Quote:
+    """GST (India, seller GSTIN set: CGST + SGST in the seller's state, else IGST) or the export note; totals."""
     gstin = (settings.ZINWE_INVOICE_SELLER.get("gstin") or "").strip()
     gst = settings.ZINWE_GST
-    if currency == INR:
+    q.taxes, q.note, q.export = [], "", False
+    amount = q.amount
+    if q.currency == INR:
         q.place_of_supply = (company.state if company else "") or gst["seller_state"]
         if gstin and amount > 0:
             rate = Decimal(gst["rate"])
@@ -188,6 +195,45 @@ def quote(
     return q
 
 
+def quote(
+    plan: Plan,
+    company: Company | None,
+    currency: str | None = None,
+    cycle: str | None = None,
+    cycle_amount: Decimal | None = None,
+    coupon: Any = None,
+) -> Quote:
+    """
+    What `company` pays for one billing cycle of `plan` (currency/cycle default from the country).
+    `cycle_amount` replaces the catalogue price (a subscriber's locked-in price), before tax.
+    `coupon` (F-21, a checked z_auth.models.Coupon) takes its % off a monthly amount, floored at the plan's
+    `band_min_inr`, before tax; a yearly quote ignores it (z_auth.coupons refuses it first).
+    """
+    currency = currency or currency_for(company, plan)
+    cycle = valid_cycle(cycle) or cycle_for(currency)
+    months = months_in(cycle)
+    list_amount, amount = cycle_prices(plan, currency, cycle)
+    if cycle_amount is not None:
+        amount = money(cycle_amount)
+        list_amount = max(list_amount, amount)
+    q = Quote(
+        plan_code=plan.code, plan_name=plan.name, currency=currency, billing_cycle=cycle, months=months,
+        list_amount=list_amount, discount_amount=money(list_amount - amount), amount=amount,
+        region="IN" if currency == INR else "INTL",
+    )
+    _apply_coupon(q, coupon, plan)
+    return _add_tax(q, company)
+
+
+def with_coupon(q: Quote, coupon: Any, plan: Plan, company: Company | None) -> Quote:
+    """A copy of quote `q` with `coupon` taken off (F-21) and the tax worked out again on the lower amount."""
+    from copy import deepcopy
+
+    out = deepcopy(q)
+    _apply_coupon(out, coupon, plan)
+    return _add_tax(out, company) if out.coupon else out
+
+
 def quote_for_subscription(subscription: Subscription, plan: Plan | None = None, cycle: str | None = None) -> Quote:
     """
     The next payment on `subscription` (or an upgrade to `plan`), in the subscription's own currency, for one
@@ -206,6 +252,20 @@ def quote_for_subscription(subscription: Subscription, plan: Plan | None = None,
     ):
         locked = subscription.amount_inr
     return quote(target, subscription.company, subscription.currency, cycle, cycle_amount=locked)
+
+
+def rupees(amount: Decimal | str | int) -> str:
+    """F-21 copy style: ₹971 (whole rupees without .00), ₹973.91, Indian grouping (₹14,437.10, ₹1,00,000)."""
+    value = money(amount)
+    sign = "-" if value < 0 else ""
+    whole, _, paise = f"{abs(value):.2f}".partition(".")
+    if len(whole) > 3:
+        head, tail, groups = whole[:-3], whole[-3:], []
+        while len(head) > 2:
+            groups.insert(0, head[-2:])
+            head = head[:-2]
+        whole = ",".join(([head] if head else []) + groups + [tail])
+    return f"{sign}₹{whole}" + ("" if paise == "00" else f".{paise}")
 
 
 def money_text(amount: Decimal | str, currency: str) -> str:

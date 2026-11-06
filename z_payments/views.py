@@ -1,7 +1,7 @@
 """
 Online payment endpoints (Razorpay Standard Checkout). See z_payments.services for the whole flow.
 
-POST /api/payments/razorpay/order/    {upgrade_plan?, accept_terms, offer?}  -> the checkout options for a new order
+POST /api/payments/razorpay/order/    {upgrade_plan?, accept_terms, offer?, coupon?}  -> the checkout options for a new order
 GET  /api/payments/offer/<id>/?plan=  an admin offer this owner can use now, with its price (or 404)
 POST /api/payments/razorpay/verify/   {razorpay_order_id, razorpay_payment_id, razorpay_signature}
 POST /api/payments/razorpay/webhook/  Razorpay's server-to-server notice (signed with the webhook secret)
@@ -18,6 +18,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from z_auth import billing
+from z_auth.coupons import CouponRefused
 from z_auth.models import Plan
 from z_auth.portal_serializers import PaymentSerializer
 
@@ -40,6 +41,8 @@ class OrderRequest(serializers.Serializer):
     offer = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     # Monthly or yearly, as chosen at checkout (default: the subscription's own). Ignored with an offer.
     billing_cycle = serializers.ChoiceField(choices=("monthly", "yearly"), required=False, allow_null=True)
+    # F-21: a coupon code (monthly only, never with an offer), checked again here.
+    coupon = serializers.CharField(max_length=40, required=False, allow_blank=True, allow_null=True)
 
     def validate_accept_terms(self, value: bool) -> bool:
         if value is not True:
@@ -71,7 +74,10 @@ class RazorpayOrderView(APIView):
                 request.user, data.validated_data.get("upgrade_plan"), accept_terms=True,
                 offer_id=data.validated_data.get("offer"),
                 cycle=data.validated_data.get("billing_cycle"),
+                coupon=data.validated_data.get("coupon"),
             )
+        except CouponRefused as exc:
+            return Response({"detail": exc.message, "reason": exc.reason}, status=status.HTTP_400_BAD_REQUEST)
         except services.OnlinePaymentUnavailable as exc:
             return _unavailable(exc)
         except services.OfferNotAvailable as exc:

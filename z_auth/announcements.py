@@ -16,30 +16,67 @@ Notification-bar items: the slim bars on the owner dashboard and the public webs
 Each item is a plain dict the frontend renders and can remember-dismiss by ``id`` (an edited message
 gets a new id, so it shows again). ``image_url`` is the message's optional picture
 (``/api/auth/announcements/<id>/image/?v=<updated>``, public) or null.
+
+F-22 **User interactions**: pop-ups gain kinds (feedback_ask, upgrade_ask), a moment (`trigger`: sign in, sign out,
+N days after sign-up, after the first PC, N days before the plan ends, a date), new audiences (new in the last 7 days,
+plan ending, quiet for N days) and a `frequency` (rhythm, once, every time, every 14 days, until closed). Still at
+most one a day per owner, across every kind (bars aside). `{first name}` in the text becomes the owner's first name
+(or is dropped with the comma/space before it). Pop-up items also carry `trigger` and `coupon` (null or
+{code, plan_code, ends_on, note}); a bar with a coupon carries `coupon` too.
 """
 from __future__ import annotations
 
 import re
 from datetime import timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from django.conf import settings
 from django.db.models import Q
 from django.utils import timezone
 
-from .billing import current_subscription
+from .billing import current_subscription, days_left
 from .entitlements import Entitlements, devices_used, entitlements_for
-from .models import Announcement, AnnouncementView, Plan, Subscription, User
+from .models import Announcement, AnnouncementView, Feedback, Plan, Subscription, User
+
+Trigger = Announcement.Trigger
+Frequency = Announcement.Frequency
+Audience = Announcement.Audience
 
 ALLOWED_KINDS = {"version", "offer", "discount", "news", "maintenance", "wish", "upgrade"}
 
 # F-11 / D5: what a pop-up may be about for an owner on a paid plan. Free plans get every kind.
 PAID_POPUP_KINDS = {
     Announcement.Kind.NEWS, Announcement.Kind.VERSION, Announcement.Kind.WISH, Announcement.Kind.MAINTENANCE,
+    Announcement.Kind.FEEDBACK_ASK,  # F-22: asking what they think sells nothing
 }
 # Show it again this long after the 1st view, then after the 2nd; never after the 3rd.
 POPUP_GAPS = (timedelta(days=2), timedelta(days=7))
 POPUP_MAX_VIEWS = 3
+EVERY_14D = timedelta(days=14)
+NEW_DAYS = 7
+ENDING_WITHIN = timedelta(days=7)
+DEFAULT_PLAN_END_DAYS = 7
+
+FIRST_NAME = re.compile(r"\{\s*first name\s*\}", re.IGNORECASE)
+FIRST_NAME_WITH_GAP = re.compile(r"[,\s]*\{\s*first name\s*\}", re.IGNORECASE)
+
+
+def first_name(user: User | None) -> str:
+    """The owner's first name from their full name ('' when they never gave one: never the email)."""
+    name = (getattr(user, "full_name", "") or "").strip()
+    return name.split()[0] if name else ""
+
+
+def personalise(text: str, user: User | None) -> str:
+    """`{first name}` -> the owner's first name; without one the token goes with the comma/space before it."""
+    if not text or "{" not in text:
+        return text
+    name = first_name(user)
+    if name:
+        return FIRST_NAME.sub(name, text)
+    out = FIRST_NAME_WITH_GAP.sub("", text)
+    return out.lstrip(" ,") if FIRST_NAME.match(text.lstrip()) else out
 
 # Short names for "Businesses adds work hours, app usage and team chat".
 SHORT_MODULE_NAMES: dict[str, str] = {
@@ -91,9 +128,47 @@ def _live(placements: tuple[str, ...]):  # type: ignore[no-untyped-def]
     )
 
 
-def _reaches(announcement: Announcement, ent: Entitlements, email: str = "") -> bool:
-    """Does this dashboard message's audience include an owner with these entitlements (and this email)?"""
+def plan_ending(user: User, now: Any = None) -> bool:
+    """F-22: an active plan or trial with an end date within the next 7 days."""
+    now = now or timezone.now()
+    sub = current_subscription(user)
+    return bool(
+        sub is not None and sub.status == Subscription.Status.ACTIVE and sub.ends_at is not None
+        and now < sub.ends_at <= now + ENDING_WITHIN
+    )
+
+
+def is_quiet(user: User, days: int, now: Any = None) -> bool:
+    """
+    F-22: the owner hadn't signed in for `days` days: their last sign-in is that old, or they just came back after
+    such a gap (sign-ins from the audit trail, else `last_login`). Never signed in: their account is that old.
+    """
+    from z_analytics.models import Event
+
+    now = now or timezone.now()
+    gap = timedelta(days=days)
+    logins = list(
+        Event.objects.filter(name="auth.login", actor_email=user.email)
+        .order_by("-created_at").values_list("created_at", flat=True)[:2]
+    )
+    latest = logins[0] if logins else user.last_login
+    if latest is None:
+        return user.date_joined <= now - gap
+    if now - latest >= gap:
+        return True
+    return len(logins) > 1 and latest - logins[1] >= gap
+
+
+def _reaches(announcement: Announcement, ent: Entitlements, email: str = "", user: User | None = None) -> bool:
+    """Does this dashboard message's audience include an owner with these entitlements (and this email)?
+    The F-22 audiences (new in 7 days, plan ending, quiet) need the owner (`user`)."""
     audience = announcement.audience
+    if audience == Audience.NEW7:
+        return user is not None and user.date_joined >= timezone.now() - timedelta(days=NEW_DAYS)
+    if audience == Audience.PLAN_ENDING:
+        return user is not None and plan_ending(user)
+    if audience == Audience.QUIET:
+        return user is not None and is_quiet(user, announcement.audience_days or Announcement.QUIET_DAYS)
     if audience == Announcement.Audience.OWNERS:
         wanted = {e.strip().lower() for e in announcement.owner_emails or [] if isinstance(e, str)}
         return bool(email) and email.strip().lower() in wanted
@@ -112,9 +187,17 @@ def offer_link(announcement: Announcement) -> str:
     return f"/app/upgrade?plan={announcement.offer_plan.code}&offer={announcement.pk}" if announcement.offer_plan_id else ""
 
 
-def _as_item(announcement: Announcement) -> dict[str, Any]:
+def coupon_link(announcement: Announcement) -> str:
+    """F-22: "Use the code" opens the plan page with the code, which the pay page fills in and checks."""
+    return f"/onboarding/plan?coupon={announcement.coupon.code}" if announcement.coupon_id else ""
+
+
+def _as_item(announcement: Announcement, user: User | None = None) -> dict[str, Any]:
     label = announcement.cta_label if announcement.cta_href else ""
     href = announcement.cta_href if announcement.cta_label else ""
+    if announcement.coupon_id and not href:
+        label = (announcement.cta_label or "Use the code")[:40]
+        href = coupon_link(announcement)
     if announcement.offer_plan_id and announcement.offer_price_inr and not href:
         # An offer with no link of its own gets one that applies it: the staff's button text if they wrote one,
         # else the price (whole rupees without ".00").
@@ -122,27 +205,59 @@ def _as_item(announcement: Announcement) -> dict[str, Any]:
         amount = f"{int(price):,}" if price == int(price) else f"{price:,.2f}"
         label = (announcement.cta_label or f"Upgrade for ₹{amount} + GST")[:40]
         href = offer_link(announcement)
-    return _item(
+    item = _item(
         f"a{announcement.pk}-{int(announcement.updated_at.timestamp())}",
         announcement.kind,
-        announcement.title,
-        announcement.body,
+        personalise(announcement.title, user),
+        personalise(announcement.body, user),
         label,
         href,
         announcement.dismissible,
         image_url(announcement),
     )
+    if announcement.coupon_id:
+        item["coupon"] = coupon_block(announcement.coupon)
+    return item
+
+
+def coupon_block(coupon: Any) -> dict[str, Any]:
+    """
+    F-22: the coupon an interaction hands out: {code, plan_code (its one plan, else null), ends_on, note}, e.g.
+    "Startups ₹679.70 + GST for the first month, about ₹68 per PC. Ends 5 Jan." (the plan's monthly price after the
+    code, floored at its band minimum; without one plan: "30% off your first month.").
+    """
+    from .coupons import day_text
+    from .pricing import coupon_discount, money, rupees
+
+    codes = list(coupon.plan_codes or [])
+    plan = Plan.objects.filter(code=codes[0]).first() if len(codes) == 1 else None
+    ends = f" Ends {day_text(coupon.ends_on)}." if coupon.ends_on else ""
+    if plan is not None and plan.price_inr_monthly > 0:
+        off, _ = coupon_discount(plan.price_inr_monthly, coupon.percent_off, plan.band_min_inr)
+        price = money(plan.price_inr_monthly - off)
+        per_pc = ""
+        if plan.max_devices:
+            per_pc = f", about {rupees((price / plan.max_devices).quantize(Decimal('1'), rounding=ROUND_HALF_UP))} per PC"
+        note = f"{plan.name} {rupees(price)} + GST for the first month{per_pc}.{ends}"
+    else:
+        note = f"{coupon.percent_off}% off your first month.{ends}"
+    return {
+        "code": coupon.code,
+        "plan_code": plan.code if plan is not None else None,
+        "ends_on": coupon.ends_on.isoformat() if coupon.ends_on else None,
+        "note": note,
+    }
 
 
 def _is_paid(ent: Entitlements) -> bool:
     return bool(ent.on_active_plan and ent.plan and ent.plan.requires_payment)
 
 
-def popup_reaches(announcement: Announcement, ent: Entitlements, email: str = "") -> bool:
+def popup_reaches(announcement: Announcement, ent: Entitlements, email: str = "", user: User | None = None) -> bool:
     """A pop-up's audience, and on a paid plan only the kinds that aren't selling anything (D5)."""
     if _is_paid(ent) and announcement.kind not in PAID_POPUP_KINDS:
         return False
-    return _reaches(announcement, ent, email)
+    return _reaches(announcement, ent, email, user)
 
 
 def _popup_due(view: AnnouncementView | None, now: Any) -> bool:
@@ -156,23 +271,85 @@ def _popup_due(view: AnnouncementView | None, now: Any) -> bool:
     return now - view.last_seen_at >= POPUP_GAPS[view.views - 1]
 
 
-def popups_for(user: User, ent: Entitlements | None = None) -> list[dict[str, Any]]:
+def _frequency_due(frequency: str, view: AnnouncementView | None, now: Any) -> bool:
+    """F-22: is it this owner's turn, by the interaction's frequency? (Closing stops all but every / every 14 days.)"""
+    if frequency == Frequency.ONCE:
+        return view is None or (view.views == 0 and not view.closed)
+    if frequency == Frequency.EVERY:
+        return True
+    if frequency == Frequency.EVERY_14D:
+        return view is None or view.last_seen_at is None or now - view.last_seen_at >= EVERY_14D
+    if frequency == Frequency.UNTIL_CLOSED:
+        return view is None or not view.closed
+    return _popup_due(view, now)  # rhythm (the pop-ups' default)
+
+
+def _has_pc(user: User) -> bool:
+    from z_devices.models import Device
+
+    return Device.objects.filter(owner=user).exists()
+
+
+def _trigger_due(announcement: Announcement, user: User, now: Any) -> bool:
+    """F-22: has this owner reached the interaction's moment? (Sign in / sign out: always; the moment itself is
+    the request.)"""
+    trigger = announcement.trigger
+    if trigger == Trigger.DAYS_AFTER_SIGNUP:
+        joined = timezone.localdate(user.date_joined)
+        return (timezone.localdate(now) - joined).days >= (announcement.trigger_days or 0)
+    if trigger == Trigger.FIRST_PC:
+        return _has_pc(user)
+    if trigger == Trigger.BEFORE_PLAN_END:
+        sub = current_subscription(user)
+        left = days_left(sub, now) if sub is not None else None
+        return left is not None and left <= (announcement.trigger_days or DEFAULT_PLAN_END_DAYS)
+    if trigger == Trigger.DATE and announcement.ends_at is None:
+        return timezone.localdate(now) == timezone.localdate(announcement.starts_at)
+    return True
+
+
+SIGNIN_TRIGGERS = tuple(t for t in Trigger.values if t != Trigger.SIGNOUT)
+
+
+def popups_for(user: User, ent: Entitlements | None = None, moment: str = "signin") -> list[dict[str, Any]]:
     """
-    F-11: the pop-up to show this owner now: none, or one (the highest priority that's due). Nothing when they
-    already saw a pop-up today.
+    F-11 / F-22: the pop-up (user interaction) to show this owner now: none, or one (the highest priority that's
+    due by its moment, audience and frequency). `moment` "signout" asks for a sign-out interaction; anything else is
+    the dashboard visit (sign in and the other moments). Nothing when they already saw one today.
     """
     ent = ent or entitlements_for(user)
     now = timezone.now()
     today = timezone.localtime(now).replace(hour=0, minute=0, second=0, microsecond=0)
     if AnnouncementView.objects.filter(owner=user, last_seen_at__gte=today).exists():
         return []
-    live = [a for a in _live((Announcement.Placement.POPUP,)).select_related("offer_plan")
-            if popup_reaches(a, ent, user.email)]
+    triggers = (Trigger.SIGNOUT,) if moment == "signout" else SIGNIN_TRIGGERS
+    live = [a for a in _live((Announcement.Placement.POPUP,)).filter(trigger__in=triggers)
+            .select_related("offer_plan", "coupon") if popup_reaches(a, ent, user.email, user)]
     views = {v.announcement_id: v for v in AnnouncementView.objects.filter(owner=user, announcement__in=live)}
     for announcement in live:  # already in priority order
-        if _popup_due(views.get(announcement.pk), now):
-            return [{**_as_item(announcement), "announcement_id": announcement.pk}]
+        view = views.get(announcement.pk)
+        if _frequency_due(announcement.effective_frequency, view, now) and _trigger_due(announcement, user, now):
+            return [{
+                **_as_item(announcement, user), "announcement_id": announcement.pk,
+                "trigger": announcement.trigger, "coupon": coupon_block(announcement.coupon) if announcement.coupon_id
+                else None,
+            }]
     return []
+
+
+def record_answer(user: User, announcement: Announcement, rating: int, message: str = "") -> Feedback:
+    """
+    F-22: POST .../announcements/<id>/answer/: the owner rated Zinwe in a feedback ask. Saved as their feedback
+    (with the interaction and its moment, for Inbox -> Feedback), and the pop-up counts as seen and pressed.
+    """
+    feedback = Feedback.objects.create(
+        owner=user, source=Feedback.Source.OWNER, rating=rating, message=(message or "").strip()[:2000],
+        page="interaction", announcement=announcement, trigger=announcement.trigger,
+    )
+    record_popup_view(user, announcement, clicked=True)
+    user.feedback_prompt_at = timezone.now()  # the dashboard's own feedback card waits its turn again
+    user.save(update_fields=["feedback_prompt_at"])
+    return feedback
 
 
 def record_popup_view(
@@ -197,16 +374,20 @@ def record_popup_view(
     return view
 
 
-def pushed_for_dashboard(ent: Entitlements, email: str = "") -> list[dict[str, Any]]:
+def pushed_for_dashboard(ent: Entitlements, email: str = "", user: User | None = None) -> list[dict[str, Any]]:
     placements = (Announcement.Placement.DASHBOARD, Announcement.Placement.BOTH)
-    return [_as_item(a) for a in _live(placements).select_related("offer_plan") if _reaches(a, ent, email)]
+    return [
+        _as_item(a, user) for a in _live(placements).select_related("offer_plan", "coupon")
+        if _reaches(a, ent, email, user)
+    ]
 
 
 def website_announcements() -> list[dict[str, Any]]:
     """The bars for the public website, sign-up and onboarding (every visitor sees the same). Messages for
     specific owners and offers are dashboard-only: they never show to the public."""
     placements = (Announcement.Placement.WEBSITE, Announcement.Placement.BOTH)
-    live = _live(placements).exclude(audience=Announcement.Audience.OWNERS).filter(offer_plan__isnull=True)
+    personal = (Audience.OWNERS, Audience.NEW7, Audience.PLAN_ENDING, Audience.QUIET)
+    live = _live(placements).exclude(audience__in=personal).filter(offer_plan__isnull=True, coupon__isnull=True)
     return [_as_item(a) for a in live]
 
 
@@ -330,7 +511,7 @@ def history_label(days: int) -> str:
 def announcements_for(user: User) -> list[dict[str, Any]]:
     """The owner's dashboard bars: pushed messages, configured banners, then the upgrade bar."""
     ent = entitlements_for(user)
-    items = pushed_for_dashboard(ent, user.email) + _config_announcements()
+    items = pushed_for_dashboard(ent, user.email, user) + _config_announcements()
     upgrade = _upgrade_announcement(user, ent)
     if upgrade is not None:
         items.append(upgrade)
