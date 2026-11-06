@@ -429,7 +429,7 @@ def _with_valid_coupon(code: str, subscription: Any, plan: Any, due: Any) -> Any
 class CouponCheckView(APIView):
     """
     GET /api/auth/subscription/coupon/?code=ZWSTARTUP15&plan=startups&cycle=monthly[&offer=<id>] -- F-21: can this
-    owner use the code on that plan and cycle? 200 {ok: true, code, percent_off, capped, lowest_price, amount_off,
+    owner use the code on that plan and cycle? 200 {ok: true, code, percent_off, capped, amount_off,
     message, quote} or {ok: false, code, reason, message}. `offer` (an admin offer price) always refuses a code.
     The checkout and the payment check it again.
     """

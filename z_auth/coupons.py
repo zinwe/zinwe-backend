@@ -38,7 +38,7 @@ MESSAGES = {
     "monthly_only": "Coupon codes are for monthly billing. Yearly already gives you 2 months free.",
     "used_before": "You have used a code before. One code per company.",
     "limit_reached": "This code has been used up.",
-    "lowest_price": "This plan is already at its lowest price, so the code gives nothing.",
+    "lowest_price": "This code can't be used on this plan right now.",
     "offer": "This is an offer price. A coupon code can't be added to it.",
 }
 
@@ -95,7 +95,6 @@ class CouponCheck:
             "code": self.code,
             "percent_off": self.coupon.percent_off if self.coupon else 0,
             "capped": self.capped,
-            "lowest_price": str(pricing.money(self.lowest_price)) if self.lowest_price is not None else None,
             "amount_off": str(self.amount_off),
             "message": self.message,
             "quote": self.quote.as_dict() if self.quote else None,
@@ -179,8 +178,8 @@ def check(
     result.quote = pricing.with_coupon(base, coupon, plan, company)
     if capped:
         result.message = (
-            f"This code gives {coupon.percent_off}%, but {plan.name} has a lowest price of "
-            f"{pricing.rupees(lowest)} a month. You get {pricing.rupees(off)} off."
+            # Owner decision (6 Nov): the lowest price is internal, so the message names the saving, never the floor.
+            f"This code gives up to {coupon.percent_off}%. On {plan.name} you get {pricing.rupees(off)} off."
         )
     else:
         result.message = f"{coupon.percent_off}% off your first month. You save {pricing.rupees(off)}."

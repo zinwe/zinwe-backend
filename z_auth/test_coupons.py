@@ -100,7 +100,7 @@ class CheckTests(CouponTestCase):
         self.assertTrue(body["ok"], body)
         self.assertEqual((body["code"], body["percent_off"], body["capped"]), ("ZWSTARTUP15", 15, False))
         self.assertEqual(body["amount_off"], "145.65")
-        self.assertIsNone(body["lowest_price"])
+        self.assertNotIn("lowest_price", body)  # internal: never sent to the owner
         self.assertEqual(body["message"], "15% off your first month. You save ₹145.65.")
         q = body["quote"]
         self.assertEqual((q["amount"], q["total"], q["discount_amount"]), ("825.35", "973.91", q["discount_amount"]))
@@ -116,9 +116,11 @@ class CheckTests(CouponTestCase):
         make_coupon("ZWBIGSALE40", 40)
         body = self.check_code("ZWBIGSALE40")
         self.assertTrue(body["ok"], body)
-        self.assertEqual((body["capped"], body["amount_off"], body["lowest_price"]), (True, "321.00", "650.00"))
+        self.assertEqual((body["capped"], body["amount_off"]), (True, "321.00"))
+        self.assertNotIn("lowest_price", body)
+        self.assertNotIn("650", body["message"])
         self.assertEqual(
-            body["message"], "This code gives 40%, but Startups has a lowest price of ₹650 a month. You get ₹321 off."
+            body["message"], "This code gives up to 40%. On Startups you get ₹321 off."
         )
         self.assertEqual(body["quote"]["amount"], "650.00")
         self.assertTrue(body["quote"]["coupon"]["capped"])
