@@ -55,8 +55,10 @@ class InteractionTestCase(APITestCase):
 
 class DefaultsTests(InteractionTestCase):
     def test_old_rows_keep_their_behaviour(self) -> None:
-        a = Announcement.objects.create(title="Diwali", kind="wish", placement="popup")
-        bar = Announcement.objects.create(title="News", kind="news")
+        # Start an hour before the frozen clock: a default starts_at (made after setUp's now) is "not yet live".
+        starts = self.now - timedelta(hours=1)
+        a = Announcement.objects.create(title="Diwali", kind="wish", placement="popup", starts_at=starts)
+        bar = Announcement.objects.create(title="News", kind="news", starts_at=starts)
         self.assertEqual((a.trigger, a.frequency, a.effective_frequency), ("signin", "", "rhythm"))
         self.assertEqual(bar.effective_frequency, "until_closed")
         item = self.feed()["popups"][0]

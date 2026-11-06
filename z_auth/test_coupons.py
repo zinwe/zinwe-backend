@@ -181,6 +181,7 @@ class CheckTests(CouponTestCase):
         CouponUse.objects.update(state="void")
         self.assertTrue(self.check_code()["ok"])
 
+    @override_settings(ZINWE_PAYMENT_INSTRUCTIONS={"upi_id": "skytechno@upi", "payee_name": "SKYTECHNO"})
     def test_checkout_preview_carries_the_code(self) -> None:
         self.subscribe()
         make_coupon()
