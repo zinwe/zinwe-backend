@@ -143,10 +143,11 @@ def yearly_saving_percent(plan: Plan, currency: str) -> int:
     return int(((1 - year / (month * 12)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def coupon_discount(amount: Decimal, percent_off: int, lowest: Decimal | None) -> tuple[Decimal, bool]:
+def coupon_discount(amount: Decimal, percent_off: int, lowest: Decimal | None = None) -> tuple[Decimal, bool]:
     """
-    F-21: (amount off, capped) for `percent_off` % off `amount`, never taking it below `lowest` (the plan's price band
-    minimum; None = no floor). Capped = the floor cut the discount short. 0 off when the amount is already at it.
+    F-21: (amount off, capped) for `percent_off` % off `amount`. Owner decision (6 Nov 2026): no floor for coupons, the
+    code's own % (at most 40%, checked when the code is made) is the only limit, so callers pass no `lowest` and capped
+    stays False. `lowest` is kept only so a floor can come back without changing callers.
     """
     off = money(Decimal(amount) * percent_off / 100)
     if lowest is not None and amount - off < lowest:
@@ -158,8 +159,7 @@ def _apply_coupon(q: Quote, coupon: Any, plan: Plan) -> None:
     """Take a coupon (z_auth.models.Coupon) off a monthly quote's amount; yearly quotes take none."""
     if coupon is None or q.billing_cycle != MONTHLY or q.amount <= 0:
         return
-    lowest = plan.band_min_inr if q.currency == INR else None
-    off, capped = coupon_discount(q.amount, coupon.percent_off, lowest)
+    off, capped = coupon_discount(q.amount, coupon.percent_off)
     if off <= 0:
         return
     q.amount = money(q.amount - off)
@@ -206,8 +206,8 @@ def quote(
     """
     What `company` pays for one billing cycle of `plan` (currency/cycle default from the country).
     `cycle_amount` replaces the catalogue price (a subscriber's locked-in price), before tax.
-    `coupon` (F-21, a checked z_auth.models.Coupon) takes its % off a monthly amount, floored at the plan's
-    `band_min_inr`, before tax; a yearly quote ignores it (z_auth.coupons refuses it first).
+    `coupon` (F-21, a checked z_auth.models.Coupon) takes its % off a monthly amount, before tax, with no floor;
+    a yearly quote ignores it (z_auth.coupons refuses it first).
     """
     currency = currency or currency_for(company, plan)
     cycle = valid_cycle(cycle) or cycle_for(currency)

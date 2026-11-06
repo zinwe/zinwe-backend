@@ -110,20 +110,17 @@ class CheckTests(CouponTestCase):
         # The launch discount stays the launch discount only.
         self.assertEqual(Decimal(q["list_amount"]) - Decimal(q["discount_amount"]), Decimal("971.00"))
 
-    def test_capped_at_the_band_minimum(self) -> None:
-        Plan.objects.filter(pk=self.startups.pk).update(band_min_inr=Decimal("650.00"))
+    def test_the_price_band_does_not_limit_a_coupon(self) -> None:
+        # Owner decision (6 Nov 2026): no floor; the code's own % (at most 40%) is the only limit.
+        Plan.objects.filter(pk=self.startups.pk).update(band_min_inr=Decimal("900.00"))
         self.subscribe()
         make_coupon("ZWBIGSALE40", 40)
         body = self.check_code("ZWBIGSALE40")
         self.assertTrue(body["ok"], body)
-        self.assertEqual((body["capped"], body["amount_off"]), (True, "321.00"))
-        self.assertNotIn("lowest_price", body)
-        self.assertNotIn("650", body["message"])
-        self.assertEqual(
-            body["message"], "This code gives up to 40%. On Startups you get ₹321 off."
-        )
-        self.assertEqual(body["quote"]["amount"], "650.00")
-        self.assertTrue(body["quote"]["coupon"]["capped"])
+        self.assertEqual((body["capped"], body["amount_off"]), (False, "388.40"))
+        self.assertEqual(body["message"], "40% off your first month. You save ₹388.40.")
+        self.assertEqual(body["quote"]["amount"], "582.60")
+        self.assertFalse(body["quote"]["coupon"]["capped"])
 
     def test_without_a_subscription_prices_from_the_catalogue(self) -> None:
         make_coupon()
@@ -163,7 +160,7 @@ class CheckTests(CouponTestCase):
         self.assert_refused(self.check_code("ZWFULLCODE1"), "limit_reached", "This code has been used up.")
         self.assert_refused(self.check_code(offer="7"), "offer", coupons.MESSAGES["offer"])
         Plan.objects.filter(pk=self.startups.pk).update(band_min_inr=Decimal("971.00"))
-        self.assert_refused(self.check_code(), "lowest_price", coupons.MESSAGES["lowest_price"])
+        self.assertTrue(self.check_code()["ok"])  # a band minimum at today's price still lets the code work
 
     def test_dates_are_inclusive(self) -> None:
         self.subscribe()

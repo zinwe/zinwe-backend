@@ -4,8 +4,8 @@ F-21 coupon codes: checking a code for an owner, holding it on a payment, and co
 Rules (owner decisions, 6 Nov 2026):
 - A code takes its % off today's price (after the launch discount), for the first month of MONTHLY billing only.
   Yearly takes no code; nor does an admin offer price (an Announcement offer).
-- It never takes the monthly price below the plan's price band minimum (`Plan.band_min_inr`): the discount is capped
-  there. No floor when the band minimum is empty; nothing to give when the price is already at it (`lowest_price`).
+- The plan prices stay as they are; the code takes exactly its own % off (at most 40%, set when the code is made).
+  No lowest-price floor (owner, 6 Nov 2026). The price band in Plans & pricing does not limit coupons.
 - One code per company, ever: a company with a pending or confirmed use can't use another (CouponUse).
 - Dates are Indian dates, both inclusive.
 
@@ -169,20 +169,12 @@ def check(
         return no("used_before")
     if coupon.max_uses is not None and uses_count(coupon, company) >= coupon.max_uses:
         return no("limit_reached")
-    lowest = plan.band_min_inr if base.currency == pricing.INR else None
-    result.lowest_price = lowest
-    off, capped = pricing.coupon_discount(base.amount, coupon.percent_off, lowest)
-    if off <= 0:
+    off, capped = pricing.coupon_discount(base.amount, coupon.percent_off)
+    if off <= 0:  # nothing to take a % of (a free price)
         return no("lowest_price")
     result.ok, result.capped, result.amount_off = True, capped, off
     result.quote = pricing.with_coupon(base, coupon, plan, company)
-    if capped:
-        result.message = (
-            # Owner decision (6 Nov): the lowest price is internal, so the message names the saving, never the floor.
-            f"This code gives up to {coupon.percent_off}%. On {plan.name} you get {pricing.rupees(off)} off."
-        )
-    else:
-        result.message = f"{coupon.percent_off}% off your first month. You save {pricing.rupees(off)}."
+    result.message = f"{coupon.percent_off}% off your first month. You save {pricing.rupees(off)}."
     return result
 
 
