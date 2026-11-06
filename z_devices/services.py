@@ -32,8 +32,10 @@ from .models import (
     Device,
     DeviceEvent,
     Member,
+    MemberTodo,
     Message,
     Policy,
+    Task,
     UsageMetric,
     WorkLog,
     generate_member_code,
@@ -197,6 +199,8 @@ def send_message(
     severity: str,
     channel: str = Message.Channel.CHAT,
     event: DeviceEvent | None = None,
+    about_task: Task | None = None,
+    about_todo: MemberTodo | None = None,
 ) -> Message:
     """
     Send `member` a short note: on their widget (`chat`), on the widget and by email
@@ -205,15 +209,21 @@ def send_message(
 
     `member` must belong to `owner` (the view resolves it from the owner's own
     members, so this is a defensive re-check). On commit, track the send and email it.
+    `about_task` / `about_todo` (v1.3.5, F-17): the line sits in that task's thread; they must be the member's own.
     """
     if member.owner_id != owner.id:
         raise ValueError("Member does not belong to this owner.")
+    if about_task is not None and about_task.member_id != member.id:
+        raise ValueError("That task is not this member's.")
+    if about_todo is not None and about_todo.member_id != member.id:
+        raise ValueError("That to-do is not this member's.")
 
     emailed = channel in (Message.Channel.CHAT_EMAIL, Message.Channel.EMAIL)
     message = Message.objects.create(
         owner=owner, member=member, sender=Message.Sender.OWNER, channel=channel,
         title=title, body=body, severity=severity,
         read_by_owner=True,  # the admin wrote it
+        about_task=about_task, about_todo=about_todo,
     )
     transaction.on_commit(
         lambda: track(
@@ -333,18 +343,25 @@ def email_member_about_event(owner: User, event: DeviceEvent, meta: dict[str, st
     return member.email, sent.sent_at
 
 
-def reply_from_member(device: Device, body: str) -> Message | None:
+def reply_from_member(
+    device: Device, body: str, about_task_id: int | None = None, about_todo_id: int | None = None
+) -> Message | None:
     """
     A member replies from their widget (Device auth). One line in the thread,
     sender=member. Returns None when the PC isn't linked to a member.
+    `about_task_id` / `about_todo_id` (v1.3.5, F-17): a reply in that task's thread; an id that isn't the member's
+    own is dropped (the line still goes out as an ordinary reply).
     """
     if device.member_id is None:
         return None
     member = device.member
+    about_task = Task.objects.filter(pk=about_task_id, member=member).first() if about_task_id else None
+    about_todo = MemberTodo.objects.filter(pk=about_todo_id, member=member).first() if about_todo_id else None
     message = Message.objects.create(
         owner_id=member.owner_id, member=member, sender=Message.Sender.MEMBER,
         title="", body=body, severity=Message.Severity.INFO,
         read_by_member=True,  # the member wrote it
+        about_task=about_task, about_todo=about_todo,
     )
     transaction.on_commit(
         lambda: track("member.message_reply", {"member_id": member.id}, actor_email=member.email, ref=message)
@@ -402,8 +419,13 @@ def thread_for_owner(owner: User, member: Member) -> QuerySet:
 
 
 def _with_tasks(qs: QuerySet) -> QuerySet:
-    """FR-20: task lines carry their task (steps + activity) without a query per line."""
-    return qs.select_related("task__member").prefetch_related("task__steps", "task__activity")
+    """FR-20: task lines carry their task (steps + activity) without a query per line; `task_talk` = how many lines
+    are about that task (v1.3.5, F-17), so the card's count costs no query either."""
+    return (
+        qs.select_related("task__member")
+        .prefetch_related("task__steps", "task__activity")
+        .annotate(task_talk=Count("task__talk", distinct=True))
+    )
 
 
 def mark_thread_read_by_owner(member: Member) -> int:

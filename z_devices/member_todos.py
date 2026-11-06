@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from django.db import transaction
-from django.db.models import QuerySet
+from django.db.models import Count, QuerySet
 from django.utils import timezone
 
 from z_auth.models import User
@@ -43,7 +43,7 @@ def todos_for_owner(owner: User, status: str = "all", member_id: int | None = No
         qs = qs.filter(status=status)
     if member_id is not None:
         qs = qs.filter(member_id=member_id)
-    return qs.select_related("member").order_by("-updated_at", "-id")[:LIST_LIMIT]
+    return qs.select_related("member").annotate(talk_count=Count("talk")).order_by("-updated_at", "-id")[:LIST_LIMIT]
 
 
 def todos_for_device(device: Device) -> QuerySet:

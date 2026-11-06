@@ -19,7 +19,7 @@ from z_auth import entitlements as plan
 from z_main.client import get_client_ip
 
 from . import blocklists, member_todos, pictures, services, web_push, work_tasks
-from .models import AgentRelease, DeviceEvent, WorkLog
+from .models import AgentRelease, DeviceEvent, MemberTodo, Task, WorkLog
 from .authentication import DeviceScopedThrottle, DeviceTokenAuthentication, IsDevice, IsOwner
 from .serializers import (
     BlockListSitesQuerySerializer,
@@ -155,7 +155,12 @@ class DeviceMessagesView(APIView):
         plan.require(request.auth.owner, plan.TEAM_CHAT)
         serializer = MemberReplySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        message = services.reply_from_member(request.auth, serializer.validated_data["body"])
+        message = services.reply_from_member(
+            request.auth,
+            serializer.validated_data["body"],
+            about_task_id=serializer.validated_data.get("about_task"),
+            about_todo_id=serializer.validated_data.get("about_todo"),
+        )
         if message is None:
             return Response({"detail": "This PC isn't linked to a member."}, status=status.HTTP_400_BAD_REQUEST)
         return Response(MessageSerializer(message, context={"request": request}).data, status=status.HTTP_201_CREATED)
@@ -524,6 +529,17 @@ class MemberMessageView(APIView):
             event = DeviceEvent.objects.filter(pk=event_id, device__owner=request.user).first()
             if event is None:
                 return Response({"event_id": ["That alert wasn't found."]}, status=status.HTTP_400_BAD_REQUEST)
+        about_task = about_todo = None
+        if serializer.validated_data.get("about_task"):
+            about_task = Task.objects.filter(pk=serializer.validated_data["about_task"], member=member).first()
+            if about_task is None:
+                return Response({"about_task": ["That task wasn't found."]}, status=status.HTTP_400_BAD_REQUEST)
+        if serializer.validated_data.get("about_todo"):
+            about_todo = MemberTodo.objects.filter(
+                pk=serializer.validated_data["about_todo"], member=member, deleted_at__isnull=True
+            ).first()
+            if about_todo is None:
+                return Response({"about_todo": ["That to-do wasn't found."]}, status=status.HTTP_400_BAD_REQUEST)
         message = services.send_message(
             request.user,
             member,
@@ -532,6 +548,8 @@ class MemberMessageView(APIView):
             severity=serializer.validated_data["severity"],
             channel=serializer.validated_data["channel"],
             event=event,
+            about_task=about_task,
+            about_todo=about_todo,
         )
         return Response(MessageSerializer(message, context={"request": request}).data, status=status.HTTP_201_CREATED)
 

@@ -368,6 +368,15 @@ class Message(models.Model):
     # pulled it, and when the member opened it in the widget's chat. Null = not yet / older rows.
     delivered_at = models.DateTimeField(null=True, blank=True)
     read_by_member_at = models.DateTimeField(null=True, blank=True)
+    # v1.3.5 (F-17): a line said about one task or one of the member's own to-dos: the task's thread in the owner's
+    # chat and under the task in the Zinwe window. Null = an ordinary chat line. (The task's own card line keeps
+    # `kind = "task"` and no `about_*`.)
+    about_task = models.ForeignKey(
+        "Task", null=True, blank=True, on_delete=models.SET_NULL, related_name="talk"
+    )
+    about_todo = models.ForeignKey(
+        "MemberTodo", null=True, blank=True, on_delete=models.SET_NULL, related_name="talk"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

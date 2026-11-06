@@ -152,10 +152,15 @@ class MessageCreateSerializer(serializers.Serializer):
     also_email = serializers.BooleanField(required=False, default=False)
     # Sent from an alert: that alert is marked handled (J5-04).
     event_id = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
+    # v1.3.5 (F-17): said about one of this member's tasks, or one of their own to-dos (at most one of the two).
+    about_task = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
+    about_todo = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
 
     def validate(self, attrs: dict) -> dict:
         if not attrs.get("channel"):
             attrs["channel"] = Message.Channel.CHAT_EMAIL if attrs["also_email"] else Message.Channel.CHAT
+        if attrs.get("about_task") and attrs.get("about_todo"):
+            raise serializers.ValidationError("A line is about one task or one to-do, not both.")
         return attrs
 
 
@@ -178,12 +183,15 @@ class MessageSerializer(serializers.ModelSerializer):
     # FR-20: "task" lines carry the task (its live card in the thread); null on chat lines. Older Zinwe windows
     # ignore both fields and show the line's title + body as an ordinary message.
     task = serializers.SerializerMethodField()
+    # v1.3.5 (F-17): the task / own to-do this line is about (its thread); null on ordinary lines.
+    about_task = serializers.PrimaryKeyRelatedField(read_only=True)
+    about_todo = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta:
         model = Message
         fields = [
             "id", "sender", "channel", "kind", "title", "body", "severity", "created_at", "read_by_owner",
-            "read_by_member", "delivered_at", "read_by_member_at", "task",
+            "read_by_member", "delivered_at", "read_by_member_at", "task", "about_task", "about_todo",
         ]
 
     def get_body(self, obj: Message) -> str | None:
@@ -193,7 +201,12 @@ class MessageSerializer(serializers.ModelSerializer):
         if obj.kind != Message.Kind.TASK:
             return None
         task = _task_of(obj)
-        return TaskSerializer(task, context=self.context).data if task is not None else None
+        if task is None:
+            return None
+        talk = getattr(obj, "task_talk", None)
+        if talk is not None:
+            task.talk_count = talk  # from the thread query (services._with_tasks), not a query per card
+        return TaskSerializer(task, context=self.context).data
 
 
 class EventHandledSerializer(serializers.Serializer):
@@ -206,6 +219,14 @@ class MemberReplySerializer(serializers.Serializer):
     """POST /api/devices/messages/ (Device auth) -- the member replies in the thread."""
 
     body = serializers.CharField(max_length=2000, trim_whitespace=True)
+    # v1.3.5 (F-17): a reply in a task's thread (their own task or own to-do); at most one of the two.
+    about_task = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
+    about_todo = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
+
+    def validate(self, attrs: dict) -> dict:
+        if attrs.get("about_task") and attrs.get("about_todo"):
+            raise serializers.ValidationError("A line is about one task or one to-do, not both.")
+        return attrs
 
 
 class PushKeysSerializer(serializers.Serializer):
@@ -876,6 +897,12 @@ class TaskSerializer(serializers.Serializer):
     status_changed_by = serializers.CharField(read_only=True)
     message_id = serializers.IntegerField(read_only=True, allow_null=True)
     activity = TaskActivitySerializer(many=True, read_only=True)
+    # v1.3.5 (F-17): how many chat lines are about this task (its thread). Lists annotate it; a lone task counts.
+    talk_count = serializers.SerializerMethodField()
+
+    def get_talk_count(self, obj: Any) -> int:
+        n = getattr(obj, "talk_count", None)
+        return n if n is not None else obj.talk.count()
 
     def get_member_picture(self, obj: Any) -> dict[str, Any] | None:
         from .pictures import picture_payload
@@ -970,9 +997,15 @@ class MemberTodoSerializer(serializers.Serializer):
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
     deleted = serializers.SerializerMethodField()
+    # v1.3.5 (F-17): chat lines about this to-do (its thread in the owner's chat).
+    talk_count = serializers.SerializerMethodField()
 
     def get_deleted(self, obj: Any) -> bool:
         return obj.deleted_at is not None
+
+    def get_talk_count(self, obj: Any) -> int:
+        n = getattr(obj, "talk_count", None)
+        return n if n is not None else obj.talk.count()
 
 
 class MemberTodoStepSerializer(serializers.Serializer):

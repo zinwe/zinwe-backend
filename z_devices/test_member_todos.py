@@ -19,7 +19,7 @@ CLIENT_ID = "0123456789abcdef0123456789abcdef"
 
 TODO_KEYS = {
     "id", "client_id", "member_id", "member_name", "title", "due_date", "steps", "status", "done_at", "created_at",
-    "updated_at", "deleted",
+    "updated_at", "deleted", "talk_count",
 }
 
 

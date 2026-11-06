@@ -18,7 +18,7 @@ from datetime import timedelta
 from typing import Any, Iterable
 
 from django.db import transaction
-from django.db.models import F, Prefetch, Q, QuerySet, Value
+from django.db.models import Count, F, Prefetch, Q, QuerySet, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -76,11 +76,11 @@ class TaskRefused(Exception):
 
 
 def with_details(qs: QuerySet) -> QuerySet:
-    """Everything the Task JSON needs, in three queries however many tasks."""
+    """Everything the Task JSON needs, in three queries however many tasks (+ `talk_count`, v1.3.5 F-17)."""
     return qs.select_related("member").prefetch_related(
         Prefetch("steps", queryset=TaskStep.objects.order_by("position", "id")),
         Prefetch("activity", queryset=TaskActivity.objects.order_by("at", "id")),
-    )
+    ).annotate(talk_count=Count("talk", distinct=True))
 
 
 def tasks_for_owner(owner: User, status: str = "open", member_id: int | None = None) -> QuerySet:

@@ -13,7 +13,7 @@ from rest_framework.authtoken.models import Token
 from z_auth.models import Plan, User
 
 from .authentication import DeviceScopedThrottle
-from .models import Member, Message, NotificationPrefs, Task, TaskActivity
+from .models import Member, MemberTodo, Message, NotificationPrefs, Task, TaskActivity
 from .owner_feed import feed
 from .test_plan_limits import SPLIT, PlanTestCase
 from .tests import MEMBERS_URL, MESSAGES_URL, DeviceTestCase
@@ -22,7 +22,7 @@ TASKS_URL = "/api/devices/tasks/"
 
 TASK_KEYS = {
     "id", "member_id", "member_name", "member_picture", "title", "note", "due_at", "priority", "steps", "status", "help_note",
-    "created_at", "updated_at", "status_changed_at", "status_changed_by", "message_id", "activity",
+    "created_at", "updated_at", "status_changed_at", "status_changed_by", "message_id", "activity", "talk_count",
 }
 
 
@@ -519,3 +519,75 @@ class TaskPlanGateTests(PlanTestCase):
         Task.objects.update(status="progress")
         TaskActivity.objects.create(task_id=self.task_id, by="member", action="done")
         self.assertEqual([i for i in feed(self.owner, since)["items"] if i["kind"] == "task"], [])
+
+
+class TaskThreadTests(TaskTestCase):
+    """v1.3.5 (F-17): chat lines about one task or one own to-do (the task's thread)."""
+
+    def message_url(self) -> str:
+        return f"{MEMBERS_URL}{self.member.id}/message/"
+
+    def test_owner_line_about_a_task_is_linked_and_counted(self) -> None:
+        task = self.make()
+        self.as_owner()
+        with self.captureOnCommitCallbacks(execute=True):
+            sent = self.client.post(
+                self.message_url(), {"title": "About: Reconcile October GST", "body": "Any blockers?", "about_task": task["id"]}, format="json"
+            )
+        self.assertEqual(sent.status_code, status.HTTP_201_CREATED, sent.content)
+        self.assertEqual(sent.json()["about_task"], task["id"])
+        self.assertIsNone(sent.json()["about_todo"])
+        self.assertEqual(sent.json()["kind"], "chat")
+
+        # The thread carries the link, the task counts the line; the task's own card line stays unlinked.
+        thread = self.client.get(f"{MEMBERS_URL}{self.member.id}/messages/").json()
+        about = [m for m in thread if m["about_task"] == task["id"]]
+        self.assertEqual([m["body"] for m in about], ["Any blockers?"])
+        card = next(m for m in thread if m["kind"] == "task")
+        self.assertIsNone(card["about_task"])
+        self.assertEqual(card["task"]["talk_count"], 1)
+        listed = next(t for t in self.client.get(TASKS_URL).json() if t["id"] == task["id"])
+        self.assertEqual(listed["talk_count"], 1)
+
+        # The member answers in the thread from their Zinwe window; the PC's feed shows the link too.
+        self.as_device(self.token)
+        with self.captureOnCommitCallbacks(execute=True):
+            reply = self.client.post(MESSAGES_URL, {"body": "None, done by 5.", "about_task": task["id"]}, format="json")
+        self.assertEqual(reply.status_code, status.HTTP_201_CREATED, reply.content)
+        self.assertEqual(reply.json()["about_task"], task["id"])
+        feed = self.client.get(MESSAGES_URL).json()
+        self.assertEqual(sum(1 for m in feed if m["about_task"] == task["id"]), 2)
+        self.assertEqual(next(m for m in feed if m["kind"] == "task")["task"]["talk_count"], 2)
+
+    def test_about_must_be_this_members_task_or_todo(self) -> None:
+        task = self.make()
+        other_member = Member.objects.create(owner=self.owner, name="Other One", email="other@acme.in")
+        todo = MemberTodo.objects.create(
+            owner=self.owner, member=self.member, client_id="c-1", title="Order toner", updated_at=timezone.now()
+        )
+        self.as_owner()
+        wrong_member = self.client.post(f"{MEMBERS_URL}{other_member.id}/message/", {"title": "x", "about_task": task["id"]}, format="json")
+        self.assertEqual(wrong_member.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("about_task", wrong_member.json())
+        both = self.client.post(self.message_url(), {"title": "x", "about_task": task["id"], "about_todo": todo.id}, format="json")
+        self.assertEqual(both.status_code, status.HTTP_400_BAD_REQUEST)
+        missing_todo = self.client.post(self.message_url(), {"title": "x", "about_todo": todo.id + 999}, format="json")
+        self.assertEqual(missing_todo.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("about_todo", missing_todo.json())
+
+        # About an own to-do: linked, and the to-do lists count it.
+        with self.captureOnCommitCallbacks(execute=True):
+            ok = self.client.post(self.message_url(), {"title": "About: Order toner", "body": "Which model?", "about_todo": todo.id}, format="json")
+        self.assertEqual(ok.status_code, status.HTTP_201_CREATED, ok.content)
+        self.assertEqual(ok.json()["about_todo"], todo.id)
+        rows = self.client.get(f"{MEMBERS_URL}{self.member.id}/todos/").json()
+        self.assertEqual(next(r for r in rows if r["id"] == todo.id)["talk_count"], 1)
+
+        # A member reply naming a task that isn't theirs still goes out, as an ordinary line.
+        theirs = self.make(member=other_member)
+        self.as_device(self.token)
+        with self.captureOnCommitCallbacks(execute=True):
+            reply = self.client.post(MESSAGES_URL, {"body": "hello", "about_task": theirs["id"]}, format="json")
+        self.assertEqual(reply.status_code, status.HTTP_201_CREATED)
+        self.assertIsNone(reply.json()["about_task"])
+
