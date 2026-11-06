@@ -33,6 +33,10 @@ urlpatterns = [
     path("zingle/<int:zingle_id>/<str:which>/", views.ZingleFileView.as_view(), name="zingle-file"),
     path("announcements/<int:announcement_id>/image/", views.AnnouncementImageView.as_view(), name="announcement-image"),
     path("announcements/<int:announcement_id>/seen/", views.AnnouncementSeenView.as_view(), name="announcement-seen"),
+    path(
+        "announcements/<int:announcement_id>/answer/", views.AnnouncementAnswerView.as_view(),
+        name="announcement-answer",
+    ),
     path("whats-new/", views.ReleaseNotesView.as_view(), name="whats-new"),
     path("testimonials/", views.TestimonialsView.as_view(), name="testimonials"),
     path("plans/", views.PlanListView.as_view(), name="plans"),

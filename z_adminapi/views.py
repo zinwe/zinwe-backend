@@ -570,6 +570,7 @@ class AnnouncementListView(StaffView):
     """
     GET /api/admin/announcements/ -- every pushed message, newest first, with its live status; `?placement=popup`
     lists the pop-ups only. Each pop-up has `stats` {owners, views, closed, clicks, clicked_owners} (bars: null).
+    F-22 `?view=interactions` -> {interactions: [row + stats], rows: (the same list), totals} (z_adminapi.interactions).
     POST -- push one: {title, body?, kind, placement, audience, plan_codes?, cta_label?, cta_href?,
     starts_at?, ends_at?, is_active?, dismissible?, priority?}, as JSON or multipart with an optional `image` (PNG,
     JPG or WebP, up to 2 MB). Owners see it on their next page load.
@@ -581,12 +582,16 @@ class AnnouncementListView(StaffView):
         from .serializers import popup_stats
 
         rows = (
-            Announcement.objects.select_related("created_by", "offer_plan")
+            Announcement.objects.select_related("created_by", "offer_plan", "coupon")
             .annotate(**popup_stats("views__"))
             .order_by("-created_at", "-id")
         )
         if request.query_params.get("placement") in Announcement.Placement.values:
             rows = rows.filter(placement=request.query_params["placement"])
+        if request.query_params.get("view") == "interactions":
+            from .interactions import interactions
+
+            return Response(interactions(list(rows)))
         return Response(AnnouncementSerializer(rows, many=True).data)
 
     def post(self, request: Request) -> Response:
@@ -635,7 +640,8 @@ class OwnerSearchView(StaffView):
 class AnnouncementReachView(StaffView):
     """
     GET /api/admin/announcements/reach/?audience=paid&plans=startups,businesses -- {customers, total}: how
-    many customers a dashboard message with this audience shows to right now. With `placement=popup&kind=offer`,
+    many customers a dashboard message with this audience shows to right now (F-22: also new7, plan_ending and
+    quiet with `audience_days`). With `placement=popup&kind=offer`,
     a pop-up's plan rule applies too (F-11: paid plans get news, new versions, wishes and maintenance only).
     """
 
@@ -646,7 +652,13 @@ class AnnouncementReachView(StaffView):
         plans = [code for code in (request.query_params.get("plans") or "").split(",") if code]
         emails = [e.strip() for e in (request.query_params.get("emails") or "").split(",") if e.strip()]
         kind, placement = request.query_params.get("kind") or "", request.query_params.get("placement") or ""
-        return Response(services.announcement_reach(audience, plans, emails, kind=kind, placement=placement))
+        try:
+            days = int(request.query_params.get("audience_days") or 0) or None
+        except ValueError:
+            return Response({"detail": "audience_days is a whole number of days."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(services.announcement_reach(
+            audience, plans, emails, kind=kind, placement=placement, audience_days=days,
+        ))
 
 
 class AnnouncementDetailView(StaffView):

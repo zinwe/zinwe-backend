@@ -88,7 +88,7 @@ def usable_offer(user: User, offer_id: int, plan: Plan | None) -> Announcement:
         raise OfferNotAvailable(f"This offer is for the {offer.offer_plan.name} plan.")
     if offer.offer_price_inr < Decimal("1.00"):
         raise OfferNotAvailable()
-    if not _reaches(offer, entitlements_for(user), user.email):
+    if not _reaches(offer, entitlements_for(user), user.email, user):
         raise OfferNotAvailable()
     used = RazorpayOrder.objects.filter(
         owner=user, offer=offer, status__in=(RazorpayOrder.Status.PAID, RazorpayOrder.Status.NEEDS_REVIEW)

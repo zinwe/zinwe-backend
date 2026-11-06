@@ -708,6 +708,11 @@ class Feedback(models.Model):
     )
     message = models.TextField(blank=True, max_length=2000)
     page = models.CharField(max_length=120, blank=True, help_text="Dashboard page it was sent from.")
+    # F-22: the user interaction (feedback ask) it answered, and at which moment ("signout", "signin"...).
+    announcement = models.ForeignKey(
+        "z_auth.Announcement", null=True, blank=True, on_delete=models.SET_NULL, related_name="feedback",
+    )
+    trigger = models.CharField(max_length=20, blank=True)
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
 
     class Meta:
@@ -825,6 +830,28 @@ class Announcement(models.Model):
         VERSION = "version", "New version"
         MAINTENANCE = "maintenance", "Maintenance"
         WISH = "wish", "Wish"
+        # F-22 user interactions (always pop-ups): ask for a 1-10 rating, ask to upgrade.
+        FEEDBACK_ASK = "feedback_ask", "Ask for feedback"
+        UPGRADE_ASK = "upgrade_ask", "Ask to upgrade"
+
+    class Trigger(models.TextChoices):
+        """F-22: the moment a pop-up shows. Bars always show while live."""
+
+        SIGNIN = "signin", "When they sign in"  # today's behaviour: the dashboard visit
+        SIGNOUT = "signout", "When they sign out"
+        DAYS_AFTER_SIGNUP = "days_after_signup", "Days after sign-up"
+        FIRST_PC = "first_pc", "After the first PC connects"
+        BEFORE_PLAN_END = "before_plan_end", "Days before the plan ends"
+        DATE = "date", "On a date"
+
+    class Frequency(models.TextChoices):
+        """F-22: how often one owner sees it. Empty = the placement's default (pop-ups: rhythm; bars: until closed)."""
+
+        RHYTHM = "rhythm", "First visit, after 2 days, after a week"
+        ONCE = "once", "Once"
+        EVERY = "every", "Every time"
+        EVERY_14D = "every_14d", "Every 14 days"
+        UNTIL_CLOSED = "until_closed", "Until they close it"
 
     class Placement(models.TextChoices):
         DASHBOARD = "dashboard", "Dashboard"
@@ -838,6 +865,10 @@ class Announcement(models.Model):
         PAID = "paid", "Owners on a paid plan"
         PLANS = "plans", "Owners on the plans chosen"
         OWNERS = "owners", "Specific owners (by email)"
+        # F-22
+        NEW7 = "new7", "Signed up in the last 7 days"
+        PLAN_ENDING = "plan_ending", "Plan or trial ends within 7 days"
+        QUIET = "quiet", "Not signed in for a while"
 
     title = models.CharField(max_length=120)
     body = models.CharField(max_length=280, blank=True)
@@ -870,6 +901,19 @@ class Announcement(models.Model):
         upload_to=announcement_image_upload_to, blank=True,
         help_text="Optional picture: PNG, JPG or WebP, up to 2 MB. Public, like the message.",
     )
+    # F-22 user interactions. The defaults keep every older row exactly as it was.
+    trigger = models.CharField(max_length=20, choices=Trigger.choices, default=Trigger.SIGNIN)
+    trigger_days = models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="N, for days after sign-up / days before the plan ends.",
+    )
+    audience_days = models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="For the 'not signed in for a while' audience: how many days (default 14).",
+    )
+    frequency = models.CharField(max_length=20, choices=Frequency.choices, blank=True, default="")
+    coupon = models.ForeignKey(
+        "z_auth.Coupon", null=True, blank=True, on_delete=models.SET_NULL, related_name="announcements",
+        help_text="F-21: a coupon code the message hands out (its button opens the plan page with the code).",
+    )
     starts_at = models.DateTimeField(default=timezone.now)
     ends_at = models.DateTimeField(null=True, blank=True, help_text="Empty = until switched off.")
     is_active = models.BooleanField(default=True)
@@ -887,6 +931,14 @@ class Announcement(models.Model):
 
     def __str__(self) -> str:
         return f"{self.get_kind_display()}: {self.title}"
+
+    QUIET_DAYS = 14
+
+    @property
+    def effective_frequency(self) -> str:
+        if self.frequency:
+            return self.frequency
+        return self.Frequency.RHYTHM if self.placement == self.Placement.POPUP else self.Frequency.UNTIL_CLOSED
 
 
 @receiver(post_delete, sender=Announcement)

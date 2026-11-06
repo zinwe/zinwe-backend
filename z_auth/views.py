@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db import transaction
 from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -573,12 +574,15 @@ class AnnouncementsView(APIView):
     GET /api/auth/announcements/ -- the dashboard notification-bar items for the signed-in owner:
     the admin panel's messages for their audience, configured banners, then the upgrade bar; and in `popups`
     the moments pop-up to show now (F-11: none or one, same item shape plus `announcement_id`).
+    F-22: `?moment=signout` -> {popups: [at most one sign-out interaction]}.
     """
 
     permission_classes = [IsAuthenticated]
     throttle_classes: list = []
 
     def get(self, request: Request) -> Response:
+        if request.query_params.get("moment") == "signout":
+            return Response({"popups": popups_for(request.user, moment="signout")})
         return Response({"announcements": announcements_for(request.user), "popups": popups_for(request.user)})
 
 
@@ -603,6 +607,40 @@ class AnnouncementSeenView(APIView):
             "announcement_id": announcement.pk, "views": view.views, "last_seen_at": view.last_seen_at,
             "closed": view.closed, "clicks": view.clicks,
         })
+
+
+class AnnouncementAnswerView(APIView):
+    """
+    POST /api/auth/announcements/<id>/answer/ -- {rating: 1-10, message?}: F-22, the owner answered a feedback ask.
+    Saved as their feedback (with the interaction and its moment) and the pop-up counts as seen and pressed.
+    -> 201 {feedback_id, announcement_id, rating}.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request, announcement_id: int) -> Response:
+        from .announcements import record_answer
+        from .models import Announcement, Feedback
+
+        announcement = get_object_or_404(Announcement, pk=announcement_id, placement=Announcement.Placement.POPUP)
+        rating = request.data.get("rating")
+        try:
+            rating = int(rating)
+        except (TypeError, ValueError):
+            rating = None
+        if rating is None or not Feedback.RATING_MIN <= rating <= Feedback.RATING_MAX or isinstance(
+            request.data.get("rating"), bool
+        ):
+            return Response({"rating": ["Pick a number from 1 to 10."]}, status=status.HTTP_400_BAD_REQUEST)
+        message = request.data.get("message") or ""
+        if not isinstance(message, str) or len(message) > 2000:
+            return Response({"message": ["Keep it under 2,000 characters."]}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            feedback = record_answer(request.user, announcement, rating, message)
+        return Response(
+            {"feedback_id": feedback.pk, "announcement_id": announcement.pk, "rating": feedback.rating},
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class FeedbackPromptView(APIView):

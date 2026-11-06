@@ -654,7 +654,7 @@ def review_payment(
 
 
 def feedback_rows() -> list[Feedback]:
-    return list(Feedback.objects.select_related("owner__owned_company", "member", "device", "testimonial").all())
+    return list(Feedback.objects.select_related("owner__owned_company", "member", "device", "testimonial", "announcement").all())
 
 
 def feedback_summary() -> dict[str, Any]:
@@ -738,6 +738,7 @@ def billing_settings() -> dict[str, Any]:
 
 def announcement_reach(
     audience: str, plan_codes: list[str], owner_emails: list[str] | None = None, kind: str = "", placement: str = "",
+    audience_days: int | None = None,
 ) -> dict[str, int]:
     """
     How many customers a dashboard announcement with this audience reaches now: active, verified owners
@@ -748,13 +749,15 @@ def announcement_reach(
     from z_auth.entitlements import entitlements_for
     from z_auth.models import Announcement
 
-    probe = Announcement(audience=audience, plan_codes=plan_codes, owner_emails=owner_emails or [], kind=kind)
+    probe = Announcement(
+        audience=audience, plan_codes=plan_codes, owner_emails=owner_emails or [], kind=kind, audience_days=audience_days,
+    )
     check = popup_reaches if placement == Announcement.Placement.POPUP else _reaches
     owners = User.objects.filter(is_staff=False, is_active=True, email_verified_at__isnull=False)
     total = reached = 0
     for owner in owners:
         total += 1
-        reached += check(probe, entitlements_for(owner), owner.email)
+        reached += check(probe, entitlements_for(owner), owner.email, owner)
     return {"customers": reached, "total": total}
 
 
