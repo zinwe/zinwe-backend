@@ -28,9 +28,17 @@ from .portal_serializers import (
     SubscribeSerializer,
     SubscriptionSerializer,
 )
+from .coupons import CouponRefused
 from .services import PlanNotAllowed
 
 NO_COMPANY = {"detail": "No company yet."}
+
+
+def coupon_refused(exc: CouponRefused) -> Response:
+    """F-21: a code refused at submit: 400 {detail, reason, coupon: [message]}."""
+    return Response(
+        {"detail": exc.message, "reason": exc.reason, "coupon": [exc.message]}, status=status.HTTP_400_BAD_REQUEST
+    )
 
 
 class CompanyView(APIView):
@@ -118,6 +126,8 @@ class PaymentSubmitView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         except billing.UpgradeNotAllowed as exc:
             return Response({"upgrade_plan": [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
+        except CouponRefused as exc:
+            return coupon_refused(exc)
         return Response(PaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
 
 
@@ -306,8 +316,9 @@ def _quote_pdf_response(doc: dict) -> HttpResponse:
 
 class CheckoutPreviewView(APIView):
     """
-    GET /api/auth/subscription/checkout/[?plan=<code>][&cycle=monthly|yearly] -- what the checkout shows for one
-    billing cycle: {quote, covers_from, covers_until, carried_days, upi_uri, yearly_saving_percent}. `plan` = an
+    GET /api/auth/subscription/checkout/[?plan=<code>][&cycle=monthly|yearly][&coupon=CODE] -- what the checkout shows
+    for one billing cycle: {quote, covers_from, covers_until, carried_days, upi_uri, yearly_saving_percent}; with
+    `coupon` (F-21) the quote has it applied when it's valid, and `coupon_error` {reason, message} says why not. `plan` = an
     upgrade from an active plan, or another plan to pay for instead of the one waiting for payment; none = what's
     due (first payment or renewal). Read only. 404 unknown plan; 409 when there's nothing to pay / an upgrade
     isn't possible / a payment is being checked.
@@ -324,8 +335,9 @@ class CheckoutPreviewView(APIView):
         if code and plan is None:
             return Response({"detail": "That plan doesn't exist or isn't available."}, status=status.HTTP_404_NOT_FOUND)
         cycle = pricing.valid_cycle(request.query_params.get("cycle"))
+        coupon = (request.query_params.get("coupon") or "").strip()[:40] or None
         try:
-            return Response(billing.checkout_preview(request.user, plan, cycle))
+            return Response(billing.checkout_preview(request.user, plan, cycle, coupon=coupon))
         except (billing.NothingToPay, billing.UpgradeNotAllowed, billing.PaymentUnderReview) as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
 
@@ -348,8 +360,9 @@ class UpgradePreviewView(APIView):
         from . import pricing
 
         cycle = pricing.valid_cycle(request.query_params.get("cycle"))
+        coupon = (request.query_params.get("coupon") or "").strip()[:40] or None
         try:
-            return Response(billing.upgrade_preview(request.user, plan, cycle=cycle))
+            return Response(billing.upgrade_preview(request.user, plan, cycle=cycle, coupon=coupon))
         except (billing.UpgradeNotAllowed, billing.PaymentUnderReview) as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
 
@@ -384,10 +397,13 @@ class UpiQrView(APIView):
         subscription = billing.current_subscription(request.user)
         code = request.query_params.get("upgrade", "")
         cycle = pricing.valid_cycle(request.query_params.get("cycle"))
+        coupon = (request.query_params.get("coupon") or "").strip()[:40]
         if not code:
             due = billing.subscription_due(subscription)
             if due is not None and cycle:
                 due = billing.amount_due(subscription, None, cycle)
+            if due is not None and coupon:
+                due = _with_valid_coupon(coupon, subscription, subscription.plan, due)
             return _upi_qr_response(billing.upi_qr(due, subscription.company) if due else None)
         plan = Plan.objects.filter(code=code[:50], is_active=True).first()
         if plan is None:
@@ -396,7 +412,76 @@ class UpiQrView(APIView):
             subscription = billing.check_upgrade(subscription, plan)
         except (billing.UpgradeNotAllowed, billing.PaymentUnderReview) as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
-        return _upi_qr_response(billing.upi_qr(billing.amount_due(subscription, plan, cycle), subscription.company))
+        due = billing.amount_due(subscription, plan, cycle)
+        if coupon:
+            due = _with_valid_coupon(coupon, subscription, plan, due)
+        return _upi_qr_response(billing.upi_qr(due, subscription.company))
+
+
+def _with_valid_coupon(code: str, subscription: Any, plan: Any, due: Any) -> Any:
+    """The quote with the coupon (F-21) when it's valid for this owner, else unchanged."""
+    from .coupons import check
+
+    checked = check(code, subscription.company, plan, due)
+    return checked.quote if checked.ok else due
+
+
+class CouponCheckView(APIView):
+    """
+    GET /api/auth/subscription/coupon/?code=ZWSTARTUP15&plan=startups&cycle=monthly[&offer=<id>] -- F-21: can this
+    owner use the code on that plan and cycle? 200 {ok: true, code, percent_off, capped, lowest_price, amount_off,
+    message, quote} or {ok: false, code, reason, message}. `offer` (an admin offer price) always refuses a code.
+    The checkout and the payment check it again.
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "coupon_check"
+
+    def get(self, request: Request) -> Response:
+        from . import coupons, pricing
+        from .models import Plan
+
+        params = request.query_params
+        code = coupons.normalise(params.get("code"))[:40]
+        cycle = pricing.valid_cycle(params.get("cycle"))
+        subscription = billing.current_subscription(request.user)
+        plan_code = (params.get("plan") or "")[:50]
+        plan = Plan.objects.filter(code=plan_code, is_active=True).first() if plan_code else (
+            subscription.plan if subscription else None
+        )
+        if plan is None:
+            return Response({"detail": "That plan doesn't exist or isn't available."}, status=status.HTTP_404_NOT_FOUND)
+        company = get_company(request.user)
+        if params.get("offer"):
+            base = pricing.quote(plan, company, cycle=cycle)
+            return Response(coupons.check(code, company, plan, base, offer=True).as_dict())
+        base = None
+        try:
+            other = subscription is None or plan.pk != subscription.plan_id
+            preview = billing.checkout_preview(request.user, plan if other else None, cycle)
+            if preview["quote"]["plan_code"] == plan.code:
+                base = _quote_from_dict(preview["quote"])
+        except billing.BillingError:
+            pass
+        if base is None:  # no payment can start here yet (e.g. before choosing a plan): today's catalogue price
+            currency = subscription.currency if subscription else None
+            base = pricing.quote(plan, company, currency, cycle)
+        return Response(coupons.check(code, company, plan, base).as_dict())
+
+
+def _quote_from_dict(data: dict) -> Any:
+    """A Quote back from its as_dict() form (the checkout preview's quote)."""
+    from decimal import Decimal
+
+    from .pricing import Quote, TaxLine
+
+    fields = {k: v for k, v in data.items() if k != "taxes"}
+    for key in ("list_amount", "discount_amount", "amount", "tax_total", "total"):
+        fields[key] = Decimal(fields[key])
+    q = Quote(**fields)
+    q.taxes = [TaxLine(t["label"], Decimal(t["rate"]), Decimal(t["amount"])) for t in data.get("taxes", [])]
+    return q
 
 
 class QuoteView(APIView):

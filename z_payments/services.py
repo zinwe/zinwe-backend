@@ -138,12 +138,18 @@ def checkout_config(currency: str) -> dict[str, str] | None:
 @transaction.atomic
 def start_order(
     user: User, upgrade_plan: Plan | None = None, accept_terms: bool = False, offer_id: int | None = None,
-    cycle: str | None = None,
+    cycle: str | None = None, coupon: str | None = None,
 ) -> RazorpayOrder:
-    """A Razorpay order for what `user` owes now (or for an admin offer's price). Raises the billing errors,
-    `OfferNotAvailable` or `OnlinePaymentUnavailable`."""
+    """A Razorpay order for what `user` owes now (or for an admin offer's price). `coupon` (F-21) is checked again
+    and held on the order (pending until paid). Raises the billing errors, `OfferNotAvailable`,
+    `coupons.CouponRefused` (never with an offer) or `OnlinePaymentUnavailable`."""
+    from z_auth import coupons
+
     if not online_enabled():
         raise OnlinePaymentUnavailable()
+    code = coupons.normalise(coupon)
+    if code and offer_id:
+        raise coupons.CouponRefused("offer", coupons.MESSAGES["offer"], code)
     offer = usable_offer(user, offer_id, upgrade_plan) if offer_id else None
     # An offer is priced for one cycle of the subscription's own; otherwise the cycle chosen at checkout.
     subscription, upgrade_plan, renewal, due = billing.payment_target(user, upgrade_plan, None if offer else cycle)
@@ -151,6 +157,9 @@ def start_order(
         # Same subscription, plan change and period rules as a normal payment; only the price is the offer's.
         # After it's paid, renewals use the plan's normal price (billing.verify_payment re-prices the plan).
         due = offer_quote(subscription, offer)
+    use = None
+    if code:
+        use, due = coupons.reserve(code, user, subscription.company, upgrade_plan or subscription.plan, due)
     if due.currency not in ONLINE_CURRENCIES:
         raise OnlinePaymentUnavailable()
     amount_paise = int((due.total * 100).quantize(Decimal("1")))
@@ -168,7 +177,7 @@ def start_order(
     return RazorpayOrder.objects.create(
         owner=user, subscription=subscription, upgrade_plan=upgrade_plan, is_renewal=renewal,
         due=due.as_dict(), amount_paise=amount_paise, currency=due.currency, order_id=order["id"],
-        receipt=receipt, terms_accepted=accept_terms, offer=offer,
+        receipt=receipt, terms_accepted=accept_terms, offer=offer, coupon_use=use,
     )
 
 
@@ -281,6 +290,9 @@ def _record(order: RazorpayOrder, payment_id: str, via: str) -> ConfirmResult:
         terms_accepted_at=now if order.terms_accepted else None,
         terms_version=settings.ZINWE_LEGAL_VERSION if order.terms_accepted else "",
     )
+    from z_auth.coupons import attach
+
+    attach(order.coupon_use, payment)  # F-21: confirmed with the payment below (or when staff approve it)
     order.razorpay_payment_id = payment_id
     order.payment = payment
     order.error = ""  # a late payment on an order marked abandoned still counts
@@ -360,9 +372,14 @@ def reconcile(now: Any = None) -> ReconcileResult:
                 confirm(order.pk, paid[0]["id"], via="reconcile")
                 result.confirmed += 1
             elif order.created_at <= now - ORDER_EXPIRY:
-                result.expired += RazorpayOrder.objects.filter(
+                expired = RazorpayOrder.objects.filter(
                     pk=order.pk, status=RazorpayOrder.Status.CREATED,
                 ).update(status=RazorpayOrder.Status.FAILED, error=ABANDONED_ERROR)
+                if expired:
+                    from z_auth.coupons import void_for_orders
+
+                    void_for_orders([order.pk])  # F-21: the held code is free again
+                result.expired += expired
         except (api.RazorpayError, PaymentNotConfirmed) as exc:
             result.errors.append(f"{order.order_id}: {exc}")
     return result

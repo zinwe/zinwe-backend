@@ -124,6 +124,12 @@ def _data(payment: ManualPayment, number: str, fy: str, issued_at: datetime) -> 
         title = "Tax invoice" if registered else "Invoice"
     notes = [n for n in [due.get("note", "")] if n]
     notes.append("This is a computer-generated invoice and needs no signature.")
+    # F-21: the coupon on the payment, as its own line ("Coupon ZWSTARTUP15 −₹145.65").
+    coupon = due.get("coupon") or None
+    if coupon:
+        off = Decimal(coupon["amount_off"])
+        off_text = pricing.rupees(off) if currency == pricing.INR else pricing.money_text(off, currency)
+        coupon = {**coupon, "label": f"Coupon {coupon['code']} −{off_text}"}
     return {
         "number": number,
         "title": title,
@@ -152,9 +158,12 @@ def _data(payment: ManualPayment, number: str, fy: str, issued_at: datetime) -> 
             "period_until": payment.covers_until.date().isoformat() if payment.covers_until else None,
             "list_amount": due["list_amount"],
             "discount_amount": due["discount_amount"],
+            "coupon_code": coupon["code"] if coupon else None,
+            "coupon_amount": coupon["amount_off"] if coupon else "0.00",
             "amount": due["amount"],
             "amount_inr": due["amount"],  # legacy key (the amount, in `currency`)
         }],
+        "coupon": coupon,
         "taxable_amount": due["amount"],
         "taxes": due.get("taxes", []),
         "tax_total": due.get("tax_total", "0.00"),
@@ -332,6 +341,8 @@ def invoice_pdf(invoice: Invoice) -> bytes:
     line = d["lines"][0]
     if Decimal(line.get("discount_amount") or 0) > 0:
         row("Discount", f"- {Decimal(line['discount_amount']):,.2f}")
+    if d.get("coupon"):
+        row(f"Coupon {d['coupon']['code']}", f"- {Decimal(d['coupon']['amount_off']):,.2f}")
     row("Taxable value", f"{Decimal(d['taxable_amount']):,.2f}")
     for tax in d.get("taxes", []):
         row(f"{tax['label']} @ {tax['rate']}%", f"{Decimal(tax['amount']):,.2f}")

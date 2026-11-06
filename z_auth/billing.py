@@ -339,10 +339,22 @@ def carried_days(subscription: Subscription, now: datetime | None = None) -> int
 
 
 def _preview(
-    subscription: Subscription, due: pricing.Quote, start: datetime, until: datetime, carried: int, plan: Plan
+    subscription: Subscription, due: pricing.Quote, start: datetime, until: datetime, carried: int, plan: Plan,
+    coupon: str | None = None,
 ) -> dict[str, Any]:
+    coupon_error = None
+    if coupon:
+        # F-21: a valid code is applied to the preview; an invalid one isn't, and says why.
+        from . import coupons
+
+        checked = coupons.check(coupon, subscription.company, plan, due)
+        if checked.ok:
+            due = checked.quote
+        coupon_error = checked.error()
     pay = upi_payment(due, subscription.company)
+    extra = {"coupon_error": coupon_error} if coupon else {}
     return {
+        **extra,
         "quote": due.as_dict(),
         "covers_from": timezone.localdate(start).isoformat(),
         "covers_until": timezone.localdate(until).isoformat(),
@@ -354,7 +366,7 @@ def _preview(
 
 
 def upgrade_preview(
-    user: User, plan: Plan, now: datetime | None = None, cycle: str | None = None
+    user: User, plan: Plan, now: datetime | None = None, cycle: str | None = None, coupon: str | None = None,
 ) -> dict[str, Any]:
     """
     What moving up to `plan` costs and covers, before paying (J3-08): the quote for one billing cycle (`cycle`
@@ -366,11 +378,12 @@ def upgrade_preview(
     subscription = check_upgrade(current_subscription(user), plan)
     due = amount_due(subscription, plan, cycle)
     start, until = upgrade_period(subscription, now, due.months)
-    return _preview(subscription, due, start, until, carried_days(subscription, now), plan)
+    return _preview(subscription, due, start, until, carried_days(subscription, now), plan, coupon)
 
 
 def checkout_preview(
-    user: User, upgrade_plan: Plan | None = None, cycle: str | None = None, now: datetime | None = None
+    user: User, upgrade_plan: Plan | None = None, cycle: str | None = None, now: datetime | None = None,
+    coupon: str | None = None,
 ) -> dict[str, Any]:
     """
     What the checkout shows before paying, for one billing cycle (`cycle`, else the subscription's): an upgrade
@@ -383,7 +396,7 @@ def checkout_preview(
     if subscription is None:
         raise NothingToPay()
     if upgrade_plan is not None and subscription.status == Status.ACTIVE:
-        return upgrade_preview(user, upgrade_plan, now, cycle)
+        return upgrade_preview(user, upgrade_plan, now, cycle, coupon)
     if has_payment_under_review(subscription):
         raise PaymentUnderReview()
     if subscription.status == Status.PENDING_PAYMENT:
@@ -394,11 +407,11 @@ def checkout_preview(
             if not plan.requires_payment:
                 raise UpgradeNotAllowed()
             due = pricing.quote(plan, subscription.company, subscription.currency, cycle)
-        return _preview(subscription, due, now, add_months(now, due.months), 0, plan)
+        return _preview(subscription, due, now, add_months(now, due.months), 0, plan, coupon)
     if is_paid_active(subscription):
         due = amount_due(subscription, None, cycle)
         start, until = renewal_period(subscription, now, due.months)
-        return _preview(subscription, due, start, until, 0, subscription.plan)
+        return _preview(subscription, due, start, until, 0, subscription.plan, coupon)
     raise NothingToPay()
 
 
@@ -495,13 +508,21 @@ def submit_payment(
     staff approve; then the new plan starts with any paid days left carried over. On a plan
     still waiting for its first payment, the pending choice is simply swapped for the new plan.
 
+    `data["coupon"]` (F-21): a coupon code, checked again here and held on the payment (pending until approved).
+
     Raises `NothingToPay` (nothing is due: no subscription, a free plan or a trial),
-    `PaymentUnderReview` (one is already `submitted`) or `UpgradeNotAllowed`.
+    `PaymentUnderReview` (one is already `submitted`), `UpgradeNotAllowed` or `coupons.CouponRefused`.
     """
+    from . import coupons
+
     upgrade_plan: Plan | None = data.pop("upgrade_plan", None)
     accepted_terms = bool(data.pop("accept_terms", False))
     cycle = pricing.valid_cycle(data.pop("billing_cycle", None))
+    code = coupons.normalise(data.pop("coupon", None))
     subscription, upgrade_plan, renewal, due = payment_target(user, upgrade_plan, cycle)
+    use = None
+    if code:
+        use, due = coupons.reserve(code, user, subscription.company, upgrade_plan or subscription.plan, due)
     _fill_receipt_defaults(data, user, subscription, due)
     payment = ManualPayment(subscription=subscription, is_renewal=renewal, upgrade_plan=upgrade_plan, **data)
     payment.currency = subscription.currency
@@ -512,6 +533,7 @@ def submit_payment(
     if proof is not None:
         payment.proof = proof
     payment.save()
+    coupons.attach(use, payment)
     transaction.on_commit(lambda: _after_payment_submitted(payment))
     return payment
 
@@ -725,6 +747,9 @@ def verify_payment(
         payment.staff_checked_by = reviewer
         fields += ["staff_reference", "staff_amount", "staff_checked_by"]
     payment.save(update_fields=fields)
+    from .coupons import confirm_for_payment
+
+    confirm_for_payment(payment)  # F-21: its coupon use counts now
     from .invoices import issue_invoice  # numbered now: GST invoice numbers run without gaps
 
     invoice = issue_invoice(payment)
@@ -774,6 +799,9 @@ def reject_payment(payment_id: int, reviewer: User | None, reason: str) -> Manua
     payment.reviewed_at = timezone.now()
     payment.reviewed_by = reviewer
     payment.save(update_fields=["status", "rejection_reason", "reviewed_at", "reviewed_by"])
+    from .coupons import void_for_payment
+
+    void_for_payment(payment)  # F-21: the company may use a code again
     transaction.on_commit(lambda: _after_payment_rejected(payment))
     return payment
 

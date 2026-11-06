@@ -8,6 +8,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from z_auth import billing
+from z_auth.coupons import coupon_code
 from z_auth.models import (
     Announcement, Feedback, Invoice, Issue, ManualPayment, Plan, ReleaseNote, Subscription, Testimonial,
 )
@@ -58,6 +59,7 @@ def payment_dict(pay: ManualPayment, cycle: int | None) -> dict[str, Any]:
         # What was due when they paid, with tax (the quote frozen on the payment): compare the receipt with this.
         "currency": pay.currency,
         "due_total": (pay.due or {}).get("total") or None,
+        "coupon_code": coupon_code(pay.due),  # F-21: the code on the payment, or None
         # What staff read off the receipt when approving (J8-01), and who did.
         "staff_reference": pay.staff_reference,
         "staff_amount": str(pay.staff_amount) if pay.staff_amount is not None else None,
@@ -582,13 +584,14 @@ class AdminSubscriptionSerializer(serializers.ModelSerializer):
     days_left = serializers.SerializerMethodField()
     latest_payment = serializers.SerializerMethodField()
     invoices = serializers.SerializerMethodField()
+    coupon_code = serializers.SerializerMethodField()
 
     class Meta:
         model = Subscription
         fields = (
             "id", "owner", "company", "region", "plan", "status", "currency", "billing_cycle", "amount_inr",
             "amount_due", "is_trial", "starts_at", "ends_at", "days_left", "payment_link", "latest_payment",
-            "invoices", "created_at",
+            "invoices", "coupon_code", "created_at",
         )
         read_only_fields = [f for f in fields if f != "payment_link"]
 
@@ -620,8 +623,13 @@ class AdminSubscriptionSerializer(serializers.ModelSerializer):
             return None
         return {
             "id": p.id, "status": p.status, "method": p.get_method_display(), "amount": str(p.amount_inr),
-            "currency": p.currency, "submitted_at": p.submitted_at,
+            "currency": p.currency, "submitted_at": p.submitted_at, "coupon_code": coupon_code(p.due),
         }
+
+    def get_coupon_code(self, obj: Subscription) -> str | None:
+        """F-21: the code on this subscription's latest payment, or None."""
+        p = billing.latest_payment(obj)
+        return coupon_code(p.due) if p is not None else None
 
     def get_invoices(self, obj: Subscription) -> list[dict[str, Any]]:
         return [

@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views
+from . import coupons, views
 
 app_name = "z_adminapi"
 
@@ -42,6 +42,10 @@ urlpatterns = [
     path("releases/reach/", views.ReleaseReachView.as_view(), name="release-reach"),
     path("releases/<int:pk>/", views.ReleaseDetailView.as_view(), name="release-detail"),
     path("announcements/", views.AnnouncementListView.as_view(), name="announcements"),
+    path("coupons/", coupons.CouponListView.as_view(), name="coupons"),
+    path("coupons/suggest/", coupons.CouponSuggestView.as_view(), name="coupon-suggest"),
+    path("coupons/<int:pk>/", coupons.CouponDetailView.as_view(), name="coupon-detail"),
+    path("coupons/<int:pk>/uses/", coupons.CouponUsesView.as_view(), name="coupon-uses"),
     path("zingles/", views.ZingleListView.as_view(), name="zingles"),
     path("zingles/<int:pk>/", views.ZingleDetailView.as_view(), name="zingle-detail"),
     path("owners/search/", views.OwnerSearchView.as_view(), name="owner-search"),
