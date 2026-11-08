@@ -94,7 +94,10 @@ class ChatMessage(models.Model):
 class ChatReport(models.Model):
     """A member reported a line (or a whole chat) to the owner. Only the reported part reaches the owner."""
 
-    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="reports")
+    # Null once the owner deleted the group: the report stays, with the chat's kind and name kept below.
+    conversation = models.ForeignKey(Conversation, null=True, blank=True, on_delete=models.SET_NULL, related_name="reports")
+    conversation_kind = models.CharField(max_length=8, blank=True, default="")
+    conversation_name = models.CharField(max_length=60, blank=True, default="")
     message = models.ForeignKey(ChatMessage, null=True, blank=True, on_delete=models.SET_NULL, related_name="reports")
     reporter = models.ForeignKey("z_devices.Member", on_delete=models.CASCADE, related_name="chat_reports")
     note = models.TextField(blank=True, max_length=1000)
@@ -116,6 +119,9 @@ class ChatSettings(models.Model):
     owner = models.OneToOneField("z_auth.User", on_delete=models.CASCADE, related_name="chat_settings")
     # Members may start direct chats with teammates they share a group with.
     allow_member_dm = models.BooleanField(default=True)
+    # The owner's own Chat list settings, the same on every browser: {"pins": ["p7", "g3"], "muted": [...],
+    # "marked": [...]} ("p<member id>" = the owner's chat with that person, "g<group id>" = a group).
+    owner_prefs = models.JSONField(default=dict, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self) -> str:

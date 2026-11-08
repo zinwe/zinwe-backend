@@ -15,4 +15,5 @@ urlpatterns = [
     path("reports/", views.ReportListView.as_view(), name="reports"),
     path("reports/<int:report_id>/handled/", views.ReportHandledView.as_view(), name="report-handled"),
     path("settings/", views.SettingsView.as_view(), name="settings"),
+    path("prefs/", views.PrefsView.as_view(), name="prefs"),
 ]

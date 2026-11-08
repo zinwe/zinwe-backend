@@ -7,6 +7,8 @@ reach the owner is a line a member chose to report (ChatReport keeps a copy of j
 """
 from __future__ import annotations
 
+import re
+
 from datetime import datetime, timedelta
 from typing import Any, Iterable
 
@@ -68,6 +70,52 @@ def update_settings(owner: User, data: dict[str, Any]) -> ChatSettings:
         row.allow_member_dm = bool(data["allow_member_dm"])
         row.save()
     return row
+
+
+PREF_KEY = re.compile(r"^[pg][1-9][0-9]{0,9}$")
+PREF_LISTS = ("pins", "muted", "marked")
+
+
+def owner_prefs(owner: User) -> dict[str, list[str]]:
+    """The owner's Chat list settings (pins in pin order, muted, marked as unread), kept on the server so every
+    browser shows the same list. A group pinned or muted through PATCH groups/<id>/ shows here too."""
+    stored = settings_for(owner).owner_prefs or {}
+    out = {k: [x for x in stored.get(k, []) if isinstance(x, str) and PREF_KEY.match(x)] for k in PREF_LISTS}
+    groups = Conversation.objects.filter(owner=owner, kind=GROUP).values_list("pk", "owner_pinned", "owner_muted")
+    live = set()
+    for pk, pinned, muted in groups:
+        key = f"g{pk}"
+        live.add(key)
+        if pinned and key not in out["pins"] and len(out["pins"]) < MAX_PINS:
+            out["pins"].append(key)
+        if muted and key not in out["muted"]:
+            out["muted"].append(key)
+    for k in PREF_LISTS:  # a deleted group drops out
+        out[k] = [x for x in out[k] if x.startswith("p") or x in live]
+    return out
+
+
+@transaction.atomic
+def save_owner_prefs(owner: User, data: dict[str, Any]) -> dict[str, list[str]]:
+    clean: dict[str, list[str]] = {}
+    for k in PREF_LISTS:
+        raw = data.get(k, [])
+        if not isinstance(raw, list) or len(raw) > 1000 or not all(isinstance(x, str) and PREF_KEY.match(x) for x in raw):
+            raise ChatRefused("A list of chat keys like p7 or g3.", field=k)
+        clean[k] = list(dict.fromkeys(raw))
+    if len(clean["pins"]) > MAX_PINS:
+        raise ChatRefused(f"You can pin up to {MAX_PINS} chats.", field="pins")
+    row, _ = ChatSettings.objects.get_or_create(owner=owner)
+    row.owner_prefs = clean
+    row.save(update_fields=["owner_prefs", "updated_at"])
+    groups = Conversation.objects.filter(owner=owner, kind=GROUP)
+    pinned = {int(x[1:]) for x in clean["pins"] if x[0] == "g"}
+    muted = {int(x[1:]) for x in clean["muted"] if x[0] == "g"}
+    groups.exclude(pk__in=pinned).filter(owner_pinned=True).update(owner_pinned=False)
+    groups.filter(pk__in=pinned).update(owner_pinned=True)
+    groups.exclude(pk__in=muted).filter(owner_muted=True).update(owner_muted=False)
+    groups.filter(pk__in=muted).update(owner_muted=True)
+    return owner_prefs(owner)
 
 
 def chat_floor(owner: User, now: datetime | None = None) -> datetime | None:
@@ -136,6 +184,20 @@ def create_group(owner: User, name: str, icon: str = "", member_ids: list[int] |
         text += " Only you can post here."
     system_line(group, text, now)
     return group_for_owner(owner, group.pk)  # type: ignore[return-value]
+
+
+@transaction.atomic
+def delete_group(owner: User, group: Conversation) -> None:
+    """DELETE groups/<id>/: the group and everything said in it go for everyone. Its task cards' tasks stay (they
+    just lose the group), and reports about it stay with the group's name."""
+    key = f"g{group.pk}"
+    ChatReport.objects.filter(conversation=group).update(conversation_kind=GROUP, conversation_name=group.name)
+    group.delete()
+    row = ChatSettings.objects.filter(owner=owner).first()
+    if row and row.owner_prefs:
+        prefs = {k: [x for x in v if x != key] for k, v in row.owner_prefs.items() if isinstance(v, list)}
+        row.owner_prefs = prefs
+        row.save(update_fields=["owner_prefs", "updated_at"])
 
 
 @transaction.atomic
@@ -485,7 +547,8 @@ def report(conv: Conversation, row: ConversationMember, member: Member, message_
     if line is None and not note:
         raise ChatRefused("Say what is wrong.", field="note")
     return ChatReport.objects.create(
-        conversation=conv, message=line, reporter=member, note=note,
+        conversation=conv, conversation_kind=conv.kind, conversation_name=conv.name if conv.kind == GROUP else "",
+        message=line, reporter=member, note=note,
         message_body=line.body if line else "",
         message_by=(line.sender_member.name if line.sender_member_id else owner_name(conv.owner)) if line else "",
         message_at=line.created_at if line else None,
@@ -493,13 +556,13 @@ def report(conv: Conversation, row: ConversationMember, member: Member, message_
 
 
 def reports_for_owner(owner: User) -> QuerySet:
-    return ChatReport.objects.filter(conversation__owner=owner).select_related("conversation", "reporter").order_by(
+    return ChatReport.objects.filter(reporter__owner=owner).select_related("conversation", "reporter").order_by(
         "handled_at", "-created_at", "-id"
     )
 
 
 def handle_report(owner: User, report_id: int) -> ChatReport | None:
-    row = ChatReport.objects.filter(conversation__owner=owner, pk=report_id).first()
+    row = ChatReport.objects.filter(reporter__owner=owner, pk=report_id).first()
     if row is not None and row.handled_at is None:
         row.handled_at = timezone.now()
         row.save(update_fields=["handled_at"])
@@ -635,7 +698,12 @@ def conversation_json(conv: Conversation, row: ConversationMember, member: Membe
 def report_json(row: ChatReport) -> dict[str, Any]:
     """A report as the owner sees it: the reported line only (never the rest of a direct chat)."""
     conv = row.conversation
-    if conv.kind == GROUP:
+    if conv is None:  # the owner deleted the group; a direct chat is never deleted by the owner
+        if row.conversation_kind == DIRECT:
+            where = {"id": None, "kind": DIRECT, "name": "A chat between team members"}
+        else:
+            where = {"id": None, "kind": GROUP, "name": f"{row.conversation_name or 'A group'} (deleted)"}
+    elif conv.kind == GROUP:
         where = {"id": conv.pk, "kind": GROUP, "name": conv.name}
     else:
         where = {"id": None, "kind": DIRECT, "name": "A chat between team members"}

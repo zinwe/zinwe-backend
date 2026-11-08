@@ -318,6 +318,60 @@ class ReportTests(ChatCase):
         self.assertIsNotNone(ChatReport.objects.get().handled_at)
 
 
+class DeleteGroupAndPrefsTests(ChatCase):
+    def test_owner_deletes_a_group_for_everyone_reports_and_tasks_stay(self) -> None:
+        from z_devices.models import Task
+
+        g = self.make_group(ids=[self.karan.id, self.emily.id])
+        self.device(self.karan_token)
+        bad = self.client.post(f"{DEVICE_CHAT}{g['id']}/messages/", {"body": "rude line"}, format="json").json()
+        self.device(self.emily_token)
+        self.assertEqual(self.client.post(f"{DEVICE_CHAT}{g['id']}/report/", {"message_id": bad["id"]},
+                                          format="json").status_code, 201)
+        task = Task.objects.create(owner=self.owner, member=self.karan, title="Hero", group_id=g["id"])
+        self.as_owner()
+        self.client.put("/api/chat/prefs/", {"pins": [f"g{g['id']}", f"p{self.karan.id}"], "muted": [], "marked": []},
+                        format="json")
+        r = self.client.delete(f"{GROUPS}{g['id']}/")
+        self.assertEqual(r.status_code, 204)
+        self.assertEqual(self.client.get(f"{GROUPS}{g['id']}/").status_code, 404)
+        self.assertFalse(ChatMessage.objects.filter(conversation_id=g["id"]).exists())
+        task.refresh_from_db()
+        self.assertIsNone(task.group_id)
+        rep = self.client.get("/api/chat/reports/").json()[0]
+        self.assertEqual(rep["conversation"], {"id": None, "kind": "group", "name": "Design (deleted)"})
+        self.assertEqual(rep["message"]["body"], "rude line")
+        self.assertEqual(self.client.get("/api/chat/prefs/").json()["pins"], [f"p{self.karan.id}"])
+        self.device(self.karan_token)
+        self.assertEqual([c["id"] for c in self.client.get(DEVICE_CHAT).json() if c["kind"] == "group"], [])
+        self.assertEqual(self.client.get(f"{DEVICE_CHAT}{g['id']}/messages/").status_code, 404)
+
+    def test_a_direct_chat_cannot_be_deleted_by_the_owner(self) -> None:
+        self.make_group(ids=[self.karan.id, self.emily.id])
+        self.device(self.karan_token)
+        direct = self.client.post(f"{DEVICE_CHAT}direct/", {"member_id": self.emily.id}, format="json").json()
+        self.as_owner()
+        self.assertEqual(self.client.delete(f"{GROUPS}{direct['id']}/").status_code, 404)
+        self.assertTrue(Conversation.objects.filter(pk=direct["id"]).exists())
+
+    def test_owner_prefs_round_trip_and_mirror_group_flags(self) -> None:
+        g = self.make_group()
+        self.as_owner()
+        self.assertEqual(self.client.get("/api/chat/prefs/").json(), {"pins": [], "muted": [], "marked": []})
+        body = {"pins": [f"p{self.karan.id}", f"g{g['id']}"], "muted": [f"g{g['id']}"], "marked": [f"p{self.emily.id}"]}
+        r = self.client.put("/api/chat/prefs/", body, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json(), body)
+        group = self.client.get(f"{GROUPS}{g['id']}/").json()
+        self.assertEqual((group["pinned"], group["muted"]), (True, True))
+        self.client.patch(f"{GROUPS}{g['id']}/", {"muted": False}, format="json")
+        self.assertEqual(self.client.get("/api/chat/prefs/").json()["pins"], body["pins"])
+        r = self.client.put("/api/chat/prefs/", {"pins": ["p1", "p2", "p3", "p4"], "muted": [], "marked": []}, format="json")
+        self.assertEqual(r.json(), {"pins": ["You can pin up to 3 chats."]})
+        r = self.client.put("/api/chat/prefs/", {"pins": ["x1"], "muted": [], "marked": []}, format="json")
+        self.assertEqual(r.status_code, 400)
+
+
 class RetentionTests(ChatCase):
     def test_lines_past_the_plan_window_are_hidden_then_pruned(self) -> None:
         g = self.make_group()

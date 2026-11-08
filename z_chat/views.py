@@ -85,7 +85,7 @@ class GroupListView(_OwnerView):
 
 
 class GroupDetailView(_OwnerView):
-    """GET /api/chat/groups/<id>/; PATCH {name?, icon?, member_ids?, announce?, pinned?, muted?} -> Group."""
+    """GET /api/chat/groups/<id>/; PATCH {name?, icon?, member_ids?, announce?, pinned?, muted?} -> Group; DELETE -> 204."""
 
     def get(self, request: Request, group_id: int) -> Response:
         return Response(services.group_json(self.group(request, group_id), request))
@@ -99,6 +99,10 @@ class GroupDetailView(_OwnerView):
         except services.ChatRefused as exc:
             return _refused(exc)
         return Response(services.group_json(group, request))
+
+    def delete(self, request: Request, group_id: int) -> Response:
+        services.delete_group(request.user, self.group(request, group_id))
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class GroupMessagesView(_OwnerView):
@@ -198,6 +202,25 @@ class SettingsView(_OwnerView):
         return Response({"allow_member_dm": row.allow_member_dm})
 
     put = patch
+
+
+class PrefsView(APIView):
+    """GET|PUT /api/chat/prefs/ -- the owner's Chat list settings {pins, muted, marked}, the same on every browser.
+    Not behind the team-chat plan check: the owner's own chats with each person use it too."""
+
+    permission_classes = [IsOwner]
+
+    def get(self, request: Request) -> Response:
+        return Response(services.owner_prefs(request.user))
+
+    def put(self, request: Request) -> Response:
+        data = request.data if isinstance(request.data, dict) else {}
+        try:
+            return Response(services.save_owner_prefs(request.user, data))
+        except services.ChatRefused as exc:
+            return _refused(exc)
+
+    patch = put
 
 
 # --- Device (the member's Zinwe window) ----------------------------------------------------
