@@ -8,7 +8,11 @@ they share a group with, and only while the owner's `allow_member_dm` is on. Rul
 """
 from __future__ import annotations
 
-from django.db import models
+import uuid
+from pathlib import Path
+
+from django.conf import settings
+from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -119,6 +123,9 @@ class ChatSettings(models.Model):
     owner = models.OneToOneField("z_auth.User", on_delete=models.CASCADE, related_name="chat_settings")
     # Members may start direct chats with teammates they share a group with.
     allow_member_dm = models.BooleanField(default=True)
+    # v1.5: anyone in the company may share files in chat (the owner included). db_default too, so the previous
+    # release (which doesn't know the column) can still create settings rows.
+    allow_files = models.BooleanField(default=True, db_default=True)
     # The owner's own Chat list settings, the same on every browser: {"pins": ["p7", "g3"], "muted": [...],
     # "marked": [...]} ("p<member id>" = the owner's chat with that person, "g<group id>" = a group).
     owner_prefs = models.JSONField(default=dict, blank=True)
@@ -126,3 +133,75 @@ class ChatSettings(models.Model):
 
     def __str__(self) -> str:
         return f"Chat settings for {self.owner_id}"
+
+
+class ChatFile(models.Model):
+    """
+    v1.5 file sharing in chat ("send and forget"): one file, uploaded once, attached to one line of a group or direct
+    chat (`chat_line`) or of the owner <-> member admin chat (`member_message`). Kept FILE_KEEP_DAYS after the line was
+    posted, then the disk file goes (`deleted_at`) and the row stays so the line says "no longer available". Stored at
+    <CHAT_FILES_ROOT>/<owner_id>/<id> (outside MEDIA_ROOT: never in the backups). Rules: z_chat.files.
+
+    Privacy: never registered in the Django admin, so a file of a direct chat is never visible there.
+    """
+
+    class Kind(models.TextChoices):
+        IMAGE = "image", "Image"
+        FILE = "file", "File"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="chat_files")
+    # Null = the owner uploaded it.
+    by_member = models.ForeignKey(
+        "z_devices.Member", null=True, blank=True, on_delete=models.CASCADE, related_name="chat_files"
+    )
+    name = models.CharField(max_length=200)
+    mime = models.CharField(max_length=100, blank=True)  # as the sender claimed it; informational only
+    size = models.BigIntegerField()
+    sha256 = models.CharField(max_length=64)
+    kind = models.CharField(max_length=8, choices=Kind.choices, default=Kind.FILE)
+    caption = models.TextField(blank=True, max_length=4000)
+    chat_line = models.OneToOneField(
+        ChatMessage, null=True, blank=True, on_delete=models.CASCADE, related_name="chat_file"
+    )
+    member_message = models.OneToOneField(
+        "z_devices.Message", null=True, blank=True, on_delete=models.CASCADE, related_name="chat_file"
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    attached_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    # The disk file was removed (expired); the row stays so the line says "no longer available".
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["owner", "by_member", "attached_at"]),
+            models.Index(fields=["expires_at", "deleted_at"]),
+            models.Index(fields=["attached_at", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"Chat file {self.pk}"
+
+    @property
+    def path(self) -> Path:
+        return Path(settings.CHAT_FILES_ROOT) / str(self.owner_id) / str(self.pk)
+
+
+def remove_chat_file(path: Path) -> None:
+    """Remove a stored chat file; already gone is fine."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _chat_file_deleted(sender: type, instance: ChatFile, **kwargs: object) -> None:
+    """A ChatFile row went (its line was deleted, chat history clean-up, any cascade): the disk file goes too, once the
+    delete is committed (a rolled-back delete keeps it)."""
+    path = instance.path
+    transaction.on_commit(lambda: remove_chat_file(path))
+
+
+models.signals.post_delete.connect(_chat_file_deleted, sender=ChatFile, dispatch_uid="z_chat_chat_file_deleted")

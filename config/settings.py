@@ -200,6 +200,9 @@ WHITENOISE_AUTOREFRESH = DEBUG
 # staff download through the admin, owners through an authenticated endpoint.
 MEDIA_ROOT = Path(env_str("DJANGO_MEDIA_ROOT", str(BASE_DIR / "media")))
 MEDIA_URL = "media/"
+# v1.5 files shared in chat (z_chat.files): kept 7 days, then deleted. Deliberately NOT under MEDIA_ROOT, so they
+# never go into the daily backups or B2. Served only through the authenticated download endpoints.
+CHAT_FILES_ROOT = Path(env_str("DJANGO_CHAT_FILES_ROOT", str(BASE_DIR / "chatfiles")))
 # Uploads above this size are streamed to a temp file instead of memory.
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2_621_440  # 2.5 MB
 # Non-file request body limit (JSON, form fields). Files don't count towards it.

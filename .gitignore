@@ -7,4 +7,5 @@ __pycache__/
 *.log
 staticfiles/
 media/
+chatfiles/
 sent-emails/
