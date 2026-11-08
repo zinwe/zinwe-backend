@@ -16,4 +16,7 @@ urlpatterns = [
     path("reports/<int:report_id>/handled/", views.ReportHandledView.as_view(), name="report-handled"),
     path("settings/", views.SettingsView.as_view(), name="settings"),
     path("prefs/", views.PrefsView.as_view(), name="prefs"),
+    # v1.5 file sharing: upload, then download (never a direct chat's file for the owner).
+    path("files/", views.FileUploadView.as_view(), name="files"),
+    path("files/<uuid:file_id>/", views.FileView.as_view(), name="file"),
 ]

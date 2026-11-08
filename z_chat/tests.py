@@ -199,9 +199,10 @@ class DevicePrivacyTests(ChatCase):
         r = self.client.post(f"{DEVICE_CHAT}direct/", {"member_id": self.jake.id}, format="json")
         self.assertEqual(r.json(), {"member_id": ["You can message people you share a group with."]})
         self.as_owner()
-        self.assertEqual(self.client.get("/api/chat/settings/").json(), {"allow_member_dm": True})
-        self.assertEqual(self.client.patch("/api/chat/settings/", {"allow_member_dm": False}, format="json").json(),
-                         {"allow_member_dm": False})
+        # v1.5 added the file-sharing keys (allow_files, file_max_bytes, file_keep_days) next to it.
+        self.assertTrue(self.client.get("/api/chat/settings/").json()["allow_member_dm"])
+        self.assertFalse(
+            self.client.patch("/api/chat/settings/", {"allow_member_dm": False}, format="json").json()["allow_member_dm"])
         self.device(self.karan_token)
         r = self.client.post(f"{DEVICE_CHAT}direct/", {"member_id": self.emily.id}, format="json")
         self.assertEqual(r.status_code, 403)

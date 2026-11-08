@@ -8,6 +8,7 @@ from typing import Any
 
 from django.http import Http404
 from rest_framework import serializers, status
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -15,7 +16,7 @@ from rest_framework.views import APIView
 from z_auth import entitlements as plan
 from z_devices.authentication import DeviceScopedThrottle, DeviceTokenAuthentication, IsDevice, IsOwner
 
-from . import services
+from . import files, services
 from .models import ChatMessage
 
 
@@ -34,9 +35,34 @@ class GroupInSerializer(serializers.Serializer):
     muted = serializers.BooleanField(required=False)
 
 
-class LineInSerializer(serializers.Serializer):
+class FileOptionalMixin:
+    """v1.5: with a `file_id` the text field (`optional_with_file`) may be blank or left out (it becomes the caption).
+    Without one it stays required exactly as before, so old clients see the same errors."""
+
+    optional_with_file: tuple[str, ...] = ()
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[call-arg]
+        data = kwargs.get("data")
+        if hasattr(data, "get") and data.get("file_id"):
+            for name in self.optional_with_file:
+                f = self.fields[name]  # type: ignore[attr-defined]
+                f.required = False
+                f.allow_blank = True
+                f.default = ""
+
+
+def file_id_field() -> serializers.UUIDField:
+    return serializers.UUIDField(required=False, allow_null=True, default=None,
+                                 error_messages={"invalid": files.NOT_FOUND})
+
+
+class LineInSerializer(FileOptionalMixin, serializers.Serializer):
+    optional_with_file = ("body",)
+
     body = serializers.CharField(max_length=services.BODY_MAX, trim_whitespace=True)
     reply_to = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
+    file_id = file_id_field()
 
 
 class LineEditSerializer(serializers.Serializer):
@@ -113,22 +139,23 @@ class GroupMessagesView(_OwnerView):
         q = PageQuerySerializer(data=request.query_params)
         q.is_valid(raise_exception=True)
         lines = services.page(group, None, q.validated_data["before"], q.validated_data["after"], q.validated_data["limit"])
-        return Response(services.lines_json(lines, group, None))
+        return Response(services.lines_json(lines, group, None, request))
 
     def post(self, request: Request, group_id: int) -> Response:
         group = self.group(request, group_id)
         data = LineInSerializer(data=request.data)
         data.is_valid(raise_exception=True)
         try:
-            line = services.post(group, data.validated_data["body"], None, None, data.validated_data["reply_to"])
+            line = services.post(group, data.validated_data["body"], None, None, data.validated_data["reply_to"],
+                                 file_id=data.validated_data["file_id"])
         except services.ChatRefused as exc:
             return _refused(exc)
-        return Response(services.line_json(line, group, None, services.readers(group)), status=status.HTTP_201_CREATED)
+        return Response(services.line_json(line, group, None, services.readers(group), request), status=status.HTTP_201_CREATED)
 
 
 def _line(group: Any, line_id: int) -> ChatMessage:
     line = ChatMessage.objects.filter(conversation=group, pk=line_id).select_related(
-        "sender_member", "reply_to__sender_member").first()
+        "sender_member", "reply_to__sender_member", "chat_file").first()
     if line is None:
         raise Http404
     return line
@@ -145,7 +172,7 @@ class GroupMessageView(_OwnerView):
             line = services.edit(_line(group, line_id), data.validated_data["body"], None)
         except services.ChatRefused as exc:
             return _refused(exc)
-        return Response(services.line_json(line, group, None, services.readers(group)))
+        return Response(services.line_json(line, group, None, services.readers(group), request))
 
     def delete(self, request: Request, group_id: int, line_id: int) -> Response:
         group = self.group(request, group_id)
@@ -153,7 +180,7 @@ class GroupMessageView(_OwnerView):
             line = services.delete(_line(group, line_id), None)
         except services.ChatRefused as exc:
             return _refused(exc)
-        return Response(services.line_json(line, group, None, services.readers(group)))
+        return Response(services.line_json(line, group, None, services.readers(group), request))
 
 
 class GroupReadView(_OwnerView):
@@ -189,19 +216,69 @@ class ReportHandledView(_OwnerView):
 
 
 class SettingsView(_OwnerView):
-    """GET|PATCH /api/chat/settings/ -- {allow_member_dm}."""
+    """GET|PATCH /api/chat/settings/ -- {allow_member_dm, allow_files, file_max_bytes, file_keep_days}; the last two
+    are read-only. A PATCH sends either switch or both."""
 
     def get(self, request: Request) -> Response:
-        return Response({"allow_member_dm": services.settings_for(request.user).allow_member_dm})
+        return Response(services.settings_json(services.settings_for(request.user)))
 
     def patch(self, request: Request) -> Response:
-        value = request.data.get("allow_member_dm")
-        if not isinstance(value, bool):
+        data = request.data if hasattr(request.data, "get") else {}
+        keys = [k for k in ("allow_member_dm", "allow_files") if k in data]
+        if not keys:
             return Response({"allow_member_dm": ["true or false."]}, status=status.HTTP_400_BAD_REQUEST)
-        row = services.update_settings(request.user, {"allow_member_dm": value})
-        return Response({"allow_member_dm": row.allow_member_dm})
+        for k in keys:
+            if not isinstance(data.get(k), bool):
+                return Response({k: ["true or false."]}, status=status.HTTP_400_BAD_REQUEST)
+        row = services.update_settings(request.user, {k: data[k] for k in keys})
+        return Response(services.settings_json(row))
 
     put = patch
+
+
+# --- Files (v1.5) ----------------------------------------------------------------------------------------------------
+
+
+def _upload(request: Request, owner: Any, member: Any) -> Response:
+    """POST (multipart `file`) -> 201 FileJSON, not attached yet."""
+    if not services.settings_for(owner).allow_files:
+        return Response({"detail": files.SHARING_OFF}, status=status.HTTP_403_FORBIDDEN)
+    if files.body_too_big(request.META.get("CONTENT_LENGTH")):  # refused before the body is read
+        return Response({"file": [files.TOO_BIG]}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        row = files.store_upload(request.FILES.get("file"), owner.pk, member.pk if member is not None else None)
+    except files.FileRefused as exc:
+        return Response({exc.field: [exc.message]}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(files.file_json(row, request, device=member is not None), status=status.HTTP_201_CREATED)
+
+
+def _download(request: Request, row: Any) -> Any:
+    if files.is_gone(row):
+        return Response({"detail": files.GONE}, status=status.HTTP_410_GONE)
+    response = files.download(row, inline=request.query_params.get("inline") == "1")
+    if response is None:
+        return Response({"detail": files.GONE}, status=status.HTTP_410_GONE)
+    return response
+
+
+class FileUploadView(_OwnerView):
+    """POST /api/chat/files/ (multipart `file`) -> 201 FileJSON (owner)."""
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request: Request) -> Response:
+        return _upload(request, request.user, None)
+
+
+class FileView(_OwnerView):
+    """GET /api/chat/files/<uuid>/[?inline=1] -- groups, the owner's admin chats and own uploads. Never a direct chat's
+    file (404). Expired -> 410."""
+
+    def get(self, request: Request, file_id: Any) -> Any:
+        row = files.find(file_id)
+        if row is None or not files.owner_may_get(request.user, row):
+            raise Http404
+        return _download(request, row)
 
 
 class PrefsView(APIView):
@@ -289,17 +366,18 @@ class DeviceMessagesView(_DeviceView):
         limit = q.validated_data["limit"] if "limit" in request.query_params else (
             services.MAX_PAGE if q.validated_data["after"] else services.PAGE)
         lines = services.page(conv, row, q.validated_data["before"], q.validated_data["after"], limit)
-        return Response(services.lines_json(lines, conv, member))
+        return Response(services.lines_json(lines, conv, member, request))
 
     def post(self, request: Request, conversation_id: int) -> Response:
         member, conv, row = self.conv(request, conversation_id)
         data = LineInSerializer(data=request.data)
         data.is_valid(raise_exception=True)
         try:
-            line = services.post(conv, data.validated_data["body"], member, row, data.validated_data["reply_to"])
+            line = services.post(conv, data.validated_data["body"], member, row, data.validated_data["reply_to"],
+                                 file_id=data.validated_data["file_id"])
         except services.ChatRefused as exc:
             return _refused(exc)
-        return Response(services.line_json(line, conv, member, services.readers(conv)), status=status.HTTP_201_CREATED)
+        return Response(services.line_json(line, conv, member, services.readers(conv), request), status=status.HTTP_201_CREATED)
 
 
 class DeviceMessageView(_DeviceView):
@@ -307,7 +385,7 @@ class DeviceMessageView(_DeviceView):
 
     def _line(self, conv: Any, row: Any, line_id: int) -> ChatMessage:
         line = services.visible_lines(conv, row).filter(pk=line_id).select_related(
-            "sender_member", "reply_to__sender_member").first()
+            "sender_member", "reply_to__sender_member", "chat_file").first()
         if line is None:
             raise Http404
         return line
@@ -320,7 +398,7 @@ class DeviceMessageView(_DeviceView):
             line = services.edit(self._line(conv, row, line_id), data.validated_data["body"], member)
         except services.ChatRefused as exc:
             return _refused(exc)
-        return Response(services.line_json(line, conv, member, services.readers(conv)))
+        return Response(services.line_json(line, conv, member, services.readers(conv), request))
 
     def delete(self, request: Request, conversation_id: int, line_id: int) -> Response:
         member, conv, row = self.conv(request, conversation_id)
@@ -328,7 +406,7 @@ class DeviceMessageView(_DeviceView):
             line = services.delete(self._line(conv, row, line_id), member)
         except services.ChatRefused as exc:
             return _refused(exc)
-        return Response(services.line_json(line, conv, member, services.readers(conv)))
+        return Response(services.line_json(line, conv, member, services.readers(conv), request))
 
 
 class DeviceReadView(_DeviceView):
@@ -378,6 +456,36 @@ class DeviceReportView(_DeviceView):
         except services.ChatRefused as exc:
             return _refused(exc)
         return Response({"id": report.pk, "ok": True}, status=status.HTTP_201_CREATED)
+
+
+class DeviceFilesView(_DeviceView):
+    """GET /api/devices/chat/files/ -> {allowed, max_bytes, keep_days}; POST (multipart `file`) -> 201 FileJSON."""
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    def get(self, request: Request) -> Response:
+        allowed = bool(request.auth.member_id) and services.files_allowed(request.auth.owner)
+        return Response({"allowed": allowed, "max_bytes": files.FILE_MAX_BYTES, "keep_days": files.FILE_KEEP_DAYS})
+
+    def post(self, request: Request) -> Response:
+        if not self.allowed(request):
+            raise plan.FeatureLocked(plan.TEAM_CHAT)
+        member = self.member(request)
+        return _upload(request, request.auth.owner, member)
+
+
+class DeviceFileView(_DeviceView):
+    """GET /api/devices/chat/files/<uuid>/[?inline=1] -- files in chats the member can see, their admin chat, their own
+    uploads. Expired -> 410."""
+
+    def get(self, request: Request, file_id: Any) -> Any:
+        if not self.allowed(request):
+            raise plan.FeatureLocked(plan.TEAM_CHAT)
+        member = self.member(request)
+        row = files.find(file_id)
+        if row is None or not files.member_may_get(member, row):
+            raise Http404
+        return _download(request, row)
 
 
 class DevicePeopleView(_DeviceView):

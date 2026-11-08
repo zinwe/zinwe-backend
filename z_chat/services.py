@@ -16,10 +16,11 @@ from django.db import IntegrityError, transaction
 from django.db.models import Q, QuerySet
 from django.utils import timezone
 
-from z_auth.entitlements import entitlements_for
+from z_auth.entitlements import TEAM_CHAT, entitlements_for
 from z_auth.models import User
 from z_devices.models import Member
 
+from . import files
 from .models import ChatMessage, ChatReport, ChatSettings, Conversation, ConversationMember
 
 EDIT_WINDOW = timedelta(minutes=15)
@@ -66,10 +67,27 @@ def settings_for(owner: User) -> ChatSettings:
 
 def update_settings(owner: User, data: dict[str, Any]) -> ChatSettings:
     row, _ = ChatSettings.objects.get_or_create(owner=owner)
-    if "allow_member_dm" in data:
-        row.allow_member_dm = bool(data["allow_member_dm"])
+    changed = False
+    for key in ("allow_member_dm", "allow_files"):
+        if key in data:
+            setattr(row, key, bool(data[key]))
+            changed = True
+    if changed:
         row.save()
     return row
+
+
+def settings_json(row: ChatSettings) -> dict[str, Any]:
+    """GET|PATCH /api/chat/settings/ (file_max_bytes and file_keep_days are read-only)."""
+    return {
+        "allow_member_dm": row.allow_member_dm, "allow_files": row.allow_files,
+        "file_max_bytes": files.FILE_MAX_BYTES, "file_keep_days": files.FILE_KEEP_DAYS,
+    }
+
+
+def files_allowed(owner: User) -> bool:
+    """v1.5: may anyone in this company upload a chat file now (the team-chat plan and the owner's switch)."""
+    return entitlements_for(owner).has(TEAM_CHAT) and settings_for(owner).allow_files
 
 
 PREF_KEY = re.compile(r"^[pg][1-9][0-9]{0,9}$")
@@ -423,7 +441,7 @@ def visible_lines(conv: Conversation, row: ConversationMember | None) -> QuerySe
 def page(conv: Conversation, row: ConversationMember | None, before: int | None = None, after: int | None = None,
          limit: int = PAGE) -> list[ChatMessage]:
     limit = max(1, min(limit or PAGE, MAX_PAGE))
-    qs = visible_lines(conv, row).select_related("sender_member", "reply_to__sender_member")
+    qs = visible_lines(conv, row).select_related("sender_member", "reply_to__sender_member", "chat_file")
     if after:
         return list(qs.filter(pk__gt=after).order_by("created_at", "id")[:limit])
     if before:
@@ -459,15 +477,26 @@ def _clean_body(body: str) -> str:
 
 @transaction.atomic
 def post(conv: Conversation, body: str, member: Member | None, row: ConversationMember | None = None,
-         reply_to_id: int | None = None, task: Any = None) -> ChatMessage:
-    """A line by a member (row = theirs) or by the owner (member None, groups only)."""
+         reply_to_id: int | None = None, task: Any = None, file_id: Any = None) -> ChatMessage:
+    """A line by a member (row = theirs) or by the owner (member None, groups only). v1.5: with `file_id` (the
+    sender's own upload) the line carries that file; `body` is then its caption and may be blank, and the stored body
+    is the fallback text old clients show."""
     if member is None and conv.kind != GROUP:
         raise ChatRefused("Not found.", forbidden=True)
     if not can_post(conv, row, member):
         if member is not None and conv.kind == GROUP and conv.announce and row is not None and row.left_at is None:
             raise ChatRefused("Only the admin can post in this group.", forbidden=True)
         raise ChatRefused("You can't post in this chat.", forbidden=True)
-    body = _clean_body(body)
+    chat_file = caption = None
+    if file_id:
+        try:
+            chat_file = files.claim(conv.owner_id, member.pk if member else None, file_id)
+        except files.FileRefused as exc:
+            raise ChatRefused(exc.message, field=exc.field) from None
+        caption = files.clean_caption(body)
+        body = files.fallback_body(chat_file, caption)[:BODY_MAX]
+    else:
+        body = _clean_body(body)
     reply_to = None
     if reply_to_id:
         reply_to = visible_lines(conv, row).filter(pk=reply_to_id, system=False).first()
@@ -477,6 +506,12 @@ def post(conv: Conversation, body: str, member: Member | None, row: Conversation
     line = ChatMessage.objects.create(
         conversation=conv, sender_member=member, body=body, reply_to=reply_to, task=task, created_at=now,
     )
+    if chat_file is not None:
+        try:
+            files.attach(chat_file, caption or "", line=line)
+        except files.FileRefused as exc:
+            raise ChatRefused(exc.message, field=exc.field) from None
+        line.chat_file = chat_file
     Conversation.objects.filter(pk=conv.pk).update(last_message_at=now)
     if member is None:
         Conversation.objects.filter(pk=conv.pk).update(owner_last_read_at=now)
@@ -507,18 +542,22 @@ def _own_recent(line: ChatMessage, member: Member | None) -> None:
 
 def edit(line: ChatMessage, body: str, member: Member | None) -> ChatMessage:
     _own_recent(line, member)
+    if files.file_of(line) is not None:
+        raise ChatRefused(files.NO_EDIT, field="body")
     line.body = _clean_body(body)
     line.edited_at = timezone.now()
     line.save(update_fields=["body", "edited_at"])
     return line
 
 
+@transaction.atomic
 def delete(line: ChatMessage, member: Member | None) -> ChatMessage:
-    """Delete for everyone: the text is gone for good (the line stays as "deleted")."""
+    """Delete for everyone: the text is gone for good (the line stays as "deleted"), and its file too (v1.5)."""
     _own_recent(line, member)
     line.body = ""
     line.deleted_at = timezone.now()
     line.save(update_fields=["body", "deleted_at"])
+    files.drop(line)
     return line
 
 
@@ -607,7 +646,9 @@ def readers(conv: Conversation) -> list[tuple[int | None, str, datetime | None]]
 
 
 def line_json(line: ChatMessage, conv: Conversation, viewer_member: Member | None,
-              who_read: list[tuple[int | None, str, datetime | None]] | None = None) -> dict[str, Any]:
+              who_read: list[tuple[int | None, str, datetime | None]] | None = None,
+              request: Any = None) -> dict[str, Any]:
+    """A line. v1.5 `file`: FileJSON or null (null on a deleted line); its url is the device route for a member."""
     owner = conv.owner
     deleted = line.deleted_at is not None
     body = "" if deleted else line.body
@@ -629,12 +670,14 @@ def line_json(line: ChatMessage, conv: Conversation, viewer_member: Member | Non
         "id": line.pk, "by": _by(line, owner), "body": body, "reply_to": reply, "task_id": line.task_id,
         "system": line.system, "edited": line.edited_at is not None, "deleted": deleted,
         "at": _iso(line.created_at), "seen_by": seen_by,
+        "file": None if deleted else files.file_json(files.file_of(line), request, device=viewer_member is not None),
     }
 
 
-def lines_json(lines: list[ChatMessage], conv: Conversation, viewer_member: Member | None) -> list[dict[str, Any]]:
+def lines_json(lines: list[ChatMessage], conv: Conversation, viewer_member: Member | None,
+               request: Any = None) -> list[dict[str, Any]]:
     who = readers(conv)
-    return [line_json(line, conv, viewer_member, who) for line in lines]
+    return [line_json(line, conv, viewer_member, who, request) for line in lines]
 
 
 def _last_json(line: ChatMessage | None, conv: Conversation, viewer_member: Member | None) -> dict[str, Any] | None:
