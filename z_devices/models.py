@@ -403,6 +403,7 @@ class Task(models.Model):
         ACCEPTED = "accepted", "Confirmed"
         PROGRESS = "progress", "In progress"
         HELP = "help", "Needs help"
+        CANTDO = "cantdo", "Can't do it"
         REVIEW = "review", "Done, waiting for your OK"
         APPROVED = "approved", "Approved"
         CANCELLED = "cancelled", "Cancelled"
@@ -414,6 +415,18 @@ class Task(models.Model):
     class By(models.TextChoices):
         OWNER = "owner", "Owner"
         MEMBER = "member", "Member"
+
+    class Mode(models.TextChoices):
+        """v1.4 team tasks: everyone has to finish, or the first one to start takes it."""
+
+        ALL = "all", "Everyone"
+        ANY = "any", "Any one of them"
+
+    class Repeat(models.TextChoices):
+        NONE = "", "Does not repeat"
+        DAY = "day", "Every day"
+        WEEK = "week", "Every week"
+        MONTH = "month", "Every month"
 
     # Not open any more: shown under Done (approved) or greyed out (cancelled).
     CLOSED = (Status.APPROVED, Status.CANCELLED)
@@ -429,6 +442,20 @@ class Task(models.Model):
     priority = models.CharField(max_length=8, choices=Priority.choices, default=Priority.NORMAL)
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.SENT)
     help_note = models.TextField(blank=True, max_length=1000)
+    # v1.4 team tasks (brief section 1a). `member` stays the first person, for Zinwe windows older than 1.4. db_default
+    # everywhere, so the previous release can still insert tasks while a deploy rolls.
+    mode = models.CharField(max_length=4, choices=Mode.choices, default=Mode.ALL, db_default=Mode.ALL)
+    in_order = models.BooleanField(default=False, db_default=False)
+    repeat = models.CharField(max_length=5, choices=Repeat.choices, blank=True, default="", db_default="")
+    next_on = models.DateField(null=True, blank=True)
+    # The task this one was copied from by its repeat (a copy is made once, when the owner approves).
+    repeat_of = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL, related_name="repeats")
+    # The group chat its card was posted in.
+    group = models.ForeignKey(
+        "z_chat.Conversation", null=True, blank=True, on_delete=models.SET_NULL, related_name="tasks"
+    )
+    cantdo_note = models.TextField(blank=True, max_length=1000, default="", db_default="")
+    reopen_note = models.TextField(blank=True, max_length=1000, default="", db_default="")
     status_changed_at = models.DateTimeField(default=timezone.now)
     status_changed_by = models.CharField(max_length=8, choices=By.choices, default=By.OWNER)
     nudged_at = models.DateTimeField(null=True, blank=True)
@@ -450,6 +477,48 @@ class Task(models.Model):
         return self.status not in self.CLOSED
 
 
+class TaskPerson(models.Model):
+    """
+    v1.4: one person on a task (every assignee, the legacy `Task.member` included). Their own progress: when they first
+    saw it, started and finished their part. `flag` is "help" / "cantdo" while they wait on the owner about it.
+    """
+
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="people")
+    member = models.ForeignKey(Member, on_delete=models.CASCADE, related_name="task_people")
+    position = models.PositiveSmallIntegerField(default=0)
+    seen_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    done_at = models.DateTimeField(null=True, blank=True)
+    flag = models.CharField(max_length=8, blank=True, default="")
+    flag_note = models.TextField(blank=True, max_length=1000, default="")
+
+    class Meta:
+        ordering = ["position", "id"]
+        constraints = [models.UniqueConstraint(fields=["task", "member"], name="uniq_task_person")]
+
+    def __str__(self) -> str:
+        return f"{self.member_id} on task {self.task_id}"
+
+
+class TaskChatRead(models.Model):
+    """v1.4: how far someone read a task's chat (member null = the owner), for the unread count."""
+
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="chat_reads")
+    member = models.ForeignKey(Member, null=True, blank=True, on_delete=models.CASCADE, related_name="task_chat_reads")
+    last_read_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["task", "member"], name="uniq_task_chat_read_member"),
+            models.UniqueConstraint(
+                fields=["task"], condition=models.Q(member__isnull=True), name="uniq_task_chat_read_owner"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"Task {self.task_id} read by {self.member_id or 'owner'}"
+
+
 class TaskStep(models.Model):
     """One checklist line of a task; the member ticks it in their Zinwe window."""
 
@@ -457,6 +526,10 @@ class TaskStep(models.Model):
     title = models.CharField(max_length=200)
     done = models.BooleanField(default=False)
     position = models.PositiveSmallIntegerField(default=0)
+    # v1.4: who ticks it (null = anyone on the task), and who ticked it when.
+    owner = models.ForeignKey(Member, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    done_by = models.ForeignKey(Member, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    done_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["position", "id"]
@@ -471,6 +544,8 @@ class TaskActivity(models.Model):
     task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="activity")
     at = models.DateTimeField(default=timezone.now)
     by = models.CharField(max_length=8, choices=Task.By.choices)
+    # v1.4: which person did it (member lines on a team task); null for the owner and older rows.
+    member = models.ForeignKey(Member, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     action = models.CharField(max_length=16)
     note = models.TextField(blank=True, max_length=1000)
 
@@ -808,3 +883,109 @@ class ReportDelivery(models.Model):
 
     def __str__(self) -> str:
         return f"Report {self.period_from}..{self.period_to} for {self.owner} ({self.status})"
+
+
+# --- v1.4 rules: work hours, holidays, leave, per-PC protection rules (brief section 1c) ---------------------------
+
+
+class WorkSchedule(models.Model):
+    """
+    Work hours and how a day counts, at one scope: the company (every field set, made lazily with the defaults), a
+    department (`scope_key` = Member.role) or one PC (`scope_key` = Device id). Department and PC rows hold only their
+    own changes: null = inherit. Effective = company <- department <- PC (z_devices.work_rules).
+    """
+
+    class Scope(models.TextChoices):
+        COMPANY = "company", "Company"
+        DEPARTMENT = "department", "Department"
+        DEVICE = "device", "One PC"
+
+    owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="work_schedules")
+    scope_kind = models.CharField(max_length=10, choices=Scope.choices, default=Scope.COMPANY)
+    scope_key = models.CharField(max_length=32, blank=True, default="")
+    days = models.CharField(max_length=7, null=True, blank=True, help_text="Mon..Sun, 1 = working day: 1111110.")
+    start = models.CharField(max_length=5, null=True, blank=True, help_text="HH:MM, 24 h.")
+    end = models.CharField(max_length=5, null=True, blank=True)
+    late_grace_min = models.PositiveSmallIntegerField(null=True, blank=True)
+    break_allowed_min = models.PositiveSmallIntegerField(null=True, blank=True)
+    break_ok_over_min = models.PositiveSmallIntegerField(null=True, blank=True, help_text="0 = never ask.")
+    tell_member_over = models.BooleanField(null=True, blank=True)
+    tell_owner_over = models.BooleanField(null=True, blank=True)
+    ok_early_end = models.BooleanField(null=True, blank=True)
+    full_day_hours = models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+    half_start_after = models.CharField(max_length=5, null=True, blank=True)
+    half_end_before = models.CharField(max_length=5, null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["owner", "scope_kind", "scope_key"], name="uniq_work_schedule_scope"),
+        ]
+
+    def __str__(self) -> str:
+        return f"Work hours ({self.scope_kind}{':' + self.scope_key if self.scope_key else ''}) for {self.owner_id}"
+
+
+class Holiday(models.Model):
+    owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="holidays")
+    name = models.CharField(max_length=80)
+    date = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["date", "id"]
+        constraints = [models.UniqueConstraint(fields=["owner", "date"], name="uniq_holiday_per_day")]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.date})"
+
+
+class Leave(models.Model):
+    """A day (or half day) off a member asks for in their Zinwe window; the owner approves it in Needs you."""
+
+    class Status(models.TextChoices):
+        REQUESTED = "requested", "Waiting for your OK"
+        APPROVED = "approved", "Approved"
+        DECLINED = "declined", "Declined"
+
+    owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="leaves")
+    member = models.ForeignKey(Member, on_delete=models.CASCADE, related_name="leaves")
+    date = models.DateField()
+    half = models.BooleanField(default=False)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.REQUESTED)
+    note = models.CharField(max_length=500, blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date", "-id"]
+        constraints = [models.UniqueConstraint(fields=["member", "date"], name="uniq_leave_per_member_day")]
+        indexes = [models.Index(fields=["owner", "status"])]
+
+    def __str__(self) -> str:
+        return f"Leave {self.member_id} {self.date} ({self.status})"
+
+
+class PolicyOverride(models.Model):
+    """
+    One department's or one PC's own protection rules: only the Policy fields that differ (`data` = {model field:
+    value}). The PC gets company <- department <- PC (z_devices.policy_scopes). Any change bumps Policy.version.
+    """
+
+    class Scope(models.TextChoices):
+        DEPARTMENT = "department", "Department"
+        DEVICE = "device", "One PC"
+
+    owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="policy_overrides")
+    scope_kind = models.CharField(max_length=10, choices=Scope.choices)
+    scope_key = models.CharField(max_length=32)
+    data = models.JSONField(default=dict, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["owner", "scope_kind", "scope_key"], name="uniq_policy_override_scope"),
+        ]
+
+    def __str__(self) -> str:
+        return f"Rules for {self.scope_kind}:{self.scope_key} ({self.owner_id})"
