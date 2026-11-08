@@ -158,15 +158,34 @@ class DeviceMessagesView(APIView):
         return Response(MessageSerializer(messages, many=True, context={"request": request}).data)
 
     def post(self, request: Request) -> Response:
+        from django.db import transaction
+
+        from z_chat import files as chat_files
+
         plan.require(request.auth.owner, plan.TEAM_CHAT)
         serializer = MemberReplySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        message = services.reply_from_member(
-            request.auth,
-            serializer.validated_data["body"],
-            about_task_id=serializer.validated_data.get("about_task"),
-            about_todo_id=serializer.validated_data.get("about_todo"),
-        )
+        file_id = serializer.validated_data.get("file_id")
+        body = serializer.validated_data["body"]
+        if file_id and request.auth.member_id is None:
+            return Response({"detail": "This PC isn't linked to a member."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            with transaction.atomic():
+                chat_file = caption = None
+                if file_id:  # v1.5: a file line; the typed text is its caption, the body the fallback text
+                    chat_file = chat_files.claim(request.auth.owner_id, request.auth.member_id, file_id)
+                    caption = chat_files.clean_caption(body)
+                    body = chat_files.fallback_body(chat_file, caption)
+                message = services.reply_from_member(
+                    request.auth,
+                    body,
+                    about_task_id=serializer.validated_data.get("about_task"),
+                    about_todo_id=serializer.validated_data.get("about_todo"),
+                )
+                if message is not None and chat_file is not None:
+                    chat_files.attach(chat_file, caption or "", message=message)
+        except chat_files.FileRefused as exc:
+            return Response({exc.field: [exc.message]}, status=status.HTTP_400_BAD_REQUEST)
         if message is None:
             return Response({"detail": "This PC isn't linked to a member."}, status=status.HTTP_400_BAD_REQUEST)
         return Response(MessageSerializer(message, context={"request": request}).data, status=status.HTTP_201_CREATED)
@@ -546,17 +565,36 @@ class MemberMessageView(APIView):
             ).first()
             if about_todo is None:
                 return Response({"about_todo": ["That to-do wasn't found."]}, status=status.HTTP_400_BAD_REQUEST)
-        message = services.send_message(
-            request.user,
-            member,
-            title=serializer.validated_data["title"],
-            body=serializer.validated_data["body"],
-            severity=serializer.validated_data["severity"],
-            channel=serializer.validated_data["channel"],
-            event=event,
-            about_task=about_task,
-            about_todo=about_todo,
-        )
+        from django.db import transaction
+
+        from z_chat import files as chat_files
+
+        title = serializer.validated_data["title"]
+        body = serializer.validated_data["body"]
+        file_id = serializer.validated_data.get("file_id")
+        try:
+            with transaction.atomic():
+                chat_file = caption = None
+                if file_id:  # v1.5: a file line; the typed text is its caption, the body the fallback text
+                    chat_file = chat_files.claim(request.user.pk, None, file_id)
+                    caption = chat_files.clean_caption(body)
+                    body = chat_files.fallback_body(chat_file, caption)
+                    title = title or f"\U0001F4CE {chat_file.name}"[:120]
+                message = services.send_message(
+                    request.user,
+                    member,
+                    title=title,
+                    body=body,
+                    severity=serializer.validated_data["severity"],
+                    channel=serializer.validated_data["channel"],
+                    event=event,
+                    about_task=about_task,
+                    about_todo=about_todo,
+                )
+                if chat_file is not None:
+                    chat_files.attach(chat_file, caption or "", message=message)
+        except chat_files.FileRefused as exc:
+            return Response({exc.field: [exc.message]}, status=status.HTTP_400_BAD_REQUEST)
         return Response(MessageSerializer(message, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 

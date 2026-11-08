@@ -136,8 +136,34 @@ class MemberRotateSerializer(serializers.Serializer):
     email = serializers.BooleanField(required=False, default=True)
 
 
-class MessageCreateSerializer(serializers.Serializer):
-    """POST /api/devices/members/<id>/message/ -- the owner sends one note."""
+def _file_id_field() -> serializers.UUIDField:
+    """v1.5: the chat file (the sender's own upload, z_chat.files) this line carries."""
+    from z_chat.files import NOT_FOUND
+
+    return serializers.UUIDField(required=False, allow_null=True, default=None, error_messages={"invalid": NOT_FOUND})
+
+
+class _FileOptional:
+    """v1.5: with a `file_id`, these text fields may be blank or left out. Without one they stay exactly as before."""
+
+    optional_with_file: tuple[str, ...] = ()
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[call-arg]
+        data = kwargs.get("data")
+        if hasattr(data, "get") and data.get("file_id"):
+            for name in self.optional_with_file:
+                f = self.fields[name]  # type: ignore[attr-defined]
+                f.required = False
+                f.allow_blank = True
+                f.default = ""
+
+
+class MessageCreateSerializer(_FileOptional, serializers.Serializer):
+    """POST /api/devices/members/<id>/message/ -- the owner sends one note (v1.5: or a file, `file_id`; then `title`
+    may be left out and defaults to the file's name)."""
+
+    optional_with_file = ("title",)
 
     title = serializers.CharField(max_length=120, trim_whitespace=True)
     body = serializers.CharField(
@@ -155,6 +181,7 @@ class MessageCreateSerializer(serializers.Serializer):
     # v1.3.5 (F-17): said about one of this member's tasks, or one of their own to-dos (at most one of the two).
     about_task = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
     about_todo = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
+    file_id = _file_id_field()
 
     def validate(self, attrs: dict) -> dict:
         if not attrs.get("channel"):
@@ -199,13 +226,24 @@ class MessageSerializer(serializers.ModelSerializer):
     # v1.3.5 (F-17): the task / own to-do this line is about (its thread); null on ordinary lines.
     about_task = serializers.PrimaryKeyRelatedField(read_only=True)
     about_todo = serializers.PrimaryKeyRelatedField(read_only=True)
+    # v1.5: the chat file this line carries (z_chat FileJSON), or null. `body` keeps the fallback text for old clients.
+    file = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
         fields = [
             "id", "sender", "channel", "kind", "title", "body", "severity", "created_at", "read_by_owner",
-            "read_by_member", "delivered_at", "read_by_member_at", "task", "about_task", "about_todo",
+            "read_by_member", "delivered_at", "read_by_member_at", "task", "about_task", "about_todo", "file",
         ]
+
+    def get_file(self, obj: Message) -> dict[str, Any] | None:
+        from z_chat.files import file_json, file_of
+
+        f = file_of(obj)
+        if f is None:
+            return None
+        request = self.context.get("request")
+        return file_json(f, request, device=isinstance(getattr(request, "auth", None), Device))
 
     def get_body(self, obj: Message) -> str | None:
         return obj.body or None
@@ -231,10 +269,14 @@ class EventHandledSerializer(serializers.Serializer):
     handled = serializers.BooleanField(required=False, default=True)
 
 
-class MemberReplySerializer(serializers.Serializer):
-    """POST /api/devices/messages/ (Device auth) -- the member replies in the thread."""
+class MemberReplySerializer(_FileOptional, serializers.Serializer):
+    """POST /api/devices/messages/ (Device auth) -- the member replies in the thread (v1.5: or sends a file,
+    `file_id`; then `body` is its caption and may be blank)."""
+
+    optional_with_file = ("body",)
 
     body = serializers.CharField(max_length=2000, trim_whitespace=True)
+    file_id = _file_id_field()
     # v1.3.5 (F-17): a reply in a task's thread (their own task or own to-do); at most one of the two.
     about_task = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
     about_todo = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
