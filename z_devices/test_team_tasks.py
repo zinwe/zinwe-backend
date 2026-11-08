@@ -362,3 +362,14 @@ class TaskChatTests(TeamTaskCase):
         self.as_device(self.karan_token)
         self.client.post(MESSAGES_URL, {"body": "On it", "about_task": body["id"]}, format="json")
         self.assertEqual(Message.objects.filter(about_task_id=body["id"]).count(), 1)
+
+
+class TeamFeedTests(TeamTaskCase):
+    def test_owner_feed_names_the_person_who_did_it(self) -> None:
+        from .owner_feed import feed
+
+        since = timezone.now() - timedelta(seconds=1)
+        body = self.team(steps=[])
+        self.device_act(self.karan_token, body["id"], "cantdo", note="No access.")
+        items = [i for i in feed(self.owner, since)["items"] if i["kind"] == "task"]
+        self.assertEqual([i["title"] for i in items], ["Karan Malhotra can't do a task"])

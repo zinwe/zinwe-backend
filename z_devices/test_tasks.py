@@ -95,7 +95,8 @@ class CreateTaskTests(TaskTestCase):
         self.assertTrue(all(set(s) == {"id", "title", "done", "owner_id", "done_by_id", "done_at"} and s["done"] is False
                             for s in body["steps"]))
         self.assertEqual([(a["by"], a["action"]) for a in body["activity"]], [("owner", "created")])
-        self.assertEqual(set(body["activity"][0]), {"at", "by", "action", "note"})
+        # v1.4 adds who did it (member_id / member_name, null for the owner).
+        self.assertEqual(set(body["activity"][0]), {"at", "by", "action", "note", "member_id", "member_name"})
 
         message = Message.objects.get(pk=body["message_id"])
         self.assertEqual(message.kind, "task")

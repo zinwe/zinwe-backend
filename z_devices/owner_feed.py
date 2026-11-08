@@ -35,7 +35,7 @@ SEVERITIES_FOR = {
 }
 
 # FR-20: what a member does on a task that the owner hears about.
-TASK_ACTIONS = ("help", "done")
+TASK_ACTIONS = ("help", "done", "cantdo")  # v1.4: + "can't do it"
 
 
 def prefs_for(owner: User) -> NotificationPrefs:
@@ -104,15 +104,18 @@ def _task_rows(owner: User, prefs: NotificationPrefs, ent: Entitlements) -> Quer
     if not (prefs.tasks and ent.has(plan.TEAM_CHAT)):
         return TaskActivity.objects.none()
     # FR-20: a member asked for help on a task, or finished one (it now waits for the owner's OK).
-    return TaskActivity.objects.filter(task__owner=owner, by="member", action__in=TASK_ACTIONS).select_related("task__member")
+    return TaskActivity.objects.filter(task__owner=owner, by="member", action__in=TASK_ACTIONS).select_related(
+        "task__member", "member"
+    )
 
 
 def _task_item(a: TaskActivity) -> dict[str, Any]:
-    who = a.task.member.name
-    help_asked = a.action == "help"
+    # v1.4: on a team task, the person who did it (older lines: the task's member).
+    who = a.member.name if a.member_id and a.member else a.task.member.name
+    titles = {"help": f"{who} needs help with a task", "cantdo": f"{who} can't do a task"}
     return {
         "id": f"task-{a.pk}", "kind": "task",
-        "title": f"{who} needs help with a task" if help_asked else f"{who} finished a task",
+        "title": titles.get(a.action, f"{who} finished a task"),
         "body": _short(f"{a.task.title}: {a.note}" if a.note else a.task.title),
         "at": a.at.isoformat(), "link": f"/app/tasks?task={a.task_id}",
     }
