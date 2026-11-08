@@ -83,6 +83,7 @@ INSTALLED_APPS = [
     "z_payments",
     "z_marketing",
     "z_versions",
+    "z_chat",
 ]
 
 MIDDLEWARE = [
@@ -261,6 +262,8 @@ REST_FRAMEWORK = {
         "device_metrics": env_str("ZINWE_THROTTLE_DEVICE_METRICS", "60/min"),
         # FR-20: the member's task taps (seen, start, a step ticked...) from their Zinwe window, per PC.
         "device_tasks": env_str("ZINWE_THROTTLE_DEVICE_TASKS", "120/min"),
+        # v1.4 team chat from the Zinwe window: the open chat polls every 3 s, the list every 15 s, per PC.
+        "device_chat": env_str("ZINWE_THROTTLE_DEVICE_CHAT", "300/min"),
         # FR-44: picture writes (set / upload / remove), per owner account and per PC.
         "member_picture": env_str("ZINWE_THROTTLE_MEMBER_PICTURE", "30/hour"),
         "device_picture": env_str("ZINWE_THROTTLE_DEVICE_PICTURE", "30/hour"),

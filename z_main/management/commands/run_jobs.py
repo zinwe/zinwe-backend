@@ -24,6 +24,7 @@ from z_blog.drip import send_due as send_series_emails
 from z_blog.guide_followups import send_due as send_guide_followups
 from z_blog.newsletter import send_pending as send_newsletters
 from z_devices.report_schedules import send_due as send_scheduled_reports
+from z_chat.retention import prune_chat
 from z_devices.retention import prune_history
 from z_marketing.outreach import send_pending as send_outreach
 from z_notification.retry import run as retry_failed_emails
@@ -45,6 +46,7 @@ JOBS = (
     ("guide follow-ups", send_guide_followups),  # after the series: one Zinwe email a day per member
     ("scheduled reports", send_scheduled_reports),  # FR-22: daily / weekly / monthly reports by email
     ("history clean-up", prune_history),
+    ("chat clean-up", prune_chat),  # v1.4: team chat past each plan's chat_history_days + 30 days
     ("new version plan", make_version_plan),  # Thursday 03:00 IST: the week's feedback + issues -> plan, PDF to the founder
 )
 

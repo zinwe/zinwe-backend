@@ -9,6 +9,7 @@ urlpatterns = [
     path("api/payments/", include("z_payments.urls")),
     path("api/analytics/", include("z_analytics.urls")),
     path("api/devices/", include("z_devices.urls")),
+    path("api/chat/", include("z_chat.urls")),
     path("api/support/", include("z_support.urls")),
     path("api/admin/support/", include("z_support.staff_urls")),
     path("api/blog/", include("z_blog.urls")),
