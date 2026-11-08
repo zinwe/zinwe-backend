@@ -1,6 +1,6 @@
-from django.urls import path
+from django.urls import include, path
 
-from . import views
+from . import views, views_rules
 
 app_name = "z_devices"
 
@@ -54,6 +54,17 @@ urlpatterns = [
     path("tasks/", views.TaskListView.as_view(), name="tasks"),
     path("tasks/<int:task_id>/", views.TaskDetailView.as_view(), name="task-detail"),
     path("tasks/<int:task_id>/action/", views.TaskActionView.as_view(), name="task-action"),
+    path("tasks/<int:task_id>/chat/", views.TaskChatView.as_view(), name="task-chat"),
+    path("tasks/<int:task_id>/chat/read/", views.TaskChatReadView.as_view(), name="task-chat-read"),
+    # v1.4 team chat from the Zinwe window (z_chat).
+    path("chat/", include("z_chat.device_urls")),
+    # v1.4 rules: work hours by scope, holidays, leave.
+    path("rules/hours/", views_rules.RulesHoursView.as_view(), name="rules-hours"),
+    path("rules/scopes/", views_rules.RulesScopesView.as_view(), name="rules-scopes"),
+    path("rules/holidays/", views_rules.HolidaysView.as_view(), name="rules-holidays"),
+    path("rules/holidays/<int:holiday_id>/", views_rules.HolidayDetailView.as_view(), name="rules-holiday"),
+    path("leave/", views_rules.LeaveView.as_view(), name="leave"),
+    path("leave/<int:leave_id>/decision/", views_rules.LeaveDecisionView.as_view(), name="leave-decision"),
     path("messages/", views.DeviceMessagesView.as_view(), name="messages"),
     path("messages/read/", views.DeviceMessagesReadView.as_view(), name="messages-read"),
     path("feedback/", views.DeviceFeedbackView.as_view(), name="feedback"),

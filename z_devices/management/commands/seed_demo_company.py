@@ -14,6 +14,9 @@ team chat that read like a real office.
   hours today's day is shifted so "now" reads as mid-afternoon.
 - `--keep-alive 60` keeps the working PCs "online" for an hour (they send no real heartbeats).
 - `--clear` deletes the whole demo account.
+- v1.4: groups Design / Development / Everyone (with a direct chat between Priya and Emily), the team tasks of the
+  prototype (the Lumen relay: Priya steps 1-2 done, Karan's turn on 3-4, Emily 5-6), work hours (company + Arjun's
+  PC), holidays and leave.
 
 DEBUG off (dev / prod) needs --force.
 """
@@ -324,6 +327,7 @@ class Command(BaseCommand):
             batch_size=1000,
         )
         _chat(owner, members, now)
+        _team(owner, members, now)  # v1.4: groups, team tasks, work hours, holidays, leave
 
     # --- output -----------------------------------------------------------------
 
@@ -633,3 +637,209 @@ def _chat(owner: User, members: list[tuple[Person, Member, Device]], now: dateti
                 read_by_member_at=at + timedelta(minutes=3) if mine else None,
             )
             Message.objects.filter(pk=msg.pk).update(created_at=at)
+
+
+# --- v1.4: groups, team tasks, work hours ----------------------------------------------------------------------
+
+GROUPS = (
+    ("Design", "M12 19l7-7 3 3-7 7-3-3zM18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5zM2 2l7.586 7.586", ("Priya Nair", "Emily Carter", "Fatima Sheikh")),
+    ("Development", "M16 18l6-6-6-6M8 6l-6 6 6 6", ("Karan Malhotra", "Arjun Mehta", "Jake Thompson", "Vikram Singh")),
+    ("Everyone", "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8", tuple(p.name for p in PEOPLE)),
+)
+HOLIDAYS = (("Guru Nanak Jayanti", date(2026, 11, 24)), ("Christmas", date(2026, 12, 25)), ("Republic Day", date(2027, 1, 26)))
+
+
+def _team(owner: User, members: list[tuple[Person, Member, Device]], now: datetime) -> None:
+    """Groups Design / Development / Everyone with a few lines each, the team tasks (the Lumen relay first), work
+    hours and holidays. Rebuilt from scratch on every run, like the chat."""
+    from z_chat.models import ChatMessage, Conversation, ConversationMember
+    from z_devices import work_tasks
+    from z_devices.models import Holiday, Leave, Task, TaskActivity, TaskPerson, WorkSchedule
+    from z_devices.work_rules import DEFAULTS
+
+    member = {p.name: m for p, m, _ in members}
+    device = {p.name: d for p, _, d in members}
+    Task.objects.filter(owner=owner).delete()
+    Conversation.objects.filter(owner=owner).delete()
+    WorkSchedule.objects.filter(owner=owner).delete()
+    Holiday.objects.filter(owner=owner).delete()
+    Leave.objects.filter(owner=owner).delete()
+
+    ago = lambda minutes: now - timedelta(minutes=minutes)  # noqa: E731
+
+    # Work hours: the company's (Mon to Fri, 10 to 7, 7 hours make a full day), and Arjun's PC starts later (he
+    # covers the US evening).
+    WorkSchedule.objects.create(owner=owner, scope_kind="company", scope_key="",
+                                **{**DEFAULTS, "days": "1111100", "full_day_hours": 7})
+    WorkSchedule.objects.create(owner=owner, scope_kind="device", scope_key=str(device["Arjun Mehta"].pk),
+                                start="11:00", end="20:00", break_allowed_min=90)
+    for name, day in HOLIDAYS:
+        Holiday.objects.create(owner=owner, name=name, date=day)
+    Leave.objects.create(owner=owner, member=member["Fatima Sheikh"], date=now.date(), half=False,
+                         status=Leave.Status.APPROVED, note="Family function", decided_at=ago(60 * 26))
+    Leave.objects.create(owner=owner, member=member["Sneha Reddy"], date=now.date() + timedelta(days=4), half=True,
+                         note="Doctor's appointment in the morning")
+
+    groups = {}
+    for index, (name, icon, people) in enumerate(GROUPS):
+        made = ago(60 * 24 * (12 - index))
+        conv = Conversation.objects.create(owner=owner, kind="group", name=name, icon=icon, created_at=made,
+                                           last_message_at=made, owner_last_read_at=now)
+        ConversationMember.objects.bulk_create([
+            ConversationMember(conversation=conv, member=member[n], joined_at=made, last_read_at=now) for n in people
+        ])
+        ChatMessage.objects.create(conversation=conv, system=True, created_at=made,
+                                   body=f"You made the group and added {_names([n.split()[0] for n in people])}.")
+        groups[name] = conv
+
+    def say(group: str, who: str | None, minutes: int, body: str) -> None:
+        at = ago(minutes)
+        ChatMessage.objects.create(conversation=groups[group], sender_member=member[who] if who else None, body=body,
+                                   created_at=at)
+        Conversation.objects.filter(pk=groups[group].pk).update(last_message_at=at)
+
+    say("Everyone", None, 60 * 24 * 3, "Diwali party on Monday from 5 PM in the main hall. Family welcome!")
+    say("Everyone", "Sneha Reddy", 60 * 24 * 3 - 20, "The caterer needs the final count by Sunday, please reply to Fatima.")
+    say("Development", "Vikram Singh", 300, "Staging is back up, the certificate is renewed.")
+    say("Development", "Karan Malhotra", 120, "Lumen hero after lunch, checkout fix right after.")
+    say("Design", "Emily Carter", 180, "Both hero options are in the Design folder: A is the office photo, B the illustration.")
+    say("Design", "Priya Nair", 95, "Copy and images for Lumen are in the Lumen folder.")
+
+    # A direct chat between two members (the owner never sees it; it shows in their Zinwe windows).
+    direct = Conversation.objects.create(owner=owner, kind="direct", direct_key=":".join(
+        str(i) for i in sorted((member["Priya Nair"].pk, member["Emily Carter"].pk))), created_at=ago(400))
+    for n in ("Priya Nair", "Emily Carter"):
+        ConversationMember.objects.create(conversation=direct, member=member[n], joined_at=ago(400), last_read_at=now)
+    for who, minutes, body in (("Emily Carter", 70, "Option B for the hero?"), ("Priya Nair", 66, "Yes, B. The photo is too dark on phones.")):
+        ChatMessage.objects.create(conversation=direct, sender_member=member[who], body=body, created_at=ago(minutes))
+    Conversation.objects.filter(pk=direct.pk).update(last_message_at=ago(66))
+
+    today = timezone.localtime(now)
+
+    def due(days: int, hour: int = 18) -> datetime:
+        return _local((today + timedelta(days=days)).date(), hour, 0)
+
+    def task(title: str, people: tuple[str, ...], days: int, steps: list[tuple[str, str]], sent_min: int, *,
+             note: str = "", high: bool = False, in_order: bool = False, group: str | None = None,
+             repeat: str = "", hour: int = 18) -> Task:
+        t = work_tasks.create_team_task(
+            owner, [member[n] for n in people], title, note, due(days, hour), "high" if high else "normal",
+            [{"title": s, "owner_id": member[o].pk} for s, o in steps], in_order=in_order, repeat=repeat,
+            group=groups.get(group) if group else None, post_in_group=bool(group),
+        )
+        sent = ago(sent_min)
+        Task.objects.filter(pk=t.pk).update(created_at=sent, status_changed_at=sent)
+        TaskActivity.objects.filter(task=t).update(at=sent)
+        Message.objects.filter(pk=t.message_id).update(created_at=sent, delivered_at=sent + timedelta(seconds=20))
+        ChatMessage.objects.filter(task=t).update(created_at=sent)
+        return Task.objects.get(pk=t.pk)
+
+    def progress(t: Task, status: str, minutes: int, seen: int | None = None, done_steps: int = 0,
+                 people_done: tuple[str, ...] = (), flag: tuple[str, str, str] | None = None) -> None:
+        at = ago(minutes)
+        steps = list(t.steps.order_by("position", "id"))
+        for i, s in enumerate(steps[:done_steps]):
+            when = at - timedelta(minutes=10 * (done_steps - i))
+            s.done, s.done_by_id, s.done_at = True, s.owner_id, when
+            s.save(update_fields=["done", "done_by", "done_at"])
+            TaskActivity.objects.create(task=t, by="member", member_id=s.owner_id, action="step_done", note=s.title, at=when)
+        for p in TaskPerson.objects.filter(task=t).select_related("member"):
+            p.seen_at = ago(seen) if seen is not None else None
+            if status not in ("sent", "seen"):
+                p.started_at = p.seen_at
+            if p.member.name in people_done or status in ("review", "approved"):
+                p.done_at = at
+            if flag and p.member.name == flag[0]:
+                p.flag, p.flag_note = flag[1], flag[2]
+            p.save()
+        if seen is not None:
+            TaskActivity.objects.create(task=t, by="member", member=t.member, action="seen", at=ago(seen))
+        fields = {"status": status, "status_changed_at": at, "status_changed_by": "member" if status != "approved" else "owner"}
+        if flag:
+            fields["help_note" if flag[1] == "help" else "cantdo_note"] = flag[2]
+            TaskActivity.objects.create(task=t, by="member", member=member[flag[0]], action=flag[1], note=flag[2], at=at)
+        if status == "review":
+            TaskActivity.objects.create(task=t, by="member", member=t.member, action="done", at=at)
+        if status == "approved":
+            TaskActivity.objects.create(task=t, by="owner", action="approved", at=at)
+        Task.objects.filter(pk=t.pk).update(**fields, updated_at=at)
+
+    def talk(t: Task, rows: list[tuple[str | None, int, str]]) -> None:
+        for who, minutes, body in rows:
+            m = member[who] if who else t.member
+            line = Message.objects.create(
+                owner=owner, member=m, sender=Message.Sender.MEMBER if who else Message.Sender.OWNER, body=body,
+                read_by_owner=True, read_by_member=True, about_task=t,
+            )
+            Message.objects.filter(pk=line.pk).update(created_at=ago(minutes))
+
+    # The Lumen relay: Priya's steps 1-2 done, Karan's turn (3-4), then Emily (5-6). Posted in the Design chat.
+    lumen = task("Launch the Lumen landing page", ("Priya Nair", "Karan Malhotra", "Emily Carter"), 0, [
+        ("Write the page copy", "Priya Nair"), ("Pick the hero images", "Priya Nair"),
+        ("Build the hero section", "Karan Malhotra"), ("Connect the signup form", "Karan Malhotra"),
+        ("Check it on phones", "Emily Carter"), ("Final check with Ananya", "Emily Carter"),
+    ], 60 * 30, note="Client demo on Monday morning. Use option B for the hero.", high=True, in_order=True, group="Design")
+    progress(lumen, "progress", 220, seen=60 * 30 - 20, done_steps=2, people_done=("Priya Nair",))
+    TaskPerson.objects.filter(task=lumen, member__name__in=["Emily Carter"]).update(started_at=None)
+    talk(lumen, [("Priya Nair", 218, "Copy and images are in the Lumen folder. Karan, over to you."),
+                 ("Karan Malhotra", 190, "Thanks! Starting after lunch."), (None, 185, "Great. Let's aim for 6.")])
+
+    party = task("Prepare the Diwali office party", ("Sneha Reddy", "Fatima Sheikh", "Arjun Mehta"), 2, [
+        ("Book the caterer for 40 people", "Sneha Reddy"), ("Order the sweets boxes", "Fatima Sheikh"),
+        ("Put up the lights and rangoli", "Sneha Reddy"), ("Set up music and speakers", "Arjun Mehta"),
+        ("Send the invite to everyone", "Fatima Sheikh"),
+    ], 60 * 24 * 3, note="Party on Monday from 5 PM in the main hall. Budget Rs 40,000. Veg menu only.", group="Everyone")
+    progress(party, "review", 40, seen=60 * 24 * 3 - 20, done_steps=5)
+    talk(party, [("Sneha Reddy", 60 * 24 * 2, "Caterer booked, they need the final count by Sunday."),
+                 (None, 60 * 24 * 2 - 25, "Count is 38. Thanks Sneha!")])
+
+    invoices = task("Send the October invoices", ("Priya Nair",), 1, [
+        ("Make the invoices in Tally", "Priya Nair"), ("Check the GST line on each", "Priya Nair"),
+        ("Email them to the 12 clients", "Priya Nair"),
+    ], 60 * 30)
+    progress(invoices, "review", 65, seen=60 * 30 - 7, done_steps=3)
+
+    hero = task("Design the new landing page hero", ("Emily Carter",), 1, [
+        ("Make two image options", "Emily Carter"), ("Pick one with Ananya", "Emily Carter"),
+        ("Export it for web and phone", "Emily Carter"),
+    ], 60 * 28, note="Brand colours only.")
+    progress(hero, "help", 12, seen=60 * 28 - 12, done_steps=1, flag=("Emily Carter", "help", "Which hero image, A or B?"))
+
+    ssl = task("Renew the SSL certificates", ("Arjun Mehta",), 2, [
+        ("Get the new certificates from the provider", "Arjun Mehta"), ("Install them on the web server", "Arjun Mehta"),
+        ("Check the site shows the lock", "Arjun Mehta"),
+    ], 60 * 29, note="They expire on Wed 11 Nov.", high=True)
+    progress(ssl, "cantdo", 110, seen=60 * 29 - 5, flag=("Arjun Mehta", "cantdo", "No admin access to the server."))
+
+    links = task("Fix the broken links on the Lumen site", ("Jake Thompson",), -1, [
+        ("Run the link checker", "Jake Thompson"), ("Fix or remove each broken link", "Jake Thompson"),
+    ], 60 * 47)
+    progress(links, "seen", 60 * 30, seen=60 * 30)
+
+    checkout = task("Get the checkout fix live on staging", ("Karan Malhotra",), 0, [
+        ("Fix the coupon rounding", "Karan Malhotra"), ("Deploy to staging", "Karan Malhotra"),
+        ("Ask the client to test", "Karan Malhotra"),
+    ], 60 * 28, note="The client tests tomorrow morning.", high=True)
+    progress(checkout, "progress", 60 * 22, seen=60 * 28 - 7, done_steps=1)
+
+    case = task("Write the case study for Northwind", ("Priya Nair",), 1, [], 400, note="One page.")
+    progress(case, "seen", 394, seen=394)
+
+    task("Pay the office rent", ("Fatima Sheikh",), 3, [], 15, note="The landlord's account is in the Accounts sheet.",
+         repeat="month", hour=12)
+
+    nas = task("Back up the design files to the NAS", ("Vikram Singh",), -4, [
+        ("Copy the 2026 folders", "Vikram Singh"), ("Check the copy opens", "Vikram Singh"),
+    ], 60 * 24 * 6)
+    progress(nas, "approved", 60 * 24 * 5, seen=60 * 24 * 6 - 4, done_steps=2)
+
+    # Each group's newest line (the task cards were back-dated above).
+    for conv in groups.values():
+        newest = ChatMessage.objects.filter(conversation=conv).order_by("-created_at").values_list("created_at", flat=True).first()
+        Conversation.objects.filter(pk=conv.pk).update(last_message_at=newest)
+    # Lines the owner hasn't read yet (the Chat badge): Emily's and Priya's in Design.
+    Conversation.objects.filter(pk=groups["Design"].pk).update(owner_last_read_at=ago(200))
+
+
+def _names(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]

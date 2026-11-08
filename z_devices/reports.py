@@ -109,12 +109,14 @@ class _Collector:
 
 
 def _work(c: _Collector, owner: User, lo: datetime, hi: datetime, now: datetime, member: Member | None,
-          tz: Any) -> None:
+          tz: Any) -> dict[Any, dict[date, Any]]:
     logs = WorkLog.objects.filter(owner=owner)
     if member is not None:
         logs = logs.filter(member=member)
     since = entitlements_for(owner).history_since()
+    per_person: dict[Any, dict[date, Any]] = {}
     for key, sample, days in work_days(logs, lo, hi, now, tz, since=since):
+        per_person[key] = days
         name, member_id = (sample.member.name if sample.member else sample.device.hostname), sample.member_id
         row = c.person(key, member_id, name)
         for day, w in sorted(days.items()):
@@ -143,6 +145,7 @@ def _work(c: _Collector, owner: User, lo: datetime, hi: datetime, now: datetime,
                 c.day_person(day, key, member_id, name).update(
                     worked_seconds=w.worked, break_seconds=w.on_break, breaks=w.breaks, first_in=first_in,
                     last_out=last_out)
+    return per_person
 
 
 def _alerts(c: _Collector, owner: User, lo: datetime, hi: datetime, ent: Any, member: Member | None):  # type: ignore[no-untyped-def]
@@ -239,8 +242,9 @@ def build_report(
     tz = work_zone(owner)
     lo, hi = day_bounds(start, end, tz)
     c = _Collector(start, end)
+    per_person: dict[Any, dict[date, Any]] | None = None
     if ent.has(plan.WORK_TIME):
-        _work(c, owner, lo, hi, now, member, tz)
+        per_person = _work(c, owner, lo, hi, now, member, tz)
     alerts = _alerts(c, owner, lo, hi, ent, member)
     _usage(c, owner, lo, hi, ent, member)
 
@@ -278,6 +282,17 @@ def build_report(
     else:
         report["member"] = {"id": member.pk, "name": member.name, "email": member.email, "role": member.role}
         report["person_days"] = [c.person_days[d] for d in sorted(c.person_days)]
+    if per_person is not None:
+        # v1.4: how each day counts (full / half / absent / leave / off / holiday, late), by the Rules' work hours.
+        from .work_rules import attendance
+
+        report["attendance"] = attendance(owner, start, end, per_person, now, member=member)
+        if member is not None and report["attendance"]["people"]:
+            by_day = {d["date"]: d for d in report["attendance"]["people"][0]["days"]}
+            for row in report["person_days"]:
+                status = by_day.get(row["date"])
+                row.update(status=status["status"] if status else None, late=status["late"] if status else False,
+                           worked_min=row["worked_seconds"] // 60, break_min=row["break_seconds"] // 60)
     return report
 
 

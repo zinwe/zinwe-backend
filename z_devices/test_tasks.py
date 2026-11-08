@@ -23,7 +23,12 @@ TASKS_URL = "/api/devices/tasks/"
 TASK_KEYS = {
     "id", "member_id", "member_name", "member_picture", "title", "note", "due_at", "priority", "steps", "status", "help_note",
     "created_at", "updated_at", "status_changed_at", "status_changed_by", "message_id", "activity", "talk_count",
+    # v1.4 team tasks (additive)
+    "member", "mode", "in_order", "repeat", "next_on", "group_id", "repeat_of_id", "people", "cantdo_note",
+    "reopen_note", "nudged_at", "chat",
 }
+# The device's view adds its own block.
+DEVICE_TASK_KEYS = TASK_KEYS | {"me"}
 
 
 def task_url(task_id: int) -> str:
@@ -86,9 +91,12 @@ class CreateTaskTests(TaskTestCase):
         self.assertEqual(body["priority"], "high")
         self.assertEqual(body["help_note"], "")
         self.assertEqual([s["title"] for s in body["steps"]], ["Download GSTR-2B", "Match the register"])
-        self.assertTrue(all(set(s) == {"id", "title", "done"} and s["done"] is False for s in body["steps"]))
+        # v1.4 adds owner_id, done_by_id, done_at to each step.
+        self.assertTrue(all(set(s) == {"id", "title", "done", "owner_id", "done_by_id", "done_at"} and s["done"] is False
+                            for s in body["steps"]))
         self.assertEqual([(a["by"], a["action"]) for a in body["activity"]], [("owner", "created")])
-        self.assertEqual(set(body["activity"][0]), {"at", "by", "action", "note"})
+        # v1.4 adds who did it (member_id / member_name, null for the owner).
+        self.assertEqual(set(body["activity"][0]), {"at", "by", "action", "note", "member_id", "member_name"})
 
         message = Message.objects.get(pk=body["message_id"])
         self.assertEqual(message.kind, "task")
@@ -154,7 +162,8 @@ class CreateTaskTests(TaskTestCase):
         self.as_owner()
         url = f"{MEMBERS_URL}{self.member.id}/messages/"
         self.client.get(url)
-        with self.assertNumQueries(7):  # token, user, plan, mark read, messages, steps, activity
+        # token, user, plan, mark read, messages, steps, activity (+ who), v1.4: people, chat reads, chat lines
+        with self.assertNumQueries(10):
             self.client.get(url)
 
 
@@ -256,7 +265,8 @@ class EditTaskTests(TaskTestCase):
     def test_member_pc_cannot_edit(self) -> None:
         task = self.make()
         self.as_device(self.token)
-        self.assertEqual(self.client.patch(task_url(task["id"]), {"title": "x"}, format="json").status_code, 401)
+        # v1.4: the PC may GET a task by id, so its token is accepted here, but editing stays the owner's.
+        self.assertEqual(self.client.patch(task_url(task["id"]), {"title": "x"}, format="json").status_code, 403)
 
     def test_unknown_task(self) -> None:
         self.as_owner()
@@ -347,7 +357,7 @@ class DeviceTaskTests(TaskTestCase):
         self.as_device(self.token)
         rows = self.client.get(TASKS_URL).json()
         self.assertEqual({t["title"] for t in rows}, {"Open", "Approved recently"})
-        self.assertEqual(set(rows[0]), TASK_KEYS)
+        self.assertEqual(set(rows[0]), DEVICE_TASK_KEYS)
         self.assertIn(open_task["id"], {t["id"] for t in rows})
 
     def test_full_member_flow(self) -> None:

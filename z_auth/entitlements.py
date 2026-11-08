@@ -64,6 +64,7 @@ MODULES: tuple[str, ...] = tuple(MODULE_LABELS)
 FALLBACK_MODULES = frozenset(MODULE_LABELS) - {REPORTS_PRO}  # what Free has: everything but reports_pro
 FALLBACK_MAX_DEVICES = 3
 FALLBACK_HISTORY_DAYS = 7
+FALLBACK_CHAT_HISTORY_DAYS = 30
 
 # Which module an agent event type / usage-metric category belongs to. Exact names first,
 # then prefixes. Anything unlisted (e.g. policy.updated, usb.policy_applied) is always kept.
@@ -110,6 +111,14 @@ class Entitlements:
     on_active_plan: bool
     # Days of alerts / activity / work-log history the owner sees (0 = no limit).
     history_days: int = 0
+    # v1.4: days of team chat kept (0 = no limit).
+    chat_history_days: int = 0
+
+    def chat_since(self, now: datetime | None = None) -> datetime | None:
+        """The oldest team-chat line the plan shows, or None when it keeps everything."""
+        if not self.chat_history_days:
+            return None
+        return (now or timezone.now()) - timedelta(days=self.chat_history_days)
 
     def history_since(self, now: datetime | None = None) -> datetime | None:
         """The oldest moment the owner may see, or None when the plan keeps everything."""
@@ -150,9 +159,14 @@ def _free_plan() -> Plan | None:
 
 def _from_plan(plan: Plan | None, on_active_plan: bool) -> Entitlements:
     if plan is None:
-        return Entitlements(None, FALLBACK_MODULES, FALLBACK_MAX_DEVICES, False, FALLBACK_HISTORY_DAYS)
+        return Entitlements(
+            None, FALLBACK_MODULES, FALLBACK_MAX_DEVICES, False, FALLBACK_HISTORY_DAYS, FALLBACK_CHAT_HISTORY_DAYS
+        )
     modules = frozenset(m for m in (plan.modules or []) if m in MODULE_LABELS)
-    return Entitlements(plan, modules, plan.max_devices or 0, on_active_plan, plan.history_days or 0)
+    return Entitlements(
+        plan, modules, plan.max_devices or 0, on_active_plan, plan.history_days or 0,
+        getattr(plan, "chat_history_days", 0) or 0,
+    )
 
 
 def entitlements_for(user: User) -> Entitlements:
@@ -235,6 +249,7 @@ def as_payload(user: User) -> dict[str, Any]:
         "modules": sorted(ent.modules),
         "max_devices": ent.max_devices,
         "history_days": ent.history_days,
+        "chat_history_days": ent.chat_history_days,
         "devices_used": devices_used(user),
         "upgrade_for": upgrade_for,
     }

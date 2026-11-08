@@ -162,6 +162,9 @@ def deactivate_member(member: Member) -> Member:
     member.is_active = False
     member.save(update_fields=["is_active"])
     revoked = member.devices.filter(is_revoked=False).update(is_revoked=True)
+    from z_chat.services import member_left
+
+    member_left(member)  # v1.4: out of every group and direct chat (the others keep a read-only copy for 30 days)
     transaction.on_commit(
         lambda: track(
             "member.deactivated",
@@ -355,7 +358,11 @@ def reply_from_member(
     if device.member_id is None:
         return None
     member = device.member
-    about_task = Task.objects.filter(pk=about_task_id, member=member).first() if about_task_id else None
+    about_task = None
+    if about_task_id:
+        from .work_tasks import _for_member
+
+        about_task = Task.objects.filter(pk=about_task_id, owner_id=member.owner_id).filter(_for_member(member.pk)).first()
     about_todo = MemberTodo.objects.filter(pk=about_todo_id, member=member).first() if about_todo_id else None
     message = Message.objects.create(
         owner_id=member.owner_id, member=member, sender=Message.Sender.MEMBER,
@@ -421,9 +428,17 @@ def thread_for_owner(owner: User, member: Member) -> QuerySet:
 def _with_tasks(qs: QuerySet) -> QuerySet:
     """FR-20: task lines carry their task (steps + activity) without a query per line; `task_talk` = how many lines
     are about that task (v1.3.5, F-17), so the card's count costs no query either."""
+    from django.db.models import Prefetch
+
+    from .models import TaskActivity, TaskPerson, TaskStep
+
     return (
-        qs.select_related("task__member")
-        .prefetch_related("task__steps", "task__activity")
+        qs.select_related("task__member", "task__owner")
+        .prefetch_related(
+            Prefetch("task__steps", queryset=TaskStep.objects.order_by("position", "id")),
+            Prefetch("task__activity", queryset=TaskActivity.objects.select_related("member").order_by("at", "id")),
+            Prefetch("task__people", queryset=TaskPerson.objects.select_related("member").order_by("position", "id")),
+        )
         .annotate(task_talk=Count("task__talk", distinct=True))
     )
 
@@ -1090,7 +1105,10 @@ def record_heartbeat(device: Device, data: dict[str, Any], ip: str | None) -> di
                 "consent_version", "consent_at", "consent_declined_at", "usb_restore_delivered_at",
             ]
         )
-    policy = get_policy(device.owner)
+    from .policy_scopes import policy_for_device_scope
+    from .work_rules import work_rules_for_device
+
+    policy = policy_for_device_scope(device, get_policy(device.owner))
     response = {
         "device_id": device.id,
         "server_time": device.last_seen_at,
@@ -1103,6 +1121,8 @@ def record_heartbeat(device: Device, data: dict[str, Any], ip: str | None) -> di
         "consent_state": device.consent_state,
         "usb_restore": usb_restore,
         **employer_names(device),
+        # v1.4: this PC's work hours and break limit (company <- department <- PC).
+        "work_rules": work_rules_for_device(device, now),
     }
     # The day moved (keys omitted otherwise, like "update"). Sent on every heartbeat of that day, so a lost response
     # costs nothing: the old PC hears where the day went, the new PC what to carry on from (it takes each one once).
@@ -1311,6 +1331,9 @@ def policy_for_device(device: Device, data: dict[str, Any], policy: Policy) -> d
         out["remote_software"]["blocking_enabled"] = False
         out["web"]["enabled"] = False
     out["web"]["list_version"] = device_list_version(device, policy)
+    from .work_rules import work_rules_for_device
+
+    out["work_rules"] = work_rules_for_device(device)  # v1.4
     return out
 
 

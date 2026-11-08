@@ -52,6 +52,7 @@ HEARTBEAT_RESPONSE_KEYS = {
     "company_name", "owner_name",
     "web_list_version",  # names the set of blocked sites this PC should hold
     "picture",  # FR-44: the PC's member's picture (null = initials)
+    "work_rules",  # v1.4: this PC's work hours and break limit
 }
 
 # The non-usb feature blocks as a freshly created policy emits them (see contract defaults).
@@ -130,6 +131,12 @@ class DeviceTestCase(APITestCase):
             "monitoring_enabled": True,
             "company_name": "",
             "owner_name": "",
+            # v1.4: the PC's work hours (the company defaults here).
+            "work_rules": {
+                "days": "1111110", "start": "10:00", "end": "19:00", "late_grace_min": 15, "break_allowed_min": 75,
+                "break_ok_over_min": 45, "tell_member_over": True, "full_day_hours": 8, "working_today": mock.ANY,
+                "holiday_today": None, "leave_today": None,
+            },
         }
 
 

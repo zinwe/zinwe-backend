@@ -179,6 +179,19 @@ class MessageSerializer(serializers.ModelSerializer):
     off null to hide the second line.
     """
 
+    class _List(serializers.ListSerializer):
+        """A thread: the task cards' chat summaries load in two queries for the whole page (v1.4)."""
+
+        def to_representation(self, data: Any) -> list[Any]:
+            from .work_tasks import chat_summaries
+
+            rows = list(data.all() if hasattr(data, "all") else data)
+            tasks = [t for t in (_task_of(m) for m in rows if m.kind == Message.Kind.TASK) if t is not None]
+            request = self.context.get("request")
+            auth = getattr(request, "auth", None)
+            chat_summaries(tasks, auth.member_id if isinstance(auth, Device) else None)
+            return super().to_representation(rows)
+
     body = serializers.SerializerMethodField()
     # FR-20: "task" lines carry the task (its live card in the thread); null on chat lines. Older Zinwe windows
     # ignore both fields and show the line's title + body as an ordinary message.
@@ -207,6 +220,9 @@ class MessageSerializer(serializers.ModelSerializer):
         if talk is not None:
             task.talk_count = talk  # from the thread query (services._with_tasks), not a query per card
         return TaskSerializer(task, context=self.context).data
+
+
+MessageSerializer.Meta.list_serializer_class = MessageSerializer._List  # type: ignore[attr-defined]
 
 
 class EventHandledSerializer(serializers.Serializer):
@@ -860,13 +876,17 @@ class ReportDeliverySerializer(serializers.Serializer):
         return obj.member.name if obj.member_id else None
 
 
-# --- FR-20 v2: tasks ------------------------------------------------------------
+# --- FR-20 v2 + v1.4 team tasks ---------------------------------------------------
 
 
 class TaskStepSerializer(serializers.Serializer):
     id = serializers.IntegerField(read_only=True)
     title = serializers.CharField(read_only=True)
     done = serializers.BooleanField(read_only=True)
+    # v1.4: who ticks it (null = anyone on the task), who ticked it and when.
+    owner_id = serializers.IntegerField(read_only=True, allow_null=True)
+    done_by_id = serializers.IntegerField(read_only=True, allow_null=True)
+    done_at = serializers.DateTimeField(read_only=True, allow_null=True)
 
 
 class TaskActivitySerializer(serializers.Serializer):
@@ -874,10 +894,27 @@ class TaskActivitySerializer(serializers.Serializer):
     by = serializers.CharField(read_only=True)
     action = serializers.CharField(read_only=True)
     note = serializers.CharField(read_only=True)
+    # v1.4: the person who did it (null for the owner and lines from before 1.4).
+    member_id = serializers.IntegerField(read_only=True, allow_null=True)
+    member_name = serializers.SerializerMethodField()
+
+    def get_member_name(self, obj: Any) -> str | None:
+        return obj.member.name if obj.member_id and obj.member else None
+
+
+def _agent_below_14(device: Any) -> bool:
+    from .services import _parse_version
+
+    version = _parse_version(getattr(device, "agent_version", "") or "")
+    return bool(version) and version < (1, 4)
 
 
 class TaskSerializer(serializers.Serializer):
-    """The Task of the FR-20 v2 contract, for the owner's dashboard and the member's Zinwe window alike."""
+    """
+    The Task of the FR-20 v2 contract + the v1.4 team-task fields, for the owner's dashboard and the member's Zinwe window
+    alike. Context: `request`; `device` (a device call: adds the `me` block, and a Zinwe window older than 1.4 gets
+    "cantdo" as "help"); `viewer_member_id` (whose unread count; None = the owner).
+    """
 
     id = serializers.IntegerField(read_only=True)
     member_id = serializers.IntegerField(read_only=True)
@@ -889,8 +926,8 @@ class TaskSerializer(serializers.Serializer):
     due_at = serializers.DateTimeField(read_only=True, allow_null=True)
     priority = serializers.CharField(read_only=True)
     steps = TaskStepSerializer(many=True, read_only=True)
-    status = serializers.CharField(read_only=True)
-    help_note = serializers.CharField(read_only=True)
+    status = serializers.SerializerMethodField()
+    help_note = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
     status_changed_at = serializers.DateTimeField(read_only=True)
@@ -899,6 +936,43 @@ class TaskSerializer(serializers.Serializer):
     activity = TaskActivitySerializer(many=True, read_only=True)
     # v1.3.5 (F-17): how many chat lines are about this task (its thread). Lists annotate it; a lone task counts.
     talk_count = serializers.SerializerMethodField()
+    # v1.4 team tasks.
+    member = serializers.IntegerField(source="member_id", read_only=True)
+    mode = serializers.CharField(read_only=True)
+    in_order = serializers.BooleanField(read_only=True)
+    repeat = serializers.CharField(read_only=True)
+    next_on = serializers.DateField(read_only=True, allow_null=True)
+    group_id = serializers.IntegerField(read_only=True, allow_null=True)
+    repeat_of_id = serializers.IntegerField(read_only=True, allow_null=True)
+    people = serializers.SerializerMethodField()
+    cantdo_note = serializers.CharField(read_only=True)
+    reopen_note = serializers.CharField(read_only=True)
+    nudged_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    chat = serializers.SerializerMethodField()
+
+    def to_representation(self, instance: Any) -> dict[str, Any]:
+        data = super().to_representation(instance)
+        device = self.context.get("device")
+        if device is not None and device.member_id:
+            from .work_tasks import me_block
+
+            data["me"] = me_block(instance, device.member_id)
+        return data
+
+    def _legacy(self) -> bool:
+        device = self.context.get("device")
+        return device is not None and _agent_below_14(device)
+
+    def get_status(self, obj: Any) -> str:
+        # A Zinwe window older than 1.4 doesn't know "cantdo": it shows it as "help" (with the reason as the note).
+        if obj.status == Task.Status.CANTDO and self._legacy():
+            return Task.Status.HELP
+        return obj.status
+
+    def get_help_note(self, obj: Any) -> str:
+        if obj.status == Task.Status.CANTDO and self._legacy():
+            return obj.cantdo_note
+        return obj.help_note
 
     def get_talk_count(self, obj: Any) -> int:
         n = getattr(obj, "talk_count", None)
@@ -908,6 +982,47 @@ class TaskSerializer(serializers.Serializer):
         from .pictures import picture_payload
 
         return picture_payload(obj.member, self.context.get("request"))
+
+    def get_people(self, obj: Any) -> list[dict[str, Any]]:
+        from .pictures import picture_payload
+        from .work_tasks import people_of, person_state, person_steps, steps_of
+
+        steps = steps_of(obj)
+        out = []
+        for p in people_of(obj):
+            done, total = person_steps(steps, p.member_id)
+            out.append({
+                "member_id": p.member_id, "name": p.member.name, "role": p.member.role,
+                "picture": picture_payload(p.member, self.context.get("request")),
+                "state": person_state(obj, p, steps), "steps_total": total, "steps_done": done,
+                "seen_at": _iso(p.seen_at), "started_at": _iso(p.started_at), "done_at": _iso(p.done_at),
+                "note": p.flag_note if p.flag else "",
+            })
+        return out
+
+    def get_chat(self, obj: Any) -> dict[str, Any]:
+        from .work_tasks import chat_summaries
+
+        if getattr(obj, "_chat", None) is None:
+            chat_summaries([obj], self.context.get("viewer_member_id"))
+        chat = dict(obj._chat)
+        if chat.get("last"):
+            chat["last"] = {**chat["last"], "at": _iso(chat["last"]["at"])}
+        return chat
+
+
+def _iso(value: Any) -> str | None:
+    return serializers.DateTimeField().to_representation(value) if value else None
+
+
+def task_context(request: Any, device: Any = None, tasks: Any = None) -> dict[str, Any]:
+    """Serializer context for tasks; with `tasks`, their chat summaries are loaded in two queries."""
+    viewer = device.member_id if device is not None else None
+    if tasks is not None:
+        from .work_tasks import chat_summaries
+
+        chat_summaries(list(tasks), viewer)
+    return {"request": request, "device": device, "viewer_member_id": viewer}
 
 
 def _task_of(message: Message) -> Any:
@@ -930,46 +1045,124 @@ class TaskCreateSerializer(serializers.Serializer):
     )
 
 
+def _validate_step_items(value: list[Any], allow_done: bool) -> list[Any]:
+    for item in value:
+        if isinstance(item, str):
+            if len(item) > 200:
+                raise serializers.ValidationError("A step is up to 200 characters.")
+        elif isinstance(item, dict):
+            if not isinstance(item.get("title", ""), str) or len(item.get("title", "")) > 200:
+                raise serializers.ValidationError("A step needs a title of up to 200 characters.")
+            if "id" in item and item["id"] is not None and not isinstance(item["id"], int):
+                raise serializers.ValidationError("A step id is a number.")
+            if "done" in item and (not allow_done or not isinstance(item["done"], bool)):
+                raise serializers.ValidationError("done is true or false.")
+            owner_id = item.get("owner_id")
+            if owner_id is not None and (not isinstance(owner_id, int) or isinstance(owner_id, bool)):
+                raise serializers.ValidationError("A step's owner_id is a member id or null.")
+        else:
+            raise serializers.ValidationError("Each step is a title or {title, owner_id}.")
+    return value
+
+
+class TeamTaskCreateSerializer(serializers.Serializer):
+    """
+    POST /api/devices/tasks/ (v1.4) -- {title, note?, due_at?, priority?, member_ids?, group_id?, post_in_group?,
+    mode?, in_order?, repeat?, steps?: [title | {title, owner_id}]}. With only group_id, the task goes to the group's
+    people.
+    """
+
+    title = serializers.CharField(max_length=120, trim_whitespace=True)
+    note = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
+    due_at = serializers.DateTimeField(required=False, allow_null=True, default=None)
+    priority = serializers.ChoiceField(choices=Task.Priority.choices, required=False, default=Task.Priority.NORMAL)
+    member_ids = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, default=list,
+                                       max_length=50)
+    group_id = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
+    post_in_group = serializers.BooleanField(required=False, default=True)
+    mode = serializers.ChoiceField(choices=Task.Mode.choices, required=False, default=Task.Mode.ALL)
+    in_order = serializers.BooleanField(required=False, default=False)
+    repeat = serializers.ChoiceField(choices=Task.Repeat.choices, required=False, allow_blank=True, default="")
+    steps = serializers.ListField(child=serializers.JSONField(), required=False, default=list, max_length=20)
+
+    def validate_steps(self, value: list[Any]) -> list[Any]:
+        return _validate_step_items(value, allow_done=False)
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        if not attrs["member_ids"] and not attrs.get("group_id"):
+            raise serializers.ValidationError({"member_ids": ["Pick at least one person or a group."]})
+        return attrs
+
+
 class TaskUpdateSerializer(serializers.Serializer):
-    """PATCH /api/devices/tasks/<id>/ -- any of {title, note, due_at, priority, steps: [title | {id?, title, done?}]}."""
+    """
+    PATCH /api/devices/tasks/<id>/ -- any of {title, note, due_at, priority, repeat, in_order,
+    steps: [title | {id?, title, done?, owner_id?}]}.
+    """
 
     title = serializers.CharField(max_length=120, trim_whitespace=True, required=False)
     note = serializers.CharField(max_length=1000, required=False, allow_blank=True)
     due_at = serializers.DateTimeField(required=False, allow_null=True)
     priority = serializers.ChoiceField(choices=Task.Priority.choices, required=False)
+    repeat = serializers.ChoiceField(choices=Task.Repeat.choices, required=False, allow_blank=True)
+    in_order = serializers.BooleanField(required=False)
     steps = serializers.ListField(child=serializers.JSONField(), required=False, max_length=20)
 
     def validate_steps(self, value: list[Any]) -> list[Any]:
-        for item in value:
-            if isinstance(item, str):
-                if len(item) > 200:
-                    raise serializers.ValidationError("A step is up to 200 characters.")
-            elif isinstance(item, dict):
-                if not isinstance(item.get("title", ""), str) or len(item.get("title", "")) > 200:
-                    raise serializers.ValidationError("A step needs a title of up to 200 characters.")
-                if "id" in item and item["id"] is not None and not isinstance(item["id"], int):
-                    raise serializers.ValidationError("A step id is a number.")
-                if "done" in item and not isinstance(item["done"], bool):
-                    raise serializers.ValidationError("done is true or false.")
-            else:
-                raise serializers.ValidationError("Each step is a title or {id, title, done}.")
-        return value
+        return _validate_step_items(value, allow_done=True)
 
 
 class TaskOwnerActionSerializer(serializers.Serializer):
-    """POST /api/devices/tasks/<id>/action/ (owner) -- {action: approve|reopen|cancel|nudge, note?}."""
+    """
+    POST /api/devices/tasks/<id>/action/ (owner) -- {action: approve|reopen|cancel|restore|nudge|reply|reassign|move_due,
+    note?, member_id?, from_member_id?, due_at?}.
+    """
 
-    action = serializers.ChoiceField(choices=["approve", "reopen", "cancel", "nudge"])
+    action = serializers.ChoiceField(
+        choices=["approve", "reopen", "cancel", "nudge", "reply", "reassign", "move_due", "restore"]
+    )
     note = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
+    member_id = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
+    from_member_id = serializers.IntegerField(min_value=1, required=False, allow_null=True, default=None)
+    due_at = serializers.DateTimeField(required=False, allow_null=True, default=None)
 
 
 class TaskDeviceActionSerializer(serializers.Serializer):
-    """POST /api/devices/tasks/<id>/action/ (device) -- {action: seen|accept|start|help|done|note, note?, step_id?, step_done?}."""
+    """
+    POST /api/devices/tasks/<id>/action/ (device) -- {action: seen|start|tick|untick|help|cantdo|finish (v1.4), or the
+    pre-1.4 accept|done|note; note?, step_id?, step_done?}.
+    """
 
-    action = serializers.ChoiceField(choices=["seen", "accept", "start", "help", "done", "note"])
+    action = serializers.ChoiceField(
+        choices=["seen", "accept", "start", "help", "done", "note", "tick", "untick", "cantdo", "finish"]
+    )
     note = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
     step_id = serializers.IntegerField(required=False, allow_null=True, default=None)
     step_done = serializers.BooleanField(required=False, allow_null=True, default=None)
+
+
+class TaskChatPostSerializer(serializers.Serializer):
+    """POST /api/devices/tasks/<id>/chat/ -- {body}."""
+
+    body = serializers.CharField(max_length=2000, trim_whitespace=True)
+
+
+class TaskChatQuerySerializer(serializers.Serializer):
+    """GET /api/devices/tasks/<id>/chat/?after=<line id>."""
+
+    after = serializers.IntegerField(min_value=1, required=False, default=None)
+
+
+def task_chat_line(line: Message, owner_name: str) -> dict[str, Any]:
+    """One task-chat line: {id, by: {kind, member_id, name}, body, at}."""
+    mine = line.sender == Message.Sender.OWNER
+    return {
+        "id": line.pk,
+        "by": {"kind": "owner", "member_id": None, "name": owner_name} if mine
+        else {"kind": "member", "member_id": line.member_id, "name": line.member.name},
+        "body": line.body,
+        "at": _iso(line.created_at),
+    }
 
 
 class TaskListQuerySerializer(serializers.Serializer):

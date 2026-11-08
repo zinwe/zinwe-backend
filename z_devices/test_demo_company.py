@@ -60,6 +60,40 @@ class DemoCompanyTests(TestCase):
         self.assertEqual(set(Member.objects.values_list("member_code", flat=True)), codes)
         self.assertEqual(WorkLog.objects.count(), logs)  # rebuilt, not doubled
 
+    def test_v14_groups_team_tasks_and_rules(self) -> None:
+        from z_chat.models import ChatMessage, Conversation
+        from z_devices.models import Holiday, Task, WorkSchedule
+        from z_devices.work_tasks import can_tick, people_of, person_state
+
+        seed()
+        owner = User.objects.get(email=OWNER_EMAIL)
+        groups = {g.name: g for g in Conversation.objects.filter(owner=owner, kind="group")}
+        self.assertEqual(set(groups), {"Design", "Development", "Everyone"})
+        design = sorted(p.member.name for p in groups["Design"].people.all())
+        self.assertEqual(design, ["Emily Carter", "Fatima Sheikh", "Priya Nair"])
+        self.assertEqual(groups["Everyone"].people.count(), len(PEOPLE))
+        lumen = Task.objects.get(owner=owner, title="Launch the Lumen landing page")
+        self.assertTrue(lumen.in_order)
+        self.assertEqual(lumen.status, "progress")
+        self.assertEqual(lumen.group_id, groups["Design"].pk)
+        self.assertTrue(ChatMessage.objects.filter(task=lumen, conversation=groups["Design"]).exists())
+        steps = list(lumen.steps.order_by("position"))
+        owners = [s.owner.name.split()[0] for s in steps]
+        self.assertEqual(owners, ["Priya", "Priya", "Karan", "Karan", "Emily", "Emily"])
+        self.assertEqual([s.done for s in steps], [True, True, False, False, False, False])
+        karan = Member.objects.get(owner=owner, name="Karan Malhotra")
+        self.assertEqual(can_tick(lumen, karan.pk, steps), [steps[2].pk])
+        states = {p.member.name: person_state(lumen, p, steps) for p in people_of(lumen)}
+        self.assertEqual(states["Priya Nair"], "done")
+        self.assertTrue(WorkSchedule.objects.filter(owner=owner, scope_kind="company").exists())
+        self.assertTrue(Holiday.objects.filter(owner=owner).exists())
+        self.assertTrue(Conversation.objects.filter(owner=owner, kind="direct").exists())
+        counts = (Task.objects.filter(owner=owner).count(), Conversation.objects.filter(owner=owner).count(),
+                  ChatMessage.objects.filter(conversation__owner=owner).count())
+        seed()  # rebuilt, not doubled
+        self.assertEqual(counts, (Task.objects.filter(owner=owner).count(), Conversation.objects.filter(owner=owner).count(),
+                                  ChatMessage.objects.filter(conversation__owner=owner).count()))
+
     def test_clear_removes_everything(self) -> None:
         seed()
         seed("--clear")

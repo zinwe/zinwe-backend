@@ -11,9 +11,14 @@ from .models import (
     MemberTodo,
     Message,
     Policy,
+    Holiday,
+    Leave,
+    PolicyOverride,
     Task,
     TaskActivity,
+    TaskPerson,
     TaskStep,
+    WorkSchedule,
     UsageMetric,
 )
 
@@ -100,14 +105,21 @@ class MessageAdmin(admin.ModelAdmin):
 class TaskStepInline(admin.TabularInline):
     model = TaskStep
     extra = 0
-    readonly_fields = ("title", "done", "position")
+    readonly_fields = ("title", "done", "position", "owner", "done_by", "done_at")
+    can_delete = False
+
+
+class TaskPersonInline(admin.TabularInline):
+    model = TaskPerson
+    extra = 0
+    readonly_fields = ("member", "position", "seen_at", "started_at", "done_at", "flag", "flag_note")
     can_delete = False
 
 
 class TaskActivityInline(admin.TabularInline):
     model = TaskActivity
     extra = 0
-    readonly_fields = ("at", "by", "action", "note")
+    readonly_fields = ("at", "by", "member", "action", "note")
     can_delete = False
 
 
@@ -120,9 +132,10 @@ class TaskAdmin(admin.ModelAdmin):
     search_fields = ("title", "member__name", "member__email", "owner__email")
     list_select_related = ("member", "owner")
     raw_id_fields = ("owner", "member", "message")
-    inlines = [TaskStepInline, TaskActivityInline]
+    inlines = [TaskPersonInline, TaskStepInline, TaskActivityInline]
     readonly_fields = (
         "owner", "member", "message", "title", "note", "due_at", "priority", "status", "help_note",
+        "mode", "in_order", "repeat", "next_on", "repeat_of", "group", "cantdo_note", "reopen_note",
         "status_changed_at", "status_changed_by", "nudged_at", "created_at", "updated_at",
     )
 
@@ -190,3 +203,37 @@ class UsageMetricAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request: HttpRequest, obj=None) -> bool:  # type: ignore[no-untyped-def]
         return False
+
+
+# --- v1.4 rules ------------------------------------------------------------------------
+
+
+@admin.register(WorkSchedule)
+class WorkScheduleAdmin(admin.ModelAdmin):
+    list_display = ("owner", "scope_kind", "scope_key", "days", "start", "end", "break_allowed_min", "updated_at")
+    list_filter = ("scope_kind",)
+    search_fields = ("owner__email",)
+    raw_id_fields = ("owner",)
+
+
+@admin.register(Holiday)
+class HolidayAdmin(admin.ModelAdmin):
+    list_display = ("owner", "date", "name")
+    search_fields = ("owner__email", "name")
+    raw_id_fields = ("owner",)
+
+
+@admin.register(Leave)
+class LeaveAdmin(admin.ModelAdmin):
+    list_display = ("member", "date", "half", "status", "owner", "created_at")
+    list_filter = ("status", "half")
+    search_fields = ("member__name", "member__email", "owner__email")
+    raw_id_fields = ("owner", "member")
+
+
+@admin.register(PolicyOverride)
+class PolicyOverrideAdmin(admin.ModelAdmin):
+    list_display = ("owner", "scope_kind", "scope_key", "updated_at")
+    list_filter = ("scope_kind",)
+    search_fields = ("owner__email",)
+    raw_id_fields = ("owner",)

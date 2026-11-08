@@ -225,7 +225,7 @@ class PlanListTests(PortalTestCase):
                         "yearly_saving_percent": 17,
                     },
                 },
-                "trial_days": 0, "max_devices": 50, "history_days": 365,
+                "trial_days": 0, "max_devices": 50, "history_days": 365, "chat_history_days": 365,
                 "features": plans["businesses"]["features"], "modules": plans["businesses"]["modules"],
                 "is_recommended": True,
                 "requires_payment": True, "sort_order": 30, "trial_available": False,
@@ -235,6 +235,11 @@ class PlanListTests(PortalTestCase):
         self.assertEqual(
             {code: p["history_days"] for code, p in plans.items()},
             {"free": 7, "startups": 90, "teams": 180, "businesses": 365},
+        )
+        # v1.4: days of team chat kept.
+        self.assertEqual(
+            {code: p["chat_history_days"] for code, p in plans.items()},
+            {"free": 30, "startups": 90, "teams": 180, "businesses": 365},
         )
         self.assertTrue(plans["businesses"]["tagline"])
         # Free forever is the free way in: no plan offers a time-limited trial.

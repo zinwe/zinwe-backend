@@ -188,6 +188,12 @@ class Plan(models.Model):
         help_text="Days of alerts, activity and work-log history the owner can see (0 = no limit). Older data is "
         "hidden at once and deleted 30 days later (z_devices.retention).",
     )
+    # v1.4: days of team chat (z_chat groups and direct chats) the plan keeps (0 = no limit). Older lines are hidden at
+    # once and deleted 30 days later (z_chat.retention), like history_days.
+    chat_history_days = models.PositiveIntegerField(
+        default=0, db_default=0,
+        help_text="Days of team chat kept (0 = no limit). Older lines are hidden at once and deleted 30 days later.",
+    )
     features = models.JSONField(default=list, blank=True, help_text="Short feature lines shown on plan cards.")
     modules = models.JSONField(
         default=list, blank=True,
