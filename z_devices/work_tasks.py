@@ -223,12 +223,12 @@ def me_block(task: Task, member_id: int) -> dict[str, Any]:
     steps = steps_of(task)
     person = next((p for p in people_of(task) if p.member_id == member_id), None)
     if person is None:
-        return {"turn": False, "can_tick": [], "state": "sent", "restart": False}
+        return {"member_id": member_id, "turn": False, "can_tick": [], "state": "sent", "restart": False}
     state = person_state(task, person, steps)
     ticks = can_tick(task, member_id, steps)
     turn = bool(ticks) or (not steps and task.status in WORKING and state not in ("done", "help", "cantdo"))
     return {
-        "turn": turn, "can_tick": ticks, "state": state,
+        "member_id": member_id, "turn": turn, "can_tick": ticks, "state": state,
         "restart": bool(task.reopen_note) and task.status == S.PROGRESS and person.started_at is None,
     }
 
