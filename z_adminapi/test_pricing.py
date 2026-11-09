@@ -51,10 +51,13 @@ class PricingTests(AdminApiTestCase):
         self.client.patch(f"{URL}teams/", {"is_recommended": True}, format="json")
         self.assertEqual(list(Plan.objects.filter(is_recommended=True).values_list("code", flat=True)), ["teams"])
 
-    def test_file_max_mb_per_plan_and_editable(self) -> None:  # v1.5 round 2: chat file size by plan
+    def test_overview_shows_file_max_mb(self) -> None:  # v1.5 round 2: chat file size by plan
         plans = {p["code"]: p for p in self.client.get(URL).json()["plans"]}
         self.assertEqual({c: p["file_max_mb"] for c, p in plans.items()},
                          {"free": 1024, "startups": 2048, "teams": 3072, "businesses": 5120})
+        self.assertEqual(self.client.get(f"{URL}teams/").json()["file_max_mb"], 3072)
+
+    def test_change_file_max_mb_free_plan_too(self) -> None:  # v1.5 round 2
         response = self.client.patch(f"{URL}teams/", {"file_max_mb": 4096}, format="json")
         self.assertEqual((response.status_code, response.json()["file_max_mb"]), (200, 4096), response.content)
         self.assertEqual(Plan.objects.get(code="teams").file_max_mb, 4096)
