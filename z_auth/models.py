@@ -194,6 +194,12 @@ class Plan(models.Model):
         default=0, db_default=0,
         help_text="Days of team chat kept (0 = no limit). Older lines are hidden at once and deleted 30 days later.",
     )
+    # v1.5: the largest file a member or the owner may share in chat, in MB (the file stays on the sender's device;
+    # z_chat.files). Free 1 GB, Startups 2 GB, Teams 3 GB, Businesses 5 GB.
+    file_max_mb = models.PositiveIntegerField(
+        "file sharing, max size (MB)", default=1024, db_default=1024,
+        help_text="The largest file anyone may share in chat, in MB (1024 = 1 GB).",
+    )
     features = models.JSONField(default=list, blank=True, help_text="Short feature lines shown on plan cards.")
     modules = models.JSONField(
         default=list, blank=True,

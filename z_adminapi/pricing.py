@@ -85,6 +85,7 @@ def plan_pricing(plan: Plan, subscribers: int = 0) -> dict[str, Any]:
         "max_devices": plan.max_devices,
         "history_days": plan.history_days,
         "chat_history_days": plan.chat_history_days,
+        "file_max_mb": plan.file_max_mb,
         "is_recommended": plan.is_recommended,
         "is_free": not plan.requires_payment,
         "subscribers": subscribers,
@@ -130,6 +131,8 @@ class PricingUpdateSerializer(serializers.Serializer):
     is_recommended = serializers.BooleanField(required=False)
     # v1.4: days of team chat the plan keeps (0 = no limit).
     chat_history_days = serializers.IntegerField(min_value=0, max_value=3650, required=False)
+    # v1.5: the largest file anyone may share in chat, in MB (the admin app edits it in GB).
+    file_max_mb = serializers.IntegerField(min_value=1, max_value=102400, required=False)
     band_min_inr = serializers.DecimalField(
         max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False, allow_null=True,
     )
@@ -192,7 +195,7 @@ class PricingUpdateSerializer(serializers.Serializer):
             plan.price_usd_monthly = Plan.discounted(region["list_monthly"], region["discount_percent"])
             plan.price_usd_yearly = region.get("yearly_price") if region["list_monthly"] > 0 else None
             fields += ["list_price_usd_monthly", "price_usd_monthly", "price_usd_yearly"]
-        for field in ("band_min_inr", "band_max_inr", "chat_history_days"):
+        for field in ("band_min_inr", "band_max_inr", "chat_history_days", "file_max_mb"):
             if field in data:
                 setattr(plan, field, data[field])
                 fields.append(field)

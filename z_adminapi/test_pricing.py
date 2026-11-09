@@ -51,6 +51,18 @@ class PricingTests(AdminApiTestCase):
         self.client.patch(f"{URL}teams/", {"is_recommended": True}, format="json")
         self.assertEqual(list(Plan.objects.filter(is_recommended=True).values_list("code", flat=True)), ["teams"])
 
+    def test_file_max_mb_per_plan_and_editable(self) -> None:  # v1.5 round 2: chat file size by plan
+        plans = {p["code"]: p for p in self.client.get(URL).json()["plans"]}
+        self.assertEqual({c: p["file_max_mb"] for c, p in plans.items()},
+                         {"free": 1024, "startups": 2048, "teams": 3072, "businesses": 5120})
+        response = self.client.patch(f"{URL}teams/", {"file_max_mb": 4096}, format="json")
+        self.assertEqual((response.status_code, response.json()["file_max_mb"]), (200, 4096), response.content)
+        self.assertEqual(Plan.objects.get(code="teams").file_max_mb, 4096)
+        self.assertEqual(self.client.patch(f"{URL}free/", {"file_max_mb": 2048}, format="json").status_code, 200)
+        self.assertEqual(Plan.objects.get(code="free").file_max_mb, 2048)  # the free plan has a size, not a price
+        bad = self.client.patch(f"{URL}teams/", {"file_max_mb": 0}, format="json")
+        self.assertEqual(bad.status_code, status.HTTP_400_BAD_REQUEST)
+
     def test_staff_only(self) -> None:
         self.as_user(self.make_owner())
         self.assertEqual(self.client.get(URL).status_code, status.HTTP_403_FORBIDDEN)

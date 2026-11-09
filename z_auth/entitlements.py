@@ -65,6 +65,7 @@ FALLBACK_MODULES = frozenset(MODULE_LABELS) - {REPORTS_PRO}  # what Free has: ev
 FALLBACK_MAX_DEVICES = 3
 FALLBACK_HISTORY_DAYS = 7
 FALLBACK_CHAT_HISTORY_DAYS = 30
+FALLBACK_FILE_MAX_MB = 1024  # v1.5: 1 GB, what Free has
 
 # Which module an agent event type / usage-metric category belongs to. Exact names first,
 # then prefixes. Anything unlisted (e.g. policy.updated, usb.policy_applied) is always kept.
@@ -113,6 +114,12 @@ class Entitlements:
     history_days: int = 0
     # v1.4: days of team chat kept (0 = no limit).
     chat_history_days: int = 0
+    # v1.5: the largest file anyone in the company may share in chat, in MB.
+    file_max_mb: int = FALLBACK_FILE_MAX_MB
+
+    @property
+    def file_max_bytes(self) -> int:
+        return self.file_max_mb * 1024 * 1024
 
     def chat_since(self, now: datetime | None = None) -> datetime | None:
         """The oldest team-chat line the plan shows, or None when it keeps everything."""
@@ -160,12 +167,13 @@ def _free_plan() -> Plan | None:
 def _from_plan(plan: Plan | None, on_active_plan: bool) -> Entitlements:
     if plan is None:
         return Entitlements(
-            None, FALLBACK_MODULES, FALLBACK_MAX_DEVICES, False, FALLBACK_HISTORY_DAYS, FALLBACK_CHAT_HISTORY_DAYS
+            None, FALLBACK_MODULES, FALLBACK_MAX_DEVICES, False, FALLBACK_HISTORY_DAYS, FALLBACK_CHAT_HISTORY_DAYS,
+            FALLBACK_FILE_MAX_MB,
         )
     modules = frozenset(m for m in (plan.modules or []) if m in MODULE_LABELS)
     return Entitlements(
         plan, modules, plan.max_devices or 0, on_active_plan, plan.history_days or 0,
-        getattr(plan, "chat_history_days", 0) or 0,
+        getattr(plan, "chat_history_days", 0) or 0, getattr(plan, "file_max_mb", 0) or FALLBACK_FILE_MAX_MB,
     )
 
 
@@ -250,6 +258,7 @@ def as_payload(user: User) -> dict[str, Any]:
         "max_devices": ent.max_devices,
         "history_days": ent.history_days,
         "chat_history_days": ent.chat_history_days,
+        "file_max_mb": ent.file_max_mb,
         "devices_used": devices_used(user),
         "upgrade_for": upgrade_for,
     }

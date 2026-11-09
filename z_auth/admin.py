@@ -75,7 +75,8 @@ class UserAdmin(DjangoUserAdmin):
 class PlanAdmin(admin.ModelAdmin):
     list_display = (
         "code", "name", "list_price_inr_monthly", "discount_percent", "price_inr_monthly", "trial_days",
-        "max_devices", "history_days", "chat_history_days", "modules", "is_recommended",
+        "max_devices", "history_days", "chat_history_days", "file_max_mb", "modules",
+        "is_recommended",
         "is_active", "sort_order",
     )
     list_filter = ("is_active", "is_recommended")

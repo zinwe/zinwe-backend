@@ -290,7 +290,7 @@ class PlanSerializer(serializers.ModelSerializer):
         fields = (
             "code", "name", "tagline", "price_inr_monthly", "list_price_inr_monthly", "discount_percent",
             "price_usd_monthly", "list_price_usd_monthly", "prices", "quote",
-            "trial_days", "max_devices", "history_days", "chat_history_days",
+            "trial_days", "max_devices", "history_days", "chat_history_days", "file_max_mb",
             "features", "modules", "is_recommended", "requires_payment", "sort_order", "trial_available",
             "gst_charged",
         )

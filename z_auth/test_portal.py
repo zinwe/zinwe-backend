@@ -226,6 +226,7 @@ class PlanListTests(PortalTestCase):
                     },
                 },
                 "trial_days": 0, "max_devices": 50, "history_days": 365, "chat_history_days": 365,
+                "file_max_mb": 5120,
                 "features": plans["businesses"]["features"], "modules": plans["businesses"]["modules"],
                 "is_recommended": True,
                 "requires_payment": True, "sort_order": 30, "trial_available": False,
@@ -240,6 +241,11 @@ class PlanListTests(PortalTestCase):
         self.assertEqual(
             {code: p["chat_history_days"] for code, p in plans.items()},
             {"free": 30, "startups": 90, "teams": 180, "businesses": 365},
+        )
+        # v1.5: the largest file each plan may share in chat (MB).
+        self.assertEqual(
+            {code: p["file_max_mb"] for code, p in plans.items()},
+            {"free": 1024, "startups": 2048, "teams": 3072, "businesses": 5120},
         )
         self.assertTrue(plans["businesses"]["tagline"])
         # Free forever is the free way in: no plan offers a time-limited trial.
