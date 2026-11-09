@@ -78,15 +78,20 @@ def update_settings(owner: User, data: dict[str, Any]) -> ChatSettings:
 
 
 def settings_json(row: ChatSettings) -> dict[str, Any]:
-    """GET|PATCH /api/chat/settings/ (file_max_bytes and file_keep_days are read-only)."""
+    """GET|PATCH /api/chat/settings/. Only the two switches are writable. v1.5 round 2: file_max_bytes comes from the
+    plan (file_max_mb) and files are kept 30 days; `allowed` / `max_bytes` / `keep_days` repeat what the device's
+    GET /api/devices/chat/files/ says."""
+    ent = entitlements_for(row.owner)
+    max_bytes = ent.file_max_bytes
     return {
         "allow_member_dm": row.allow_member_dm, "allow_files": row.allow_files,
-        "file_max_bytes": files.FILE_MAX_BYTES, "file_keep_days": files.FILE_KEEP_DAYS,
+        "file_max_bytes": max_bytes, "file_keep_days": files.FILE_KEEP_DAYS,
+        "allowed": ent.has(TEAM_CHAT) and row.allow_files, "max_bytes": max_bytes, "keep_days": files.FILE_KEEP_DAYS,
     }
 
 
 def files_allowed(owner: User) -> bool:
-    """v1.5: may anyone in this company upload a chat file now (the team-chat plan and the owner's switch)."""
+    """v1.5: may anyone in this company share a chat file now (the team-chat plan and the owner's switch)."""
     return entitlements_for(owner).has(TEAM_CHAT) and settings_for(owner).allow_files
 
 
@@ -441,7 +446,8 @@ def visible_lines(conv: Conversation, row: ConversationMember | None) -> QuerySe
 def page(conv: Conversation, row: ConversationMember | None, before: int | None = None, after: int | None = None,
          limit: int = PAGE) -> list[ChatMessage]:
     limit = max(1, min(limit or PAGE, MAX_PAGE))
-    qs = visible_lines(conv, row).select_related("sender_member", "reply_to__sender_member", "chat_file")
+    qs = visible_lines(conv, row).select_related(
+        "sender_member", "reply_to__sender_member", "chat_file__by_member", "chat_file__owner")
     if after:
         return list(qs.filter(pk__gt=after).order_by("created_at", "id")[:limit])
     if before:
@@ -670,7 +676,8 @@ def line_json(line: ChatMessage, conv: Conversation, viewer_member: Member | Non
         "id": line.pk, "by": _by(line, owner), "body": body, "reply_to": reply, "task_id": line.task_id,
         "system": line.system, "edited": line.edited_at is not None, "deleted": deleted,
         "at": _iso(line.created_at), "seen_by": seen_by,
-        "file": None if deleted else files.file_json(files.file_of(line), request, device=viewer_member is not None),
+        "file": None if deleted else files.file_json(files.file_of(line), request, device=viewer_member is not None,
+                                                     viewer_member_id=viewer_member.pk if viewer_member else None),
     }
 
 

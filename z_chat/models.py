@@ -9,10 +9,8 @@ they share a group with, and only while the owner's `allow_member_dm` is on. Rul
 from __future__ import annotations
 
 import uuid
-from pathlib import Path
 
-from django.conf import settings
-from django.db import models, transaction
+from django.db import models
 from django.db.models import Q
 from django.utils import timezone
 
@@ -137,30 +135,47 @@ class ChatSettings(models.Model):
 
 class ChatFile(models.Model):
     """
-    v1.5 file sharing in chat ("send and forget"): one file, uploaded once, attached to one line of a group or direct
-    chat (`chat_line`) or of the owner <-> member admin chat (`member_message`). Kept FILE_KEEP_DAYS after the line was
-    posted, then the disk file goes (`deleted_at`) and the row stays so the line says "no longer available". Stored at
-    <CHAT_FILES_ROOT>/<owner_id>/<id> (outside MEDIA_ROOT: never in the backups). Rules: z_chat.files.
+    v1.5 file sharing in chat. Round 2 (owner, 9 Nov 2026): OUR SERVER NEVER STORES A FILE. This row is only the
+    record: who shared it, its name, size and type, which device or browser holds it (`holder`) and a tiny preview
+    picture (`thumb`). The bytes stay on the sender's device and stream through the relay (z_relay, memory only) when
+    someone downloads them. Attached to one line of a group or direct chat (`chat_line`) or of the owner <-> member
+    admin chat (`member_message`). Downloadable while not stopped, not gone, its line not deleted and less than
+    FILE_KEEP_DAYS old. Rules: z_chat.files.
 
     Privacy: never registered in the Django admin, so a file of a direct chat is never visible there.
     """
 
     class Kind(models.TextChoices):
         IMAGE = "image", "Image"
+        VIDEO = "video", "Video"
+        AUDIO = "audio", "Audio"
+        DOCUMENT = "document", "Document"
         FILE = "file", "File"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     owner = models.ForeignKey("z_auth.User", on_delete=models.CASCADE, related_name="chat_files")
-    # Null = the owner uploaded it.
+    # Null = the owner shared it.
     by_member = models.ForeignKey(
         "z_devices.Member", null=True, blank=True, on_delete=models.CASCADE, related_name="chat_files"
     )
     name = models.CharField(max_length=200)
     mime = models.CharField(max_length=100, blank=True)  # as the sender claimed it; informational only
     size = models.BigIntegerField()
-    sha256 = models.CharField(max_length=64)
+    # Sent by the sender; blank while it is still hashing (PATCHed later).
+    sha256 = models.CharField(max_length=64, blank=True)
     kind = models.CharField(max_length=8, choices=Kind.choices, default=Kind.FILE)
     caption = models.TextField(blank=True, max_length=4000)
+    # Round 2: who holds the bytes. "d<device id>" (a Windows PC) or "b<owner id>.<browser id>" (the owner's browser).
+    holder = models.CharField(max_length=90, blank=True, default="", db_default="")
+    # The sender's own pointer to the file (a path on Windows, an OPFS key in the browser). Opaque to the server.
+    local_ref = models.CharField(max_length=500, blank=True, default="", db_default="")
+    # A tiny preview picture (JPEG / WebP, at most 40 KB) and what the sender measured.
+    thumb = models.BinaryField(null=True, blank=True)
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    duration_s = models.PositiveIntegerField(null=True, blank=True)
+    # Files sent together (one line each) share a batch id.
+    batch_id = models.UUIDField(null=True, blank=True, db_index=True)
     chat_line = models.OneToOneField(
         ChatMessage, null=True, blank=True, on_delete=models.CASCADE, related_name="chat_file"
     )
@@ -169,9 +184,14 @@ class ChatFile(models.Model):
     )
     created_at = models.DateTimeField(default=timezone.now)
     attached_at = models.DateTimeField(null=True, blank=True)
+    # created_at + FILE_KEEP_DAYS: not downloadable after this.
     expires_at = models.DateTimeField(null=True, blank=True)
-    # The disk file was removed (expired); the row stays so the line says "no longer available".
+    # The clean-up marked it too old (round 1: its disk file was removed). The row stays: the line says "Not shared".
     deleted_at = models.DateTimeField(null=True, blank=True)
+    # Round 2: the sender stopped sharing it.
+    stopped_at = models.DateTimeField(null=True, blank=True)
+    # Round 2: the sender's device found the local file changed, moved or deleted.
+    gone_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -183,25 +203,3 @@ class ChatFile(models.Model):
 
     def __str__(self) -> str:
         return f"Chat file {self.pk}"
-
-    @property
-    def path(self) -> Path:
-        return Path(settings.CHAT_FILES_ROOT) / str(self.owner_id) / str(self.pk)
-
-
-def remove_chat_file(path: Path) -> None:
-    """Remove a stored chat file; already gone is fine."""
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def _chat_file_deleted(sender: type, instance: ChatFile, **kwargs: object) -> None:
-    """A ChatFile row went (its line was deleted, chat history clean-up, any cascade): the disk file goes too, once the
-    delete is committed (a rolled-back delete keeps it)."""
-    path = instance.path
-    transaction.on_commit(lambda: remove_chat_file(path))
-
-
-models.signals.post_delete.connect(_chat_file_deleted, sender=ChatFile, dispatch_uid="z_chat_chat_file_deleted")

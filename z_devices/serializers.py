@@ -243,7 +243,9 @@ class MessageSerializer(serializers.ModelSerializer):
         if f is None:
             return None
         request = self.context.get("request")
-        return file_json(f, request, device=isinstance(getattr(request, "auth", None), Device))
+        auth = getattr(request, "auth", None)
+        device = isinstance(auth, Device)
+        return file_json(f, request, device=device, viewer_member_id=auth.member_id if device else None)
 
     def get_body(self, obj: Message) -> str | None:
         return obj.body or None

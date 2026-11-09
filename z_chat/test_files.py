@@ -1,24 +1,25 @@
-"""v1.5 file sharing in chat: upload limits and the off switch, attaching on all four routes, the access matrix,
-expiry, clean-up, the cascade, edit / delete, and the old-client shape (body still present)."""
+"""v1.5 file sharing in chat, round 2 (files stay on the sender's device): plan limits, registration (no bytes, no
+disk), attaching on all four routes, holder / sender checks for PATCH and stop, the ticket access matrix, signed and
+scoped tickets, previews, "shared by me", the clean-up and the old-client shape (body still present)."""
 from __future__ import annotations
 
-import hashlib
-import shutil
-import tempfile
+import base64
+import importlib
 import uuid
 from datetime import timedelta
-from pathlib import Path
 from typing import Any
-from unittest import mock
+from urllib.parse import parse_qs, unquote, urlsplit
 
+from django.apps import apps as django_apps
+from django.conf import settings
 from django.contrib.admin.sites import site
-from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.utils import timezone
 
 from z_auth._testing import give_plan
-from z_auth.models import User
-from z_devices.models import Member, Message
+from z_auth.models import Plan, User
+from z_devices.models import Device, Member, Message
+from z_relay import tickets
 
 from . import files
 from .models import ChatFile, ChatMessage, ChatReport, ConversationMember
@@ -27,52 +28,48 @@ from .tests import DEVICE_CHAT, GROUPS, ChatCase
 
 OWNER_FILES = "/api/chat/files/"
 DEVICE_FILES = "/api/devices/chat/files/"
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
-PDF = b"%PDF-1.7\n" + b"x" * 200
 CLIP = "\U0001F4CE"
-FILE_KEYS = {"id", "name", "size", "mime", "kind", "caption", "risky", "expires_at", "expired", "url"}
+BROWSER = "br-7f3a9c21e5"
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 120
+WEBP = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 60
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
+GB = 1024 ** 3
+FILE_KEYS = {
+    "id", "name", "size", "mime", "kind", "caption", "risky", "batch_id", "width", "height", "duration_s", "thumb_url",
+    "sender", "mine", "available", "state", "created_at", "expires_at", "expired",
+}
+NOT_SHARED = {"detail": "This file isn't shared any more."}
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
 
 
 class FileCase(ChatCase):
-    def setUp(self) -> None:
-        super().setUp()
-        self.root = tempfile.mkdtemp(prefix="zinwe-chatfiles-")
-        override = override_settings(CHAT_FILES_ROOT=self.root)
-        override.enable()
-        self.addCleanup(override.disable)
-        self.addCleanup(shutil.rmtree, self.root, True)
-
     # --- helpers ---
 
-    def upload(self, name: str = "Quote-Lumen.pdf", content: bytes = PDF, token: str | None = None,
-               content_type: str = "application/pdf") -> Any:
+    def register(self, name: str = "Quote-Lumen.pdf", size: int = 2202009, token: str | None = None,
+                 **extra: Any) -> Any:
+        body: dict[str, Any] = {"name": name, "size": size, "mime": extra.pop("mime", "application/pdf"),
+                                "local_ref": extra.pop("local_ref", f"C:\\Users\\me\\Documents\\{name}")}
         if token is None:
             self.as_owner()
             url = OWNER_FILES
+            body["browser_id"] = extra.pop("browser_id", BROWSER)
         else:
             self.device(token)
             url = DEVICE_FILES
-        return self.client.post(url, {"file": SimpleUploadedFile(name, content, content_type=content_type)},
-                                format="multipart")
+        body.update(extra)
+        return self.client.post(url, body, format="json")
 
-    def uploaded(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        r = self.upload(*args, **kwargs)
+    def registered(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        r = self.register(*args, **kwargs)
         self.assertEqual(r.status_code, 201, r.content)
         return r.json()
 
-    def disk(self, file_id: str) -> Path:
-        return ChatFile.objects.get(pk=file_id).path
-
-    def fetch(self, url: str) -> Any:
-        return self.client.get(url)
-
-    @staticmethod
-    def content(response: Any) -> bytes:
-        return b"".join(response.streaming_content)
-
     def group_file_line(self, g: dict[str, Any], token: str | None = None, body: str = "Final version",
-                        name: str = "Quote-Lumen.pdf", content: bytes = PDF) -> dict[str, Any]:
-        f = self.uploaded(name, content, token=token)
+                        name: str = "Quote-Lumen.pdf", size: int = 2202009, **extra: Any) -> dict[str, Any]:
+        f = self.registered(name, size, token=token, **extra)
         url = f"{GROUPS}{g['id']}/messages/" if token is None else f"{DEVICE_CHAT}{g['id']}/messages/"
         r = self.client.post(url, {"body": body, "file_id": f["id"]}, format="json")
         self.assertEqual(r.status_code, 201, r.content)
@@ -85,307 +82,363 @@ class FileCase(ChatCase):
         self.assertIn(r.status_code, (200, 201), r.content)
         return r.json()
 
+    def device_of(self, member: Member) -> Device:
+        return Device.objects.get(member=member)
 
-class UploadTests(FileCase):
-    def test_owner_upload_shape_and_disk(self) -> None:
-        r = self.upload()
-        self.assertEqual(r.status_code, 201, r.content)
-        f = r.json()
+    def ticket(self, route: str, file_id: str) -> Any:
+        return self.client.post(f"{route}{file_id}/ticket/", format="json")
+
+
+class PlanLimitTests(FileCase):
+    def test_limit_comes_from_the_plan(self) -> None:
+        # Businesses (the test owner's plan): 5 GB.
+        self.assertEqual(self.register("big.mp4", 5 * GB, mime="video/mp4").status_code, 201)
+        r = self.register("bigger.mp4", 5 * GB + 1)
+        self.assertEqual((r.status_code, r.json()), (400, {"size": ["Files can be up to 5 GB on your plan."]}))
+        r = self.register("bigger.mp4", 5 * GB + 1, token=self.karan_token)
+        self.assertEqual(r.json(), {"size": ["Files can be up to 5 GB on your plan."]})
+        # The plan's own number, whatever the admin set.
+        for mb, text in ((2048, "2 GB"), (1536, "1.5 GB"), (1024, "1 GB"), (500, "500 MB")):
+            Plan.objects.filter(code="businesses").update(file_max_mb=mb)
+            r = self.register("x.zip", mb * 1024 * 1024 + 1)
+            self.assertEqual(r.json(), {"size": [f"Files can be up to {text} on your plan."]})
+            self.assertEqual(self.register("x.zip", mb * 1024 * 1024).status_code, 201)
+            self.device(self.karan_token)
+            self.assertEqual(self.client.get(DEVICE_FILES).json(),
+                             {"allowed": True, "max_bytes": mb * 1024 * 1024, "keep_days": 30})
+
+    def test_seeded_plan_sizes_and_entitlements(self) -> None:
+        self.assertEqual(dict(Plan.objects.filter(is_active=True).values_list("code", "file_max_mb")),
+                         {"free": 1024, "startups": 2048, "teams": 3072, "businesses": 5120})
+        self.as_owner()
+        self.assertEqual(self.client.get("/api/auth/me/").json()["entitlements"]["file_max_mb"], 5120)
+        plans = {p["code"]: p for p in self.client.get("/api/auth/plans/").json()}
+        self.assertEqual(plans["startups"]["file_max_mb"], 2048)
+        # Another company on Startups gets 2 GB.
+        other = User.objects.create_user("startup@corp.in", "pw-12345678")
+        give_plan(other, "startups")
+        from z_auth.entitlements import entitlements_for
+
+        self.assertEqual((entitlements_for(other).file_max_mb, entitlements_for(other).file_max_bytes),
+                         (2048, 2 * GB))
+
+    def test_settings_show_the_plan_limit(self) -> None:
+        self.as_owner()
+        self.assertEqual(self.client.get("/api/chat/settings/").json(), {
+            "allow_member_dm": True, "allow_files": True, "file_max_bytes": 5 * GB, "file_keep_days": 30,
+            "allowed": True, "max_bytes": 5 * GB, "keep_days": 30,
+        })
+        self.assertEqual(self.client.get(OWNER_FILES).json(), {"allowed": True, "max_bytes": 5 * GB, "keep_days": 30})
+        r = self.client.patch("/api/chat/settings/", {"allow_files": False}, format="json")
+        self.assertEqual((r.json()["allow_files"], r.json()["allowed"]), (False, False))
+        r = self.client.patch("/api/chat/settings/", {"allow_files": "no"}, format="json")
+        self.assertEqual((r.status_code, r.json()), (400, {"allow_files": ["true or false."]}))
+
+
+class RegisterTests(FileCase):
+    def test_owner_registration_is_only_a_record(self) -> None:
+        f = self.registered(batch_id="0b8e4c1e-0d36-4a3c-a7d2-3c1f8f0f5a11")
         self.assertEqual(set(f), FILE_KEYS)
         self.assertEqual((f["name"], f["size"], f["mime"], f["kind"], f["caption"], f["risky"]),
-                         ("Quote-Lumen.pdf", len(PDF), "application/pdf", "file", "", False))
-        self.assertEqual((f["expires_at"], f["expired"]), (None, False))  # not attached yet
-        self.assertEqual(f["url"], f"http://testserver/api/chat/files/{f['id']}/")
+                         ("Quote-Lumen.pdf", 2202009, "application/pdf", "document", "", False))
+        self.assertEqual((f["mine"], f["available"], f["state"], f["expired"], f["thumb_url"]),
+                         (True, True, "ok", False, None))
+        self.assertEqual(f["sender"], {"name": "Ananya Rao", "first_name": "Ananya"})
+        self.assertEqual(f["batch_id"], "0b8e4c1e-0d36-4a3c-a7d2-3c1f8f0f5a11")
+        self.assertNotIn("url", f)  # clients ask for a ticket
         row = ChatFile.objects.get(pk=f["id"])
-        self.assertEqual((row.owner_id, row.by_member_id, row.chat_line_id, row.member_message_id),
-                         (self.owner.id, None, None, None))
-        self.assertEqual(row.path, Path(self.root) / str(self.owner.id) / f["id"])
-        self.assertEqual(row.path.read_bytes(), PDF)
-        self.assertEqual(row.sha256, hashlib.sha256(PDF).hexdigest())
+        self.assertEqual((row.holder, row.local_ref, row.sha256, row.by_member_id),
+                         (f"b{self.owner.id}.{BROWSER}", "C:\\Users\\me\\Documents\\Quote-Lumen.pdf", "", None))
+        self.assertEqual(row.expires_at, row.created_at + timedelta(days=30))
+        self.assertEqual(f["expires_at"], row.expires_at.isoformat().replace("+00:00", "Z"))
+        self.assertFalse(hasattr(settings, "CHAT_FILES_ROOT"))  # nothing is ever stored on the server
 
-    def test_device_upload_gets_the_device_route(self) -> None:
-        f = self.uploaded(token=self.karan_token)
-        self.assertEqual(f["url"], f"http://testserver/api/devices/chat/files/{f['id']}/")
-        self.assertEqual(ChatFile.objects.get(pk=f["id"]).by_member_id, self.karan.id)
+    def test_device_registration_with_preview(self) -> None:
+        f = self.registered("clip.mp4", 734003200, token=self.karan_token, mime="video/mp4", sha256="A" * 64,
+                            thumb_b64=b64(JPEG), width=1920, height=1080, duration_s=83.6)
+        self.assertEqual((f["kind"], f["width"], f["height"], f["duration_s"]), ("video", 1920, 1080, 84))
+        self.assertEqual(f["thumb_url"], f"http://testserver/api/devices/chat/files/{f['id']}/thumb/")
+        self.assertEqual(f["sender"], {"name": "Karan Malhotra", "first_name": "Karan"})
+        row = ChatFile.objects.get(pk=f["id"])
+        self.assertEqual((row.holder, row.sha256, bytes(row.thumb)),
+                         (f"d{self.device_of(self.karan).id}", "a" * 64, JPEG))
+        r = self.client.get(f["thumb_url"])
+        self.assertEqual((r.status_code, r["Content-Type"], r["Cache-Control"], r["X-Content-Type-Options"]),
+                         (200, "image/jpeg", "private, max-age=86400", "nosniff"))
+        self.assertEqual(r.content, JPEG)
+        # A data: URL (canvas.toDataURL) works too, and WebP.
+        w = self.registered("a.webp", 10, thumb_b64="data:image/webp;base64," + b64(WEBP), mime="image/webp")
+        self.assertEqual(self.client.get(w["thumb_url"])["Content-Type"], "image/webp")
 
-    def test_kind_by_magic_bytes_risky_and_safe_names(self) -> None:
-        self.assertEqual(self.uploaded("shot.png", PNG, content_type="image/png")["kind"], "image")
-        self.assertEqual(self.uploaded("shot.webp", b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\0" * 20)["kind"], "image")
-        self.assertEqual(self.uploaded("fake.png", b"not a picture")["kind"], "file")  # extension alone isn't enough
-        self.assertEqual(self.uploaded("drawing.svg", b"<svg xmlns='http://www.w3.org/2000/svg'/>")["kind"], "file")
-        self.assertEqual(self.uploaded("data.bin", PNG)["kind"], "file")  # picture bytes, but not an image name
-        self.assertTrue(self.uploaded("setup.EXE", b"MZ\x90\x00")["risky"])
-        self.assertTrue(self.uploaded("run.ps1", b"Write-Host hi")["risky"])
-        self.assertFalse(self.uploaded("notes.txt", b"hello")["risky"])
-        self.assertEqual(files.safe_name("..\\..\\windows\\evil.pdf"), "evil.pdf")
-        self.assertEqual(files.safe_name("a‮gpj.exe"), "agpj.exe")  # direction override stripped
-        self.assertEqual(files.safe_name('what?:"*.txt'), "what____.txt")
-        self.assertEqual(files.safe_name(""), "file")
-        long = files.safe_name("x" * 300 + ".pdf")
-        self.assertEqual((len(long), long[-4:]), (200, ".pdf"))
-
-    def test_size_limit_empty_and_missing(self) -> None:
-        exact = self.upload("big.bin", b"\0" * files.FILE_MAX_BYTES)
-        self.assertEqual(exact.status_code, 201, exact.content)
-        self.assertEqual(exact.json()["size"], 26214400)
-        over = self.upload("bigger.bin", b"\0" * (files.FILE_MAX_BYTES + 1))
-        self.assertEqual((over.status_code, over.json()), (400, {"file": ["Files can be up to 25 MB."]}))
-        empty = self.upload("empty.txt", b"")
-        self.assertEqual((empty.status_code, empty.json()), (400, {"file": ["That file is empty."]}))
-        missing = self.client.post(OWNER_FILES, {}, format="multipart")
-        self.assertEqual((missing.status_code, missing.json()), (400, {"file": ["Pick a file."]}))
-        # A body far over the limit is refused from its Content-Length, before it is read.
+    def test_bad_previews_and_fields(self) -> None:
+        bad_thumb = {"thumb_b64": ["The preview must be a JPEG or WebP picture of up to 40 KB."]}
+        for thumb in (b64(PNG), b64(b"\xff\xd8\xff" + b"\x00" * (40 * 1024)), "not base64!", b64(b"")):
+            r = self.register(thumb_b64=thumb)
+            if thumb == "":
+                self.assertEqual(r.status_code, 201)
+                continue
+            self.assertEqual((r.status_code, r.json()), (400, bad_thumb), thumb[:20])
+        self.assertEqual(self.register(thumb_b64=b64(b"\xff\xd8\xff" + b"\x00" * (40 * 1024 - 3))).status_code, 201)
+        self.assertEqual(self.register(size=0).json(), {"size": ["That file is empty."]})
+        self.assertEqual(self.register(sha256="xyz").json(), {"sha256": ["A SHA-256 is 64 hex characters."]})
+        self.assertEqual(self.register(browser_id="").json(), {"browser_id": ["This field is required."]})
+        self.assertEqual(self.register(browser_id="a b").json(), {"browser_id": ["Not a valid browser id."]})
+        self.assertEqual(self.register(local_ref="").status_code, 400)
+        self.assertEqual(self.register(local_ref="x" * 501).status_code, 400)
+        self.assertEqual(self.register(batch_id="nope").status_code, 400)
+        self.assertEqual(self.register(width=0).status_code, 400)
+        # No bytes, ever: a multipart upload (round 1) isn't accepted.
         self.as_owner()
-        r = self.client.post(OWNER_FILES, {"file": SimpleUploadedFile("x.bin", b"1")}, format="multipart",
-                             CONTENT_LENGTH=str(40 * 1024 * 1024))
-        self.assertEqual((r.status_code, r.json()), (400, {"file": ["Files can be up to 25 MB."]}))
-        # Nothing refused was left on disk.
-        on_disk = [p for p in Path(self.root).rglob("*") if p.is_file()]
-        self.assertEqual(len(on_disk), 1)
+        r = self.client.post(OWNER_FILES, {"file": "x"}, format="multipart")
+        self.assertEqual(r.status_code, 415)
+        # Nothing refused left a row.
+        self.assertEqual(ChatFile.objects.count(), 2)
 
-    def test_off_switch_stops_every_upload_but_sent_files_stay(self) -> None:
+    def test_kinds_risky_and_safe_names(self) -> None:
+        cases = {
+            "shot.PNG": "image", "pic.heic": "image", "clip.mov": "video", "song.mp3": "audio", "notes.txt": "document",
+            "deck.pptx": "document", "data.csv": "document", "drawing.svg": "file", "archive.zip": "file",
+            "setup.exe": "file", "noext": "file",
+        }
+        for name, kind in cases.items():
+            self.assertEqual(self.registered(name, 10, mime="")["kind"], kind, name)
+        self.assertEqual(self.registered("blob", 10, mime="video/webm")["kind"], "video")  # by type when no extension
+        self.assertEqual(self.registered("pic", 10, mime="image/svg+xml")["kind"], "file")
+        self.assertTrue(self.registered("setup.EXE", 10)["risky"])
+        self.assertTrue(self.registered("run.ps1", 10)["risky"])
+        self.assertEqual(self.registered("..\\..\\windows\\evil.pdf", 10)["name"], "evil.pdf")
+        self.assertEqual(files.safe_name("a\u202egpj.exe"), "agpj.exe")
+        self.assertEqual(files.safe_name('what?:"*.txt'), "what____.txt")
+
+    def test_off_switch_and_plan_without_team_chat(self) -> None:
         g = self.make_group()
         line = self.group_file_line(g)
         self.as_owner()
-        r = self.client.patch("/api/chat/settings/", {"allow_files": False}, format="json")
-        self.assertEqual(r.json(), {"allow_member_dm": True, "allow_files": False, "file_max_bytes": 26214400,
-                                    "file_keep_days": 7})
+        self.client.patch("/api/chat/settings/", {"allow_files": False}, format="json")
         off = {"detail": "Your admin has turned off file sharing."}
-        r = self.upload()
-        self.assertEqual((r.status_code, r.json()), (403, off))
-        r = self.upload(token=self.karan_token)
-        self.assertEqual((r.status_code, r.json()), (403, off))
-        self.assertEqual(self.client.get(DEVICE_FILES).json(), {"allowed": False, "max_bytes": 26214400, "keep_days": 7})
-        self.device(self.karan_token)
-        self.assertEqual(self.client.get(line["file"]["url"].replace("/api/chat/", "/api/devices/chat/")).status_code, 200)
+        self.assertEqual((self.register().status_code, self.register().json()), (403, off))
+        self.assertEqual(self.register(token=self.karan_token).json(), off)
+        self.assertEqual(self.client.get(DEVICE_FILES).json(), {"allowed": False, "max_bytes": 5 * GB, "keep_days": 30})
+        # Files already sent can still be fetched.
         self.as_owner()
-        self.assertEqual(self.client.get(line["file"]["url"]).status_code, 200)
+        self.assertEqual(self.ticket(OWNER_FILES, line["file"]["id"]).status_code, 200)
         self.client.patch("/api/chat/settings/", {"allow_files": True}, format="json")
-        self.assertEqual(self.upload().status_code, 201)
-
-    def test_settings_shape_and_validation(self) -> None:
-        self.as_owner()
-        self.assertEqual(self.client.get("/api/chat/settings/").json(),
-                         {"allow_member_dm": True, "allow_files": True, "file_max_bytes": 26214400, "file_keep_days": 7})
-        r = self.client.patch("/api/chat/settings/", {"allow_files": "no"}, format="json")
-        self.assertEqual((r.status_code, r.json()), (400, {"allow_files": ["true or false."]}))
-        r = self.client.patch("/api/chat/settings/", {"file_max_bytes": 1}, format="json")  # read-only: not a switch
-        self.assertEqual(r.status_code, 400)
-        r = self.client.patch("/api/chat/settings/", {"allow_member_dm": False, "allow_files": False}, format="json")
-        self.assertEqual((r.json()["allow_member_dm"], r.json()["allow_files"]), (False, False))
-
-    def test_device_files_endpoint(self) -> None:
-        self.device(self.karan_token)
-        self.assertEqual(self.client.get(DEVICE_FILES).json(), {"allowed": True, "max_bytes": 26214400, "keep_days": 7})
+        Plan.objects.filter(code="businesses").update(modules=["usb_alerts"])
+        self.assertEqual(self.register().status_code, 403)
+        self.assertEqual(self.register(token=self.karan_token).status_code, 403)
+        self.assertFalse(self.client.get(DEVICE_FILES).json()["allowed"])
+        self.assertEqual(self.client.get(f"{DEVICE_FILES}serve-ticket/").status_code, 403)
 
     def test_too_many_waiting_per_sender(self) -> None:
         for _ in range(files.MAX_WAITING):
-            ChatFile.objects.create(owner=self.owner, by_member=self.karan, name="a.txt", size=1, sha256="0")
-        r = self.upload(token=self.karan_token)
+            ChatFile.objects.create(owner=self.owner, by_member=self.karan, name="a.txt", size=1, holder="d1")
+        r = self.register(token=self.karan_token)
         self.assertEqual((r.status_code, r.json()), (400, {"file": ["Too many files waiting. Send or remove some first."]}))
-        self.assertEqual(self.upload(token=self.emily_token).status_code, 201)  # per sender
-        self.assertEqual(self.upload().status_code, 201)  # the owner too
+        self.assertEqual(self.register(token=self.emily_token).status_code, 201)
+        self.assertEqual(self.register().status_code, 201)
         ChatFile.objects.filter(by_member=self.karan).update(created_at=timezone.now() - timedelta(hours=2))
-        self.assertEqual(self.upload(token=self.karan_token).status_code, 201)  # stale ones don't count
+        self.assertEqual(self.register(token=self.karan_token).status_code, 201)
 
-    def test_plan_without_team_chat(self) -> None:
-        from z_auth.models import Plan
-
-        Plan.objects.filter(code="businesses").update(modules=["usb_alerts"])
-        self.assertEqual(self.upload().status_code, 403)
-        self.assertEqual(self.upload(token=self.karan_token).status_code, 403)
-        self.assertFalse(self.client.get(DEVICE_FILES).json()["allowed"])
+    def test_pc_without_a_member(self) -> None:
+        Device.objects.filter(member=self.karan).update(member=None)
+        self.assertEqual(self.register(token=self.karan_token).status_code, 404)
 
 
 class AttachTests(FileCase):
     def test_owner_group_line_old_and_new_shape(self) -> None:
         g = self.make_group()
-        content = b"\0" * 2202009
-        line = self.group_file_line(g, name="Quote-Lumen.pdf", content=content)
-        # Old clients: the body is the fallback text. New clients: the file card + caption.
+        line = self.group_file_line(g)
         self.assertEqual(line["body"], f"{CLIP} Quote-Lumen.pdf (2.1 MB)\nFinal version")
         f = line["file"]
         self.assertEqual(set(f), FILE_KEYS)
-        self.assertEqual((f["caption"], f["size"], f["expired"]), ("Final version", 2202009, False))
-        self.assertEqual(f["url"], f"http://testserver/api/chat/files/{f['id']}/")
-        row = ChatFile.objects.get(pk=f["id"])
-        posted = ChatMessage.objects.get(pk=line["id"]).created_at
-        self.assertEqual((row.attached_at, row.expires_at), (posted, posted + timedelta(days=7)))
-        self.assertEqual(f["expires_at"], (posted + timedelta(days=7)).isoformat().replace("+00:00", "Z"))
-        # The member's view of the same line: the device route.
+        self.assertEqual((f["caption"], f["mine"], f["state"]), ("Final version", True, "ok"))
+        # The member's view of the same line.
         self.device(self.karan_token)
         seen = self.client.get(f"{DEVICE_CHAT}{g['id']}/messages/").json()[-1]
-        self.assertEqual(seen["body"], line["body"])
-        self.assertEqual(seen["file"]["url"], f"http://testserver/api/devices/chat/files/{f['id']}/")
-        # Plain lines say file: null.
+        self.assertEqual((seen["body"], seen["file"]["mine"], seen["file"]["sender"]["first_name"]),
+                         (line["body"], False, "Ananya"))
         self.as_owner()
         self.assertIsNone(self.owner_lines(g["id"])[0]["file"])
-        # The group list preview shows the fallback text.
         self.assertTrue(self.client.get(GROUPS).json()[0]["last"]["text"].startswith(f"{CLIP} Quote-Lumen.pdf"))
 
-    def test_member_group_line_without_text_and_in_a_direct_chat(self) -> None:
+    def test_big_files_show_gb_in_the_fallback(self) -> None:
         g = self.make_group()
-        f = self.uploaded("photo.png", PNG, token=self.karan_token)
-        r = self.client.post(f"{DEVICE_CHAT}{g['id']}/messages/", {"file_id": f["id"]}, format="json")
-        self.assertEqual(r.status_code, 201, r.content)
-        self.assertEqual(r.json()["body"], f"{CLIP} photo.png (1 KB)")
-        self.assertEqual((r.json()["file"]["caption"], r.json()["file"]["kind"]), ("", "image"))
+        line = self.group_file_line(g, name="Shoot.mov", size=int(1.4 * GB), body="")
+        self.assertEqual(line["body"], f"{CLIP} Shoot.mov (1.4 GB)")
+        self.assertEqual([files.human_size(n) for n in (1, 348160, 2202009, 2 * GB, int(4.25 * GB))],
+                         ["1 KB", "340 KB", "2.1 MB", "2 GB", "4.2 GB"])
+
+    def test_a_batch_is_several_lines_with_one_batch_id(self) -> None:
+        g = self.make_group()
+        batch = str(uuid.uuid4())
+        self.device(self.karan_token)
+        ids = [self.registered(f"p{i}.jpg", 1000, token=self.karan_token, batch_id=batch, thumb_b64=b64(JPEG))["id"]
+               for i in range(3)]
+        for i, fid in enumerate(ids):
+            body = "From the site visit" if i == len(ids) - 1 else ""
+            r = self.client.post(f"{DEVICE_CHAT}{g['id']}/messages/", {"body": body, "file_id": fid}, format="json")
+            self.assertEqual(r.status_code, 201, r.content)
+        got = [line["file"] for line in self.owner_lines(g["id"]) if line["file"]]
+        self.assertEqual([x["batch_id"] for x in got], [batch] * 3)
+        self.assertEqual([x["caption"] for x in got], ["", "", "From the site visit"])
+        self.assertTrue(all(x["thumb_url"].startswith("http://testserver/api/chat/files/") for x in got))
+
+    def test_member_line_in_a_direct_chat(self) -> None:
         direct = self.direct_with_emily()
-        f = self.uploaded("plan.docx", b"PK\x03\x04", token=self.karan_token)
-        r = self.client.post(f"{DEVICE_CHAT}{direct['id']}/messages/", {"body": "", "file_id": f["id"]}, format="json")
-        self.assertEqual(r.status_code, 201, r.content)
+        f = self.registered("plan.docx", 4000, token=self.karan_token)
+        r = self.client.post(f"{DEVICE_CHAT}{direct['id']}/messages/", {"file_id": f["id"]}, format="json")
+        self.assertEqual((r.status_code, r.json()["body"]), (201, f"{CLIP} plan.docx (4 KB)"))
         self.device(self.emily_token)
         got = self.client.get(f"{DEVICE_CHAT}{direct['id']}/messages/").json()[-1]["file"]
-        self.assertEqual(got["name"], "plan.docx")
-        self.assertEqual(self.client.get(got["url"]).status_code, 200)
+        self.assertEqual((got["name"], got["mine"]), ("plan.docx", False))
+        self.assertEqual(self.ticket(DEVICE_FILES, got["id"]).status_code, 200)
 
-    def test_owner_to_member_admin_chat(self) -> None:
-        f = self.uploaded("Brief.pdf")
+    def test_admin_chat_both_ways(self) -> None:
+        f = self.registered("Brief.pdf", 209)
         r = self.client.post(f"/api/devices/members/{self.member.id}/message/", {"file_id": f["id"], "body": "Read this"},
                              format="json")
         self.assertEqual(r.status_code, 201, r.content)
         line = r.json()
-        self.assertEqual(line["title"], f"{CLIP} Brief.pdf")  # title defaults for a file line
-        self.assertEqual(line["body"], f"{CLIP} Brief.pdf (1 KB)\nRead this")
-        self.assertEqual((line["file"]["caption"], line["file"]["url"]),
-                         ("Read this", f"http://testserver/api/chat/files/{f['id']}/"))
-        msg = Message.objects.get(pk=line["id"])
-        self.assertEqual(ChatFile.objects.get(pk=f["id"]).member_message, msg)
-        # A title the owner typed is kept.
-        f2 = self.uploaded("Two.pdf")
-        r = self.client.post(f"/api/devices/members/{self.member.id}/message/",
-                             {"file_id": f2["id"], "title": "Contract"}, format="json")
-        self.assertEqual((r.json()["title"], r.json()["file"]["caption"]), ("Contract", ""))
-        # The member's PC: the device route, and the download works.
+        self.assertEqual((line["title"], line["body"]), (f"{CLIP} Brief.pdf", f"{CLIP} Brief.pdf (1 KB)\nRead this"))
+        self.assertEqual((line["file"]["caption"], line["file"]["mine"]), ("Read this", True))
         self.device(self.asha_token)
-        feed = self.client.get("/api/devices/messages/").json()
-        mine = next(m for m in feed if m["id"] == line["id"])
-        self.assertEqual(mine["file"]["url"], f"http://testserver/api/devices/chat/files/{f['id']}/")
-        self.assertEqual(self.content(self.client.get(mine["file"]["url"])), PDF)
-        # Another member can't.
+        mine = next(m for m in self.client.get("/api/devices/messages/").json() if m["id"] == line["id"])
+        self.assertEqual((mine["file"]["mine"], mine["file"]["sender"]["name"]), (False, "Ananya Rao"))
+        self.assertEqual(self.ticket(DEVICE_FILES, f["id"]).status_code, 200)
         self.device(self.karan_token)
-        self.assertEqual(self.client.get(mine["file"]["url"]).status_code, 404)
-
-    def test_member_to_owner_admin_chat(self) -> None:
-        f = self.uploaded("Timesheet.xlsx", b"PK\x03\x04data", token=self.asha_token)
-        r = self.client.post("/api/devices/messages/", {"file_id": f["id"], "body": "For October"}, format="json")
-        self.assertEqual(r.status_code, 201, r.content)
-        line = r.json()
-        self.assertEqual((line["sender"], line["body"]), ("member", f"{CLIP} Timesheet.xlsx (1 KB)\nFor October"))
-        self.assertEqual(line["file"]["url"], f"http://testserver/api/devices/chat/files/{f['id']}/")
+        self.assertEqual(self.ticket(DEVICE_FILES, f["id"]).status_code, 404)
+        # Member -> owner.
+        f2 = self.registered("Timesheet.xlsx", 8, token=self.asha_token)
+        r = self.client.post("/api/devices/messages/", {"file_id": f2["id"], "body": "For October"}, format="json")
+        self.assertEqual((r.status_code, r.json()["file"]["mine"]), (201, True))
         self.as_owner()
         thread = self.client.get(f"/api/devices/members/{self.member.id}/messages/").json()
-        got = next(m for m in thread if m["id"] == line["id"])["file"]
-        self.assertEqual((got["caption"], got["url"]), ("For October", f"http://testserver/api/chat/files/{f['id']}/"))
-        self.assertEqual(self.content(self.client.get(got["url"])), b"PK\x03\x04data")
-        # Plain lines still work as before, and say file: null.
-        self.device(self.asha_token)
-        r = self.client.post("/api/devices/messages/", {"body": "thanks"}, format="json")
-        self.assertEqual((r.status_code, r.json()["body"], r.json()["file"]), (201, "thanks", None))
+        got = next(m for m in thread if m["id"] == r.json()["id"])["file"]
+        self.assertEqual((got["caption"], got["mine"], got["kind"]), ("For October", False, "document"))
+        self.assertEqual(self.ticket(OWNER_FILES, f2["id"]).status_code, 200)
 
-    def test_file_id_must_be_the_senders_own_fresh_unattached_upload(self) -> None:
+    def test_file_id_must_be_the_senders_own_fresh_shared_registration(self) -> None:
         g = self.make_group(ids=[self.member.id, self.karan.id])
         refused = {"file_id": ["That file wasn't found. Attach it again."]}
         url = f"{DEVICE_CHAT}{g['id']}/messages/"
-        karans = self.uploaded(token=self.karan_token)
-        # Someone else's upload.
+        karans = self.registered(token=self.karan_token)
         self.device(self.asha_token)
-        r = self.client.post(url, {"file_id": karans["id"]}, format="json")
-        self.assertEqual((r.status_code, r.json()), (400, refused))
-        # The owner's upload, used by a member; and a member's upload, used by the owner.
-        owners = self.uploaded()
+        self.assertEqual(self.client.post(url, {"file_id": karans["id"]}, format="json").json(), refused)
+        owners = self.registered()
         self.device(self.karan_token)
         self.assertEqual(self.client.post(url, {"file_id": owners["id"]}, format="json").json(), refused)
         self.as_owner()
         self.assertEqual(self.client.post(f"{GROUPS}{g['id']}/messages/", {"file_id": karans["id"]}, format="json").json(),
                          refused)
-        self.assertEqual(self.client.post(f"/api/devices/members/{self.member.id}/message/", {"file_id": karans["id"]},
-                                          format="json").json(), refused)
-        # Another company's.
-        other = User.objects.create_user("other@corp.in", "pw-12345678")
-        theirs = ChatFile.objects.create(owner=other, name="x.pdf", size=1, sha256="0")
-        self.assertEqual(self.client.post(f"{GROUPS}{g['id']}/messages/", {"file_id": str(theirs.pk)},
-                                          format="json").json(), refused)
-        # Unknown, not a UUID, and older than an hour.
         for bad in (str(uuid.uuid4()), "nope"):
             self.assertEqual(self.client.post(f"{GROUPS}{g['id']}/messages/", {"file_id": bad}, format="json").json(),
                              refused)
-        ChatFile.objects.filter(pk=owners["id"]).update(created_at=timezone.now() - timedelta(minutes=61))
-        self.assertEqual(self.client.post(f"{GROUPS}{g['id']}/messages/", {"file_id": owners["id"]}, format="json").json(),
-                         refused)
-        # Attached once: never again (on any route).
+        # Stopped or gone before it was sent: can't be attached.
+        for change in ({"stopped_at": timezone.now()}, {"gone_at": timezone.now()},
+                       {"created_at": timezone.now() - timedelta(minutes=61)}):
+            f = self.registered()
+            ChatFile.objects.filter(pk=f["id"]).update(**change)
+            self.assertEqual(self.client.post(f"{GROUPS}{g['id']}/messages/", {"file_id": f["id"]},
+                                              format="json").json(), refused)
         self.device(self.karan_token)
         self.assertEqual(self.client.post(url, {"file_id": karans["id"]}, format="json").status_code, 201)
         self.assertEqual(self.client.post(url, {"file_id": karans["id"]}, format="json").json(), refused)
-        self.assertEqual(self.client.post("/api/devices/messages/", {"file_id": karans["id"]}, format="json").json(),
-                         refused)
-        # A refused attach posts nothing.
         self.assertEqual(Message.objects.count(), 0)
 
     def test_without_a_file_the_old_rules_and_errors_stand(self) -> None:
         g = self.make_group()
         self.assertEqual(self.client.post(f"{GROUPS}{g['id']}/messages/", {"body": ""}, format="json").json(),
                          {"body": ["This field may not be blank."]})
-        self.assertEqual(self.client.post(f"{GROUPS}{g['id']}/messages/", {}, format="json").json(),
-                         {"body": ["This field is required."]})
         self.assertEqual(self.client.post(f"/api/devices/members/{self.member.id}/message/", {"body": "x"},
                                           format="json").json(), {"title": ["This field is required."]})
-        self.device(self.asha_token)
-        self.assertEqual(self.client.post("/api/devices/messages/", {}, format="json").json(),
-                         {"body": ["This field is required."]})
 
-    def test_announce_group_and_left_member_still_cant_post_a_file(self) -> None:
+    def test_announce_group_refuses_a_members_file(self) -> None:
         g = self.make_group(announce=True)
-        f = self.uploaded(token=self.karan_token)
+        f = self.registered(token=self.karan_token)
         r = self.client.post(f"{DEVICE_CHAT}{g['id']}/messages/", {"file_id": f["id"]}, format="json")
         self.assertEqual((r.status_code, r.json()), (403, {"detail": "Only the admin can post in this group."}))
-        self.assertIsNone(ChatFile.objects.get(pk=f["id"]).attached_at)  # still attachable elsewhere
+        self.assertIsNone(ChatFile.objects.get(pk=f["id"]).attached_at)
 
 
-class AccessTests(FileCase):
+class TicketTests(FileCase):
+    def test_ticket_shape_and_signed_payload(self) -> None:
+        g = self.make_group()
+        f = self.group_file_line(g, token=self.karan_token, name="Site plan.pdf", size=5000)["file"]
+        self.as_owner()
+        before = timezone.now()
+        r = self.ticket(OWNER_FILES, f["id"])
+        self.assertEqual(r.status_code, 200, r.content)
+        t = r.json()
+        self.assertEqual(set(t), {"url", "inline_url", "status_url", "expires_at"})
+        parts = urlsplit(t["url"])
+        self.assertEqual((parts.scheme, parts.netloc, parts.path), ("http", "testserver", f"/relay/file/{f['id']}"))
+        self.assertEqual(t["inline_url"], t["url"] + "&inline=1")
+        token = parse_qs(parts.query)["t"][0]
+        self.assertEqual(t["status_url"], f"http://testserver/relay/status/{f['id']}?t={t['url'].split('?t=')[1]}")
+        self.assertEqual(tickets.read(token, tickets.GET), {
+            "k": "get", "f": f["id"], "s": 5000, "n": "Site plan.pdf", "h": f"d{self.device_of(self.karan).id}",
+            "fn": "Karan", "i": "application/pdf",
+        })
+        self.assertIsNone(tickets.read(token, tickets.SERVE))  # scoped: a get ticket can't wait or push
+        expires = timezone.datetime.fromisoformat(t["expires_at"].replace("Z", "+00:00"))
+        self.assertAlmostEqual((expires - before).total_seconds(), 900, delta=5)
+
+    def test_inline_types(self) -> None:
+        for name, inline in (("a.png", "image/png"), ("b.mp4", "video/mp4"), ("c.pdf", "application/pdf"),
+                             ("d.docx", ""), ("e.svg", ""), ("f.mkv", ""), ("g.heic", ""), ("h.exe", "")):
+            f = self.registered(name, 10)
+            token = parse_qs(urlsplit(self.ticket(OWNER_FILES, f["id"]).json()["url"]).query)["t"][0]
+            self.assertEqual(tickets.read(token, tickets.GET)["i"], inline, name)
+
+    @override_settings(ZINWE_RELAY_BASE="http://127.0.0.1:8100")
+    def test_relay_base_setting(self) -> None:
+        f = self.registered()
+        self.assertTrue(self.ticket(OWNER_FILES, f["id"]).json()["url"].startswith(
+            f"http://127.0.0.1:8100/relay/file/{f['id']}?t="))
+        self.assertEqual(self.client.get(f"{OWNER_FILES}serve-ticket/?browser_id={BROWSER}").json()["push_base"],
+                         "http://127.0.0.1:8100/relay/push/")
+
     def test_owner_never_reaches_a_direct_chat_file(self) -> None:
         direct = self.direct_with_emily()
-        f = self.uploaded("secret.pdf", token=self.karan_token)
+        f = self.registered("secret.pdf", token=self.karan_token, thumb_b64=b64(JPEG))
         self.client.post(f"{DEVICE_CHAT}{direct['id']}/messages/", {"file_id": f["id"]}, format="json")
         self.as_owner()
-        self.assertEqual(self.client.get(f"{OWNER_FILES}{f['id']}/").status_code, 404)
-        self.assertEqual(self.client.get(f"{OWNER_FILES}{f['id']}/?inline=1").status_code, 404)
-        # Even past its 7 days: not found (not "no longer available"), so nothing about it leaks.
-        ChatFile.objects.filter(pk=f["id"]).update(expires_at=timezone.now() - timedelta(days=1))
-        self.assertEqual(self.client.get(f"{OWNER_FILES}{f['id']}/").status_code, 404)
-        # Nor the Django admin: ChatFile isn't registered at all.
+        for path in ("ticket/", "thumb/", "", "stop/"):
+            call = self.client.get if path in ("thumb/", "") else self.client.post
+            self.assertEqual(call(f"{OWNER_FILES}{f['id']}/{path}").status_code, 404, path)
+        self.assertEqual(self.client.patch(f"{OWNER_FILES}{f['id']}/", {"gone": True}, format="json").status_code, 404)
+        # Even once it isn't shared any more: 404, never 410, so nothing about it leaks.
+        ChatFile.objects.filter(pk=f["id"]).update(stopped_at=timezone.now())
+        self.assertEqual(self.ticket(OWNER_FILES, f["id"]).status_code, 404)
         self.assertNotIn(ChatFile, site._registry)
-        # A third member isn't in it either.
-        self.device(self.asha_token)
-        self.assertEqual(self.client.get(f"{DEVICE_FILES}{f['id']}/").status_code, 404)
+        self.device(self.asha_token)  # not in that chat
+        self.assertEqual(self.ticket(DEVICE_FILES, f["id"]).status_code, 404)
+        self.device(self.emily_token)
+        self.assertEqual(self.ticket(DEVICE_FILES, f["id"]).status_code, 410)
 
-    def test_other_company_and_non_members(self) -> None:
+    def test_other_company_non_members_and_unattached(self) -> None:
         g = self.make_group(ids=[self.member.id, self.karan.id])
-        line = self.group_file_line(g)
-        fid = line["file"]["id"]
-        # Jake isn't in the group.
+        fid = self.group_file_line(g)["file"]["id"]
         self.device(self.jake_token)
-        self.assertEqual(self.client.get(f"{DEVICE_FILES}{fid}/").status_code, 404)
-        # Another company's owner and member.
+        self.assertEqual(self.ticket(DEVICE_FILES, fid).status_code, 404)
         other = User.objects.create_user("other@corp.in", "pw-12345678")
         give_plan(other, "businesses")
         stranger = Member.objects.create(owner=other, name="Sam Stone", email="sam@corp.in")
-        token = self._enroll(stranger, "SAM-PC")
-        self.device(token)
-        self.assertEqual(self.client.get(f"{DEVICE_FILES}{fid}/").status_code, 404)
+        self.device(self._enroll(stranger, "SAM-PC"))
+        self.assertEqual(self.ticket(DEVICE_FILES, fid).status_code, 404)
+        self.assertEqual(self.client.get(f"{DEVICE_FILES}{fid}/thumb/").status_code, 404)
+        self.client.credentials()
         self.client.force_authenticate(user=other)
-        self.assertEqual(self.client.get(f"{OWNER_FILES}{fid}/").status_code, 404)
+        self.assertEqual(self.ticket(OWNER_FILES, fid).status_code, 404)
         self.client.force_authenticate(user=None)
-        # An unattached upload: only its sender.
-        mine = self.uploaded(token=self.karan_token)
-        self.assertEqual(self.client.get(mine["url"]).status_code, 200)
+        # Not sent yet: only its sender.
+        mine = self.registered(token=self.karan_token)
+        self.assertEqual(self.ticket(DEVICE_FILES, mine["id"]).status_code, 200)
         self.device(self.asha_token)
-        self.assertEqual(self.client.get(mine["url"]).status_code, 404)
+        self.assertEqual(self.ticket(DEVICE_FILES, mine["id"]).status_code, 404)
         self.as_owner()
-        self.assertEqual(self.client.get(f"{OWNER_FILES}{mine['id']}/").status_code, 404)
-        own = self.uploaded()
-        self.assertEqual(self.client.get(own["url"]).status_code, 200)
-        self.assertEqual(self.client.get(f"{OWNER_FILES}{uuid.uuid4()}/").status_code, 404)
+        self.assertEqual(self.ticket(OWNER_FILES, mine["id"]).status_code, 404)
+        self.assertEqual(self.ticket(OWNER_FILES, str(uuid.uuid4())).status_code, 404)
 
     def test_member_who_left_keeps_older_files_only(self) -> None:
         g = self.make_group(ids=[self.member.id, self.karan.id])
@@ -394,109 +447,164 @@ class AccessTests(FileCase):
         self.client.patch(f"{GROUPS}{g['id']}/", {"member_ids": [self.karan.id]}, format="json")
         after = self.group_file_line(g)["file"]["id"]
         self.device(self.asha_token)
-        self.assertEqual(self.client.get(f"{DEVICE_FILES}{before}/").status_code, 200)  # read-only history
-        self.assertEqual(self.client.get(f"{DEVICE_FILES}{after}/").status_code, 404)
-        self.device(self.karan_token)
-        self.assertEqual(self.client.get(f"{DEVICE_FILES}{after}/").status_code, 200)
+        self.assertEqual(self.ticket(DEVICE_FILES, before).status_code, 200)
+        self.assertEqual(self.ticket(DEVICE_FILES, after).status_code, 404)
 
-    def test_download_headers_and_inline_images(self) -> None:
+    def test_not_shared_any_more_is_410(self) -> None:
         g = self.make_group()
-        doc = self.group_file_line(g, name="Résumé 2026 ✓.pdf")["file"]
-        r = self.client.get(doc["url"])
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r["Content-Disposition"], "attachment; filename*=UTF-8''R%C3%A9sum%C3%A9%202026%20%E2%9C%93.pdf")
-        self.assertEqual(r["Content-Type"], "application/octet-stream")
-        self.assertEqual(r["X-Content-Type-Options"], "nosniff")
-        self.assertEqual(r["Cache-Control"], "private, no-store")
-        self.assertEqual(self.content(r), PDF)
-        self.assertEqual(self.client.get(doc["url"] + "?inline=1")["Content-Disposition"][:10], "attachment")
-        pic = self.group_file_line(g, name="shot.png", content=PNG)["file"]
-        r = self.client.get(pic["url"] + "?inline=1")
-        self.assertEqual((r["Content-Type"], r["Content-Disposition"]), ("image/png", "inline; filename*=UTF-8''shot.png"))
-        self.assertEqual(self.content(r), PNG)
-        self.assertEqual(self.client.get(pic["url"])["Content-Type"], "application/octet-stream")
+        for change, state in (({"stopped_at": timezone.now()}, "stopped"), ({"gone_at": timezone.now()}, "gone"),
+                              ({"expires_at": timezone.now() - timedelta(seconds=1)}, "old")):
+            line = self.group_file_line(g, thumb_b64=b64(JPEG))
+            fid = line["file"]["id"]
+            ChatFile.objects.filter(pk=fid).update(**change)
+            self.as_owner()
+            r = self.ticket(OWNER_FILES, fid)
+            self.assertEqual((r.status_code, r.json()), (410, NOT_SHARED))
+            self.assertEqual(self.client.get(f"{OWNER_FILES}{fid}/thumb/").status_code, 404)
+            self.device(self.karan_token)
+            self.assertEqual(self.ticket(DEVICE_FILES, fid).status_code, 410)
+            shown = self.client.get(f"{DEVICE_CHAT}{g['id']}/messages/").json()[-1]["file"]
+            self.assertEqual((shown["state"], shown["available"], shown["expired"], shown["thumb_url"]),
+                             (state, False, True, None))
+
+    def test_serve_tickets(self) -> None:
+        self.device(self.karan_token)
+        r = self.client.get(f"{DEVICE_FILES}serve-ticket/")
+        self.assertEqual(r.status_code, 200, r.content)
+        s = r.json()
+        self.assertEqual(set(s), {"ticket", "wait_url", "push_base", "expires_at"})
+        holder = f"d{self.device_of(self.karan).id}"
+        self.assertEqual(tickets.read(s["ticket"], tickets.SERVE), {"k": "serve", "h": holder})
+        self.assertIsNone(tickets.read(s["ticket"], tickets.GET))  # a serve ticket can't download
+        self.assertEqual(unquote(s["wait_url"]), f"http://testserver/relay/wait?t={s['ticket']}")
+        self.assertEqual(s["push_base"], "http://testserver/relay/push/")
+        self.as_owner()
+        r = self.client.get(f"{OWNER_FILES}serve-ticket/")
+        self.assertEqual((r.status_code, r.json()), (400, {"browser_id": ["This field is required."]}))
+        s = self.client.get(f"{OWNER_FILES}serve-ticket/?browser_id={BROWSER}").json()
+        self.assertEqual(tickets.read(s["ticket"], tickets.SERVE)["h"], f"b{self.owner.id}.{BROWSER}")
+
+
+class HolderTests(FileCase):
+    def test_patch_sha_and_gone_by_the_holder_only(self) -> None:
+        g = self.make_group()
+        line = self.group_file_line(g, token=self.karan_token)
+        fid = line["file"]["id"]
+        url = f"{DEVICE_FILES}{fid}/"
+        # Someone who can see the file but doesn't hold it.
+        self.device(self.asha_token)
+        self.assertEqual(self.client.patch(url, {"sha256": "b" * 64}, format="json").status_code, 404)
+        self.as_owner()
+        self.assertEqual(self.client.patch(f"{OWNER_FILES}{fid}/", {"gone": True}, format="json").status_code, 404)
+        # The holder.
+        self.device(self.karan_token)
+        r = self.client.patch(url, {"sha256": "B" * 64}, format="json")
+        self.assertEqual((r.status_code, r.json()["state"]), (200, "ok"))
+        self.assertEqual(ChatFile.objects.get(pk=fid).sha256, "b" * 64)
+        self.assertEqual(self.client.patch(url, {"sha256": "b" * 64}, format="json").status_code, 200)  # same: fine
+        r = self.client.patch(url, {"sha256": "c" * 64}, format="json")
+        self.assertEqual((r.status_code, r.json()), (400, {"sha256": ["The file changed. Share it again."]}))
+        self.assertEqual(self.client.patch(url, {"sha256": "zz"}, format="json").status_code, 400)
+        self.assertEqual(self.client.patch(url, {}, format="json").status_code, 400)
+        r = self.client.patch(url, {"gone": True}, format="json")
+        self.assertEqual((r.status_code, r.json()["state"], r.json()["available"]), (200, "gone", False))
+        self.assertEqual(self.ticket(DEVICE_FILES, fid).status_code, 410)
+        # The same member on another PC isn't the holder.
+        ChatFile.objects.filter(pk=fid).update(holder="d999999", gone_at=None)
+        self.assertEqual(self.client.patch(url, {"gone": True}, format="json").status_code, 404)
+
+    def test_owner_patches_own_browser_files(self) -> None:
+        f = self.registered()
+        r = self.client.patch(f"{OWNER_FILES}{f['id']}/", {"sha256": "d" * 64}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(self.client.get(f"{OWNER_FILES}{f['id']}/").json()["id"], f["id"])
+
+    def test_stop_by_the_sender_only(self) -> None:
+        g = self.make_group()
+        line = self.group_file_line(g, token=self.karan_token, thumb_b64=b64(JPEG))
+        fid = line["file"]["id"]
+        self.device(self.asha_token)
+        self.assertEqual(self.client.post(f"{DEVICE_FILES}{fid}/stop/").status_code, 404)
+        self.as_owner()
+        self.assertEqual(self.client.post(f"{OWNER_FILES}{fid}/stop/").status_code, 404)
+        # The sender, even from a PC that doesn't hold it.
+        ChatFile.objects.filter(pk=fid).update(holder="d999999")
+        self.device(self.karan_token)
+        r = self.client.post(f"{DEVICE_FILES}{fid}/stop/")
+        self.assertEqual((r.status_code, r.json()["state"], r.json()["thumb_url"]), (200, "stopped", None))
+        self.assertIsNone(ChatFile.objects.get(pk=fid).thumb)
+        self.assertEqual(self.client.post(f"{DEVICE_FILES}{fid}/stop/").status_code, 200)  # again: fine
+        self.assertEqual(self.ticket(DEVICE_FILES, fid).json(), NOT_SHARED)
+        # The owner stops their own.
+        own = self.group_file_line(g)["file"]["id"]
+        self.assertEqual(self.client.post(f"{OWNER_FILES}{own}/stop/").json()["state"], "stopped")
+
+    def test_shared_by_me(self) -> None:
+        g = self.make_group()
+        direct = self.direct_with_emily()
+        a = self.group_file_line(g, token=self.karan_token, name="a.pdf")["file"]["id"]
+        f = self.registered("b.jpg", 10, token=self.karan_token)
+        self.client.post(f"{DEVICE_CHAT}{direct['id']}/messages/", {"file_id": f["id"]}, format="json")
+        stopped = self.group_file_line(g, token=self.karan_token, name="c.pdf")["file"]["id"]
+        self.client.post(f"{DEVICE_FILES}{stopped}/stop/")
+        self.registered("not-sent.pdf", 10, token=self.karan_token)
+        self.group_file_line(g, name="owners.pdf")
+        self.device(self.karan_token)
+        listed = self.client.get(f"{DEVICE_FILES}shared/").json()
+        self.assertEqual([x["name"] for x in listed], ["b.jpg", "a.pdf"])
+        first = listed[0]
+        self.assertEqual(set(first), FILE_KEYS | {"holder", "local_ref", "sha256", "chat"})
+        self.assertEqual(first["chat"], {"kind": "direct", "id": direct["id"], "name": "Emily Carter"})
+        self.assertEqual(listed[1]["chat"], {"kind": "group", "id": g["id"], "name": "Design"})
+        self.assertEqual((first["holder"], first["local_ref"]),
+                         (f"d{self.device_of(self.karan).id}", "C:\\Users\\me\\Documents\\b.jpg"))
+        self.assertTrue(all(x["mine"] for x in listed))
+        self.as_owner()
+        f = self.registered("Brief.pdf", 10)
+        self.client.post(f"/api/devices/members/{self.member.id}/message/", {"file_id": f["id"]}, format="json")
+        listed = self.client.get(f"{OWNER_FILES}shared/").json()
+        self.assertEqual([(x["name"], x["chat"]["kind"]) for x in listed], [("Brief.pdf", "admin"), ("owners.pdf", "group")])
+        self.assertEqual(listed[0]["chat"]["name"], self.member.name)
+        self.assertEqual(listed[0]["holder"], f"b{self.owner.id}.{BROWSER}")
 
 
 class LifecycleTests(FileCase):
-    def test_expired_is_410_and_clean_up_keeps_the_row(self) -> None:
+    def test_clean_up_marks_old_files_and_deletes_unsent_ones(self) -> None:
         g = self.make_group()
-        line = self.group_file_line(g)
+        line = self.group_file_line(g, thumb_b64=b64(JPEG))
         fid = line["file"]["id"]
-        path = self.disk(fid)
+        fresh = self.registered("fresh.txt", 1)
+        stale = self.registered("stale.txt", 1)
+        ChatFile.objects.filter(pk=stale["id"]).update(created_at=timezone.now() - timedelta(minutes=61))
         ChatFile.objects.filter(pk=fid).update(expires_at=timezone.now() - timedelta(seconds=1))
-        gone = {"detail": "This file is no longer available. Files are kept for 7 days."}
-        r = self.client.get(f"{OWNER_FILES}{fid}/")
-        self.assertEqual((r.status_code, r.json()), (410, gone))
-        self.device(self.karan_token)
-        self.assertEqual(self.client.get(f"{DEVICE_FILES}{fid}/").status_code, 410)
-        shown = self.client.get(f"{DEVICE_CHAT}{g['id']}/messages/").json()[-1]
-        self.assertEqual((shown["file"]["expired"], shown["file"]["url"]), (True, None))
-        self.assertTrue(path.exists())  # until the clean-up runs
         result = files.prune_chat_files()
-        self.assertEqual((result.expired, result.unattached, result.failed), (1, 0, []))
-        self.assertFalse(path.exists())
+        self.assertEqual((result.expired, result.unattached, result.failed), (1, 1, []))
+        self.assertIn("marked too old", result.summary())
         row = ChatFile.objects.get(pk=fid)
         self.assertIsNotNone(row.deleted_at)
-        self.assertEqual(files.prune_chat_files().expired, 0)  # once
-        self.as_owner()
-        shown = self.owner_lines(g["id"])[-1]
-        self.assertEqual((shown["file"]["name"], shown["file"]["expired"], shown["file"]["url"]),
-                         ("Quote-Lumen.pdf", True, None))
-        self.assertEqual(self.client.get(f"{OWNER_FILES}{fid}/").status_code, 410)
-
-    def test_clean_up_deletes_unsent_uploads_after_an_hour(self) -> None:
-        fresh = self.uploaded("fresh.txt", b"a")
-        stale = self.uploaded("stale.txt", b"b")
-        stale_path = self.disk(stale["id"])
-        ChatFile.objects.filter(pk=stale["id"]).update(created_at=timezone.now() - timedelta(minutes=61))
-        with self.captureOnCommitCallbacks(execute=True):
-            result = files.prune_chat_files()
-        self.assertEqual((result.expired, result.unattached), (0, 1))
+        self.assertIsNone(row.thumb)
         self.assertFalse(ChatFile.objects.filter(pk=stale["id"]).exists())
-        self.assertFalse(stale_path.exists())
-        self.assertTrue(self.disk(fresh["id"]).exists())
-        self.assertIn("unsent upload(s) deleted", result.summary())
+        self.assertTrue(ChatFile.objects.filter(pk=fresh["id"]).exists())
+        self.assertEqual(files.prune_chat_files().expired, 0)  # once
+        shown = self.owner_lines(g["id"])[-1]["file"]
+        self.assertEqual((shown["name"], shown["state"], shown["available"]), ("Quote-Lumen.pdf", "old", False))
+        # Kept 30 days from when it was shared.
+        self.assertEqual(files.FILE_KEEP_DAYS, 30)
 
     def test_run_jobs_runs_the_clean_up(self) -> None:
         from z_main.management.commands.run_jobs import JOBS
 
         self.assertIn(files.prune_chat_files, [job for _, job in JOBS])
 
-    def test_cascade_removes_the_disk_file(self) -> None:
+    def test_cascade_and_delete(self) -> None:
         g = self.make_group()
         line = self.group_file_line(g)
-        path = self.disk(line["file"]["id"])
-        # Chat history clean-up deletes old lines for good: the file row and the disk file go with them.
         ChatMessage.objects.filter(pk=line["id"]).update(created_at=timezone.now() - timedelta(days=4000))
-        with self.captureOnCommitCallbacks(execute=True):
-            self.assertEqual(prune_chat().lines, 1)
+        self.assertEqual(prune_chat().lines, 1)
         self.assertFalse(ChatFile.objects.exists())
-        self.assertFalse(path.exists())
-        # Deleting a group (owner) does the same.
         line = self.group_file_line(g)
-        path = self.disk(line["file"]["id"])
-        with self.captureOnCommitCallbacks(execute=True):
-            self.assertEqual(self.client.delete(f"{GROUPS}{g['id']}/").status_code, 204)
-        self.assertFalse(path.exists())
-        # Already gone from disk: the delete still works.
-        f = self.uploaded()
-        self.disk(f["id"]).unlink()
-        with self.captureOnCommitCallbacks(execute=True):
-            ChatFile.objects.filter(pk=f["id"]).delete()
-
-    def test_a_rolled_back_delete_keeps_the_disk_file(self) -> None:
-        from django.db import transaction
-
-        f = self.uploaded()
-        path = self.disk(f["id"])
-        with self.captureOnCommitCallbacks(execute=True):
-            try:
-                with transaction.atomic():
-                    ChatFile.objects.filter(pk=f["id"]).delete()
-                    raise RuntimeError("roll back")
-            except RuntimeError:
-                pass
-        self.assertTrue(path.exists())
+        self.assertEqual(self.client.delete(f"{GROUPS}{g['id']}/").status_code, 204)
+        self.assertFalse(ChatFile.objects.exists())
 
     def test_file_lines_cant_be_edited_and_delete_takes_the_file(self) -> None:
         g = self.make_group()
@@ -504,38 +612,29 @@ class LifecycleTests(FileCase):
         url = f"{GROUPS}{g['id']}/messages/{line['id']}/"
         r = self.client.patch(url, {"body": "changed"}, format="json")
         self.assertEqual((r.status_code, r.json()), (400, {"body": ["A file can't be edited. Delete it and send it again."]}))
-        path = self.disk(line["file"]["id"])
-        with self.captureOnCommitCallbacks(execute=True):
-            r = self.client.delete(url)
-        self.assertEqual((r.status_code, r.json()["deleted"], r.json()["body"], r.json()["file"]), (200, True, "", None))
+        r = self.client.delete(url)
+        self.assertEqual((r.status_code, r.json()["deleted"], r.json()["file"]), (200, True, None))
         self.assertFalse(ChatFile.objects.exists())
-        self.assertFalse(path.exists())
-        self.assertIsNone(self.owner_lines(g["id"])[-1]["file"])
-        self.assertEqual(self.client.get(line["file"]["url"]).status_code, 404)
-        # Past 15 minutes: the line (and its file) stay.
+        self.assertEqual(self.ticket(OWNER_FILES, line["file"]["id"]).status_code, 404)
         mine = self.group_file_line(g, token=self.karan_token)
         ChatMessage.objects.filter(pk=mine["id"]).update(created_at=timezone.now() - timedelta(minutes=16))
         ConversationMember.objects.filter(member=self.karan).update(joined_at=timezone.now() - timedelta(hours=1))
-        r = self.client.delete(f"{DEVICE_CHAT}{g['id']}/messages/{mine['id']}/")
-        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.client.delete(f"{DEVICE_CHAT}{g['id']}/messages/{mine['id']}/").status_code, 400)
         self.assertTrue(ChatFile.objects.filter(pk=mine["file"]["id"]).exists())
-        self.assertEqual(self.client.patch(f"{DEVICE_CHAT}{g['id']}/messages/{mine['id']}/", {"body": "x"},
-                                           format="json").status_code, 400)
 
     def test_a_report_keeps_the_fallback_text(self) -> None:
         g = self.make_group()
-        line = self.group_file_line(g, token=self.karan_token)
+        line = self.group_file_line(g, token=self.karan_token, size=900)
         self.device(self.asha_token)
         r = self.client.post(f"{DEVICE_CHAT}{g['id']}/report/", {"message_id": line["id"]}, format="json")
         self.assertEqual(r.status_code, 201, r.content)
         self.assertEqual(ChatReport.objects.get().message_body, f"{CLIP} Quote-Lumen.pdf (1 KB)\nFinal version")
 
-    def test_human_size(self) -> None:
-        self.assertEqual([files.human_size(n) for n in (1, 348160, 1048576, 2202009, 26214400)],
-                         ["1 KB", "340 KB", "1 MB", "2.1 MB", "25 MB"])
-
-    def test_disk_write_failure_leaves_nothing(self) -> None:
-        with mock.patch.object(ChatFile, "save", side_effect=RuntimeError("db down")):
-            with self.assertRaises(RuntimeError):
-                files.store_upload(SimpleUploadedFile("a.pdf", PDF), self.owner.id, None)
-        self.assertEqual([p for p in Path(self.root).rglob("*") if p.is_file()], [])
+    def test_round_one_files_are_stopped_by_the_migration(self) -> None:
+        old = ChatFile.objects.create(owner=self.owner, name="r1.pdf", size=10, sha256="0" * 64)
+        new = ChatFile.objects.create(owner=self.owner, name="r2.pdf", size=10, holder="d1")
+        migration = importlib.import_module("z_chat.migrations.0004_files_stay_on_device")
+        migration.stop_round_one_files(django_apps, None)
+        old.refresh_from_db()
+        new.refresh_from_db()
+        self.assertEqual((files.state(old), files.state(new)), ("stopped", "ok"))

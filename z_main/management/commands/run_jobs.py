@@ -48,7 +48,7 @@ JOBS = (
     ("scheduled reports", send_scheduled_reports),  # FR-22: daily / weekly / monthly reports by email
     ("history clean-up", prune_history),
     ("chat clean-up", prune_chat),  # v1.4: team chat past each plan's chat_history_days + 30 days
-    ("chat files clean-up", prune_chat_files),  # v1.5: chat files past 7 days (disk file goes, row stays), unsent uploads after 1 h
+    ("chat files clean-up", prune_chat_files),  # v1.5: chat files past 30 days marked (nothing on disk), unsent ones after 1 h
     ("new version plan", make_version_plan),  # Thursday 03:00 IST: the week's feedback + issues -> plan, PDF to the founder
 )
 

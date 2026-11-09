@@ -6,9 +6,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from django.http import Http404
+from django.http import Http404, HttpResponse
 from rest_framework import serializers, status
-from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -155,7 +154,7 @@ class GroupMessagesView(_OwnerView):
 
 def _line(group: Any, line_id: int) -> ChatMessage:
     line = ChatMessage.objects.filter(conversation=group, pk=line_id).select_related(
-        "sender_member", "reply_to__sender_member", "chat_file").first()
+        "sender_member", "reply_to__sender_member", "chat_file__by_member", "chat_file__owner").first()
     if line is None:
         raise Http404
     return line
@@ -236,49 +235,162 @@ class SettingsView(_OwnerView):
     put = patch
 
 
-# --- Files (v1.5) ----------------------------------------------------------------------------------------------------
+# --- Files (v1.5 round 2: the file stays on the sender's device) -----------------------------------------------------
 
 
-def _upload(request: Request, owner: Any, member: Any) -> Response:
-    """POST (multipart `file`) -> 201 FileJSON, not attached yet."""
+class FileRegisterSerializer(serializers.Serializer):
+    """POST .../files/ (JSON): the record of a file the sender holds. No bytes ever come here."""
+
+    name = serializers.CharField(max_length=1000, trim_whitespace=False)  # made safe by files.safe_name
+    size = serializers.IntegerField(min_value=0, max_value=2 ** 53)
+    mime = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    sha256 = serializers.CharField(max_length=128, required=False, allow_blank=True, allow_null=True, default="")
+    local_ref = serializers.CharField(max_length=files.LOCAL_REF_MAX, trim_whitespace=False)
+    thumb_b64 = serializers.CharField(required=False, allow_blank=True, allow_null=True, default=None)
+    width = serializers.IntegerField(min_value=1, max_value=100000, required=False, allow_null=True, default=None)
+    height = serializers.IntegerField(min_value=1, max_value=100000, required=False, allow_null=True, default=None)
+    duration_s = serializers.FloatField(min_value=0, max_value=10 ** 7, required=False, allow_null=True, default=None)
+    batch_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+    browser_id = serializers.CharField(max_length=64, required=False, allow_blank=True, allow_null=True, default=None)
+
+
+class FilePatchSerializer(serializers.Serializer):
+    sha256 = serializers.CharField(max_length=128, required=False, allow_blank=True)
+    gone = serializers.BooleanField(required=False)
+
+
+def _file_refused(exc: files.FileRefused) -> Response:
+    if exc.forbidden:
+        return Response({"detail": exc.message}, status=status.HTTP_403_FORBIDDEN)
+    return Response({exc.field: [exc.message]}, status=status.HTTP_400_BAD_REQUEST)
+
+
+def _json(request: Request, row: Any, member: Any, device: Any) -> dict[str, Any] | None:
+    return files.file_json(row, request, device=device is not None,
+                           viewer_member_id=member.pk if member is not None else None)
+
+
+def _register(request: Request, owner: Any, member: Any, device: Any) -> Response:
+    """POST -> 201 FileJSON, not attached yet. The holder is the device, or the owner's browser (browser_id)."""
     if not services.settings_for(owner).allow_files:
         return Response({"detail": files.SHARING_OFF}, status=status.HTTP_403_FORBIDDEN)
-    if files.body_too_big(request.META.get("CONTENT_LENGTH")):  # refused before the body is read
-        return Response({"file": [files.TOO_BIG]}, status=status.HTTP_400_BAD_REQUEST)
+    data = FileRegisterSerializer(data=request.data)
+    data.is_valid(raise_exception=True)
+    v = data.validated_data
     try:
-        row = files.store_upload(request.FILES.get("file"), owner.pk, member.pk if member is not None else None)
+        holder = files.device_holder(device) if device is not None else files.browser_holder(owner.pk, v["browser_id"])
+        row = files.register(owner.pk, member.pk if member is not None else None, holder,
+                             plan.entitlements_for(owner).file_max_mb, v)
     except files.FileRefused as exc:
-        return Response({exc.field: [exc.message]}, status=status.HTTP_400_BAD_REQUEST)
-    return Response(files.file_json(row, request, device=member is not None), status=status.HTTP_201_CREATED)
+        return _file_refused(exc)
+    row.owner, row.by_member = owner, member
+    return Response(_json(request, row, member, device), status=status.HTTP_201_CREATED)
 
 
-def _download(request: Request, row: Any) -> Any:
-    if files.is_gone(row):
-        return Response({"detail": files.GONE}, status=status.HTTP_410_GONE)
-    response = files.download(row, inline=request.query_params.get("inline") == "1")
-    if response is None:
-        return Response({"detail": files.GONE}, status=status.HTTP_410_GONE)
+def _patch(request: Request, row: Any, owner: Any, member: Any, device: Any) -> Response:
+    """PATCH .../files/<id>/ {sha256?} | {gone: true} -- the holder only (anyone else: 404)."""
+    if not files.is_holder(row, owner, device):
+        raise Http404
+    data = FilePatchSerializer(data=request.data)
+    data.is_valid(raise_exception=True)
+    v = data.validated_data
+    if "sha256" not in v and not v.get("gone"):
+        return Response({"sha256": ["Send sha256, or gone: true."]}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        files.patch(row, v.get("sha256"), bool(v.get("gone")))
+    except files.FileRefused as exc:
+        return _file_refused(exc)
+    return Response(_json(request, row, member, device))
+
+
+def _ticket(request: Request, row: Any) -> Response:
+    if not files.is_available(row):
+        return Response({"detail": files.NOT_SHARED}, status=status.HTTP_410_GONE)
+    return Response(files.ticket_json(row, request))
+
+
+def _thumb(row: Any) -> Any:
+    data = bytes(row.thumb) if row.thumb is not None else b""
+    if not data or not files.is_available(row):
+        raise Http404
+    response = HttpResponse(data, content_type=files.sniff_thumb(data) or "application/octet-stream")
+    response["Cache-Control"] = "private, max-age=86400"
+    response["X-Content-Type-Options"] = "nosniff"
     return response
 
 
-class FileUploadView(_OwnerView):
-    """POST /api/chat/files/ (multipart `file`) -> 201 FileJSON (owner)."""
+class _OwnerFileView(_OwnerView):
+    """An owner route on one file: groups, the owner's admin chats and own files. Never a direct chat's file (404)."""
 
-    parser_classes = [MultiPartParser, FormParser]
-
-    def post(self, request: Request) -> Response:
-        return _upload(request, request.user, None)
-
-
-class FileView(_OwnerView):
-    """GET /api/chat/files/<uuid>/[?inline=1] -- groups, the owner's admin chats and own uploads. Never a direct chat's
-    file (404). Expired -> 410."""
-
-    def get(self, request: Request, file_id: Any) -> Any:
+    def file(self, request: Request, file_id: Any) -> Any:
         row = files.find(file_id)
         if row is None or not files.owner_may_get(request.user, row):
             raise Http404
-        return _download(request, row)
+        return row
+
+
+class FilesView(_OwnerView):
+    """GET /api/chat/files/ -> {allowed, max_bytes, keep_days}; POST (JSON) registers a file -> 201 FileJSON."""
+
+    def get(self, request: Request) -> Response:
+        ent = plan.entitlements_for(request.user)
+        return Response({"allowed": services.files_allowed(request.user), "max_bytes": ent.file_max_bytes,
+                         "keep_days": files.FILE_KEEP_DAYS})
+
+    def post(self, request: Request) -> Response:
+        return _register(request, request.user, None, None)
+
+
+class FileView(_OwnerFileView):
+    """GET /api/chat/files/<uuid>/ -> FileJSON; PATCH {sha256?} | {gone: true} (the owner's own files)."""
+
+    def get(self, request: Request, file_id: Any) -> Response:
+        return Response(_json(request, self.file(request, file_id), None, None))
+
+    def patch(self, request: Request, file_id: Any) -> Response:
+        return _patch(request, self.file(request, file_id), request.user, None, None)
+
+
+class FileStopView(_OwnerFileView):
+    """POST /api/chat/files/<uuid>/stop/ -- the owner stops sharing their own file -> FileJSON."""
+
+    def post(self, request: Request, file_id: Any) -> Response:
+        row = self.file(request, file_id)
+        if not files.is_sender(row, request.user, None):
+            raise Http404
+        return Response(_json(request, files.stop(row), None, None))
+
+
+class FileTicketView(_OwnerFileView):
+    """POST /api/chat/files/<uuid>/ticket/ -> {url, inline_url, status_url, expires_at}; not shared -> 410."""
+
+    def post(self, request: Request, file_id: Any) -> Response:
+        return _ticket(request, self.file(request, file_id))
+
+
+class FileThumbView(_OwnerFileView):
+    """GET /api/chat/files/<uuid>/thumb/ -> the preview picture (private cache, 1 day)."""
+
+    def get(self, request: Request, file_id: Any) -> Any:
+        return _thumb(self.file(request, file_id))
+
+
+class ServeTicketView(_OwnerView):
+    """GET /api/chat/files/serve-ticket/?browser_id= -> {ticket, wait_url, push_base, expires_at} for this browser."""
+
+    def get(self, request: Request) -> Response:
+        try:
+            holder = files.browser_holder(request.user.pk, request.query_params.get("browser_id"))
+        except files.FileRefused as exc:
+            return _file_refused(exc)
+        return Response(files.serve_ticket_json(holder, request))
+
+
+class SharedFilesView(_OwnerView):
+    """GET /api/chat/files/shared/ -> the owner's files still shared ("Shared by me"), newest first."""
+
+    def get(self, request: Request) -> Response:
+        return Response(files.shared_by(request.user, None, request, device=False))
 
 
 class PrefsView(APIView):
@@ -385,7 +497,7 @@ class DeviceMessageView(_DeviceView):
 
     def _line(self, conv: Any, row: Any, line_id: int) -> ChatMessage:
         line = services.visible_lines(conv, row).filter(pk=line_id).select_related(
-            "sender_member", "reply_to__sender_member", "chat_file").first()
+            "sender_member", "reply_to__sender_member", "chat_file__by_member", "chat_file__owner").first()
         if line is None:
             raise Http404
         return line
@@ -459,33 +571,85 @@ class DeviceReportView(_DeviceView):
 
 
 class DeviceFilesView(_DeviceView):
-    """GET /api/devices/chat/files/ -> {allowed, max_bytes, keep_days}; POST (multipart `file`) -> 201 FileJSON."""
-
-    parser_classes = [MultiPartParser, FormParser]
+    """GET /api/devices/chat/files/ -> {allowed, max_bytes, keep_days}; POST (JSON) registers a file this PC holds."""
 
     def get(self, request: Request) -> Response:
         allowed = bool(request.auth.member_id) and services.files_allowed(request.auth.owner)
-        return Response({"allowed": allowed, "max_bytes": files.FILE_MAX_BYTES, "keep_days": files.FILE_KEEP_DAYS})
+        max_bytes = plan.entitlements_for(request.auth.owner).file_max_bytes
+        return Response({"allowed": allowed, "max_bytes": max_bytes, "keep_days": files.FILE_KEEP_DAYS})
 
     def post(self, request: Request) -> Response:
         if not self.allowed(request):
             raise plan.FeatureLocked(plan.TEAM_CHAT)
         member = self.member(request)
-        return _upload(request, request.auth.owner, member)
+        return _register(request, request.auth.owner, member, request.auth)
 
 
-class DeviceFileView(_DeviceView):
-    """GET /api/devices/chat/files/<uuid>/[?inline=1] -- files in chats the member can see, their admin chat, their own
-    uploads. Expired -> 410."""
+class _DeviceFileView(_DeviceView):
+    """A device route on one file: chats the member can see, their admin chat, their own files."""
 
-    def get(self, request: Request, file_id: Any) -> Any:
+    def file(self, request: Request, file_id: Any):  # type: ignore[no-untyped-def]
         if not self.allowed(request):
             raise plan.FeatureLocked(plan.TEAM_CHAT)
         member = self.member(request)
         row = files.find(file_id)
         if row is None or not files.member_may_get(member, row):
             raise Http404
-        return _download(request, row)
+        return member, row
+
+
+class DeviceFileView(_DeviceFileView):
+    """GET /api/devices/chat/files/<uuid>/ -> FileJSON; PATCH {sha256?} | {gone: true} (the PC that holds it)."""
+
+    def get(self, request: Request, file_id: Any) -> Response:
+        member, row = self.file(request, file_id)
+        return Response(_json(request, row, member, request.auth))
+
+    def patch(self, request: Request, file_id: Any) -> Response:
+        member, row = self.file(request, file_id)
+        return _patch(request, row, request.auth.owner, member, request.auth)
+
+
+class DeviceFileStopView(_DeviceFileView):
+    """POST /api/devices/chat/files/<uuid>/stop/ -- the member who shared it stops sharing -> FileJSON."""
+
+    def post(self, request: Request, file_id: Any) -> Response:
+        member, row = self.file(request, file_id)
+        if not files.is_sender(row, request.auth.owner, member):
+            raise Http404
+        return Response(_json(request, files.stop(row), member, request.auth))
+
+
+class DeviceFileTicketView(_DeviceFileView):
+    """POST /api/devices/chat/files/<uuid>/ticket/ -> {url, inline_url, status_url, expires_at}."""
+
+    def post(self, request: Request, file_id: Any) -> Response:
+        return _ticket(request, self.file(request, file_id)[1])
+
+
+class DeviceFileThumbView(_DeviceFileView):
+    """GET /api/devices/chat/files/<uuid>/thumb/ -> the preview picture."""
+
+    def get(self, request: Request, file_id: Any) -> Any:
+        return _thumb(self.file(request, file_id)[1])
+
+
+class DeviceServeTicketView(_DeviceView):
+    """GET /api/devices/chat/files/serve-ticket/ -> {ticket, wait_url, push_base, expires_at} for this PC."""
+
+    def get(self, request: Request) -> Response:
+        if not self.allowed(request):
+            raise plan.FeatureLocked(plan.TEAM_CHAT)
+        return Response(files.serve_ticket_json(files.device_holder(request.auth), request))
+
+
+class DeviceSharedFilesView(_DeviceView):
+    """GET /api/devices/chat/files/shared/ -> this member's files still shared ("My shared files"), newest first."""
+
+    def get(self, request: Request) -> Response:
+        if not self.allowed(request):
+            raise plan.FeatureLocked(plan.TEAM_CHAT)
+        return Response(files.shared_by(request.auth.owner, self.member(request), request, device=True))
 
 
 class DevicePeopleView(_DeviceView):

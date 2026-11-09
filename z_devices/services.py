@@ -433,7 +433,7 @@ def _with_tasks(qs: QuerySet) -> QuerySet:
     from .models import TaskActivity, TaskPerson, TaskStep
 
     return (
-        qs.select_related("task__member", "task__owner", "chat_file")
+        qs.select_related("task__member", "task__owner", "chat_file__by_member", "chat_file__owner")
         .prefetch_related(
             Prefetch("task__steps", queryset=TaskStep.objects.order_by("position", "id")),
             Prefetch("task__activity", queryset=TaskActivity.objects.select_related("member").order_by("at", "id")),
