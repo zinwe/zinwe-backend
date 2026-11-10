@@ -219,7 +219,7 @@ class SequenceTests(WaBase):
 
     def test_yes_starts_the_track_sequence(self) -> None:
         self.live(interested=WaTemplate.objects.get(name="YES reply: two questions + sign-up link"))
-        c = self.contact(track="data")
+        c = self.contact(track="privacy")  # was "data" before the 100 Reviews Tracks
         whatsapp.mark_sent(c, "first", "Hi", "staff@zinwe.io")
         whatsapp.record_reply(c, "HAAN", "staff@zinwe.io")
         whatsapp.act(c, "interested")
@@ -233,9 +233,11 @@ class SequenceTests(WaBase):
         WaContact.objects.filter(pk=c.pk).update(yes_date=whatsapp.today() - timedelta(days=1))
         c.refresh_from_db()
         self.assertEqual(whatsapp.queue()[0]["template"], "Data track, day 1: setup + first alert")
-        c.track = "chat"
+        c.track = "activity"
         c.save()
-        self.assertEqual(whatsapp.next_nurture(c).name, "Chat track, day 1: setup + first task")
+        self.assertEqual(whatsapp.next_nurture(c).name, "Team's day track, day 1: setup + log in")
+        # The Team chat track is retired: its templates are archived and never picked.
+        self.assertTrue(WaTemplate.objects.filter(name="Chat track, day 1: setup + first task", archived=True).exists())
 
     def test_a_reply_holds_the_sequence_and_stop_ends_it(self) -> None:
         c = self.contact()

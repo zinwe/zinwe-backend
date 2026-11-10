@@ -9,6 +9,9 @@ Drafts come from the campaign's templates; with ANTHROPIC_API_KEY set, Claude pe
 Someone who never replies gets at most four messages (first, follow-up, touch 3, touch 4), each due a set number of
 days after the first. A YES starts the after-YES sequence: templates of kind "nurture", picked by the contact's track
 and due `day` days after the YES.
+
+Campaigns with plan "ninety" (the 100 Reviews campaign) follow wa_flow.py instead: category templates by day, then the
+YES path by Track.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 
+from . import wa_flow
 from .contact_file import MAX_BYTES, MAX_ROWS, FileProblem, _read_rows
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
 
@@ -46,8 +50,11 @@ OPT_IN = {"y", "yes", "true"}  # opted in or introduced; any other value loads t
 LOCKED = "Not opted in yet. Mark them as opted in, with how they agreed, before messaging."
 REQUIRED = {"firm": "Business Name", "phone": "Phone", "segment": "Segment", "country": "Country", "city": "City"}
 TEMPLATE_COLUMNS = ["Business Name", "Phone", "Segment", "Country", "City", "First Name", "Source", "Opt-in", "Useful Info"]
-ACTIONS = ("interested", "signed", "notnow", "stop", "pause", "resume", "optin")
+ACTIONS = ("interested", "signed", "notnow", "stop", "pause", "resume", "optin",
+           # 90-day campaign (wa_flow.py): Track, paid, setup error, first PC connected, a testimonial back
+           "track", "paid", "setup_error", "setup_ok", "using", "review_written", "review_video")
 COLD = [WaMessage.Kind.FIRST, WaMessage.Kind.FOLLOWUP, WaMessage.Kind.TOUCH, WaMessage.Kind.CUSTOM]  # count against the daily limit
+CS = WaContact.CampaignStatus
 
 
 class WaError(Exception):
@@ -299,7 +306,7 @@ def _template_for(contact: WaContact, kind: str) -> WaTemplate | None:
 
 def _template_for_any(contact: WaContact, kind: str) -> WaTemplate | None:
     c = contact.campaign
-    english = WaTemplate.objects.filter(kind=kind, language=WaTemplate.Language.EN)
+    english = WaTemplate.objects.filter(kind=kind, language=WaTemplate.Language.EN, category="", archived=False)
     if c is None:
         return english.first()
     pick = {"first": c.first, "followup": c.followup, "touch3": c.touch3, "touch4": c.touch4, "interested": c.interested,
@@ -312,7 +319,8 @@ def next_nurture(contact: WaContact) -> WaTemplate | None:
     if contact.yes_date is None or contact.status not in (Status.INTERESTED, Status.SIGNED):
         return None
     return (
-        WaTemplate.objects.filter(kind=WaTemplate.Kind.NURTURE, language=WaTemplate.Language.EN, track__in=["", contact.track], day__gt=contact.nurture_day)
+        WaTemplate.objects.filter(kind=WaTemplate.Kind.NURTURE, language=WaTemplate.Language.EN, category="", archived=False,
+                                  track__in=["", contact.track], day__gt=contact.nurture_day)
         .order_by("day", "track", "id")
         .first()
     )
@@ -385,11 +393,21 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
         template = WaTemplate.objects.filter(pk=template_id).first()
         if template is None:
             raise WaError("That template no longer exists.")
+    elif kind == "flow":
+        template, note = wa_flow.next_for(contact, today())
+        if template is None:
+            raise WaError("Set the contact's Track first." if note == "set_track" else "Nothing is due for this contact.")
     else:
         template = next_nurture(contact) if kind == "nurture" else _template_for(contact, kind)
     if template is None:
         raise WaError("No after-YES message is left for this contact." if kind == "nurture" else "Add a template of this kind first.")
-    base = fill(template.text, contact, template.language)
+    if template.category:
+        try:
+            wa_flow.check_sendable(contact, template)
+        except wa_flow.FlowError as exc:
+            raise WaError(str(exc)) from exc
+    language = language_for(contact) if template.category else template.language
+    base = fill(wa_flow.text_in(template, language), contact, language)
     last = contact.messages.filter(kind=Kind.THEIRS).last()
     personal = _claude(base, contact, last.text if last else "")
     from .wa_media import describe
@@ -400,7 +418,7 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
         "media": describe(template),
         # From the outreach structure, never sent: what to attach, and context for whoever replies next.
         "creative": parts.get("creative", ""), "notes": fill(parts["notes"], contact) if parts.get("notes") else "",
-        "language": template.language,
+        "language": language, "template_id": template.pk, "label": wa_flow.label(template) if template.category else "",
     }
 
 
@@ -408,7 +426,8 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
 
 
 def _sent_today(campaign: WaCampaign | None = None) -> int:
-    q = WaMessage.objects.filter(kind__in=COLD, at__date=today())
+    """Cold messages sent today: first, follow-up, touches, one-offs, and 90-day Outreach."""
+    q = WaMessage.objects.filter(Q(kind__in=COLD) | Q(kind=Kind.FLOW, template__category=WaTemplate.Category.OUTREACH), at__date=today())
     return q.filter(contact__campaign=campaign).count() if campaign else q.count()
 
 
@@ -418,12 +437,15 @@ NEXT_KIND = {0: "first", 1: "followup", 2: "touch3", 3: "touch4"}
 def queue() -> list[dict[str, Any]]:
     """
     What is due today: after-YES messages first (no daily limit: these people asked for them), then no-reply touches
-    and first messages in live campaigns, within each campaign's daily limit.
+    and first messages in live campaigns, within each campaign's daily limit. 90-day campaigns: wa_flow.queue.
     """
-    out: list[dict[str, Any]] = []
     now = today()
+    room = {c.id: max(0, c.daily_limit - _sent_today(c)) for c in WaCampaign.objects.filter(plan=WaCampaign.Plan.NINETY)}
+    out: list[dict[str, Any]] = wa_flow.queue(now, room)
+    ninety = WaCampaign.Plan.NINETY
     warm = (
         WaContact.objects.filter(status__in=[Status.INTERESTED, Status.SIGNED], yes_date__isnull=False, needs_reply=False)
+        .exclude(campaign__plan=ninety)
         .exclude(paused_until__gt=now)
         .select_related("campaign")
         .order_by("yes_date", "id")
@@ -432,7 +454,7 @@ def queue() -> list[dict[str, Any]]:
         template = next_nurture(contact)
         if template is not None and contact.yes_date + timedelta(days=template.day) <= now:
             out.append({"contact": contact, "kind": "nurture", "template": template.name})
-    for c in WaCampaign.objects.filter(status=WaCampaign.Status.LIVE):
+    for c in WaCampaign.objects.filter(status=WaCampaign.Status.LIVE).exclude(plan=ninety):
         room = max(0, c.daily_limit - _sent_today(c))
         due = c.contacts.filter(opted_in=True).exclude(paused_until__gt=now)
         touches = due.filter(status=Status.MESSAGED, step__in=[1, 2, 3], next_date__lte=now, needs_reply=False)
@@ -456,7 +478,7 @@ def replies() -> list[WaContact]:
 
 
 @transaction.atomic
-def mark_sent(contact: WaContact, kind: str, text: str, actor: str) -> WaContact:
+def mark_sent(contact: WaContact, kind: str, text: str, actor: str, template_id: int | None = None) -> WaContact:
     if contact.status == Status.STOP or blocked(contact.phone):
         raise WaError("This number asked to stop. Don't message it.")
     if not contact.opted_in:
@@ -464,8 +486,25 @@ def mark_sent(contact: WaContact, kind: str, text: str, actor: str) -> WaContact
     text = text.strip()
     if not text:
         raise WaError("Write the message first.")
-    if kind not in ("first", "followup", "touch3", "touch4", "nurture", "reply", "custom"):
+    if kind not in ("first", "followup", "touch3", "touch4", "nurture", "reply", "custom", "flow"):
         raise WaError("Unknown message type.")
+    picked = WaTemplate.objects.filter(pk=template_id).select_related("coupon").first() if template_id else None
+    if template_id and picked is None:
+        raise WaError("That template no longer exists.")
+    if kind == "flow" or (picked is not None and picked.category):
+        # A 90-day campaign message, or a category template sent as a reply or one-off: it moves the path.
+        if picked is None or not picked.category:
+            raise WaError("Pick the campaign template this message came from.")
+        try:
+            wa_flow.check_sendable(contact, picked)
+        except wa_flow.FlowError as exc:
+            raise WaError(str(exc)) from exc
+        WaMessage.objects.create(contact=contact, kind=Kind.FLOW, text=text[:2000], by=actor, template=picked)
+        if not contact.lang:
+            contact.lang = language_for(contact)
+        wa_flow.record_send(contact, picked, today())
+        contact.save()
+        return contact
     c = contact.campaign
     if kind == "nurture":
         template = next_nurture(contact)
@@ -505,6 +544,8 @@ def record_reply(contact: WaContact, text: str, actor: str) -> WaContact:
         contact.opted_in, contact.opt_in_note = True, f"They messaged us on WhatsApp, {today():%d %b %Y}"
     if contact.status in (Status.READY, Status.MESSAGED, Status.NOTNOW):
         contact.status = Status.REPLIED
+    if contact.campaign_status in (CS.NONE, CS.MESSAGED, CS.NO_REPLY):
+        contact.campaign_status = CS.REPLIED
     contact.needs_reply, contact.next_date = True, None
     if re.fullmatch(r"\W*(stop|unsubscribe|band karo|mat bhejo)\W*", text, flags=re.I):
         _stop(contact, "Replied STOP")
@@ -514,6 +555,7 @@ def record_reply(contact: WaContact, text: str, actor: str) -> WaContact:
 
 def _stop(contact: WaContact, reason: str) -> None:
     contact.status, contact.next_date, contact.needs_reply = Status.STOP, None, False
+    contact.campaign_status = CS.OPTED_OUT
     WaBlock.objects.get_or_create(phone=contact.phone, defaults={"reason": reason})
 
 
@@ -529,9 +571,31 @@ def act(contact: WaContact, action: str, note: str = "") -> WaContact:
         return contact
     if action in ("interested", "signed") and not contact.opted_in:  # a YES is their agreement
         contact.opted_in, contact.opt_in_note = True, f"Said yes, {today():%d %b %Y}"
-    if action in ("interested", "signed") and contact.yes_date is None:
+    if action in ("interested", "signed", "track") and contact.yes_date is None:
         # A YES starts the after-YES sequence and ends the no-reply touches.
         contact.yes_date, contact.nurture_day, contact.next_date = today(), -1, None
+    if action in ("interested", "signed"):
+        wa_flow.advance(contact, CS.YES)
+    if action == "track":
+        try:
+            wa_flow.set_track(contact, note.strip())
+        except wa_flow.FlowError as exc:
+            raise WaError(str(exc)) from exc
+        if contact.status not in (Status.SIGNED, Status.STOP):
+            contact.status = Status.INTERESTED
+    elif action == "paid":
+        if contact.yes_date is None:
+            contact.yes_date = today()
+        wa_flow.advance(contact, CS.PAID)
+        contact.status, contact.needs_reply = Status.SIGNED, False
+    elif action in ("setup_error", "setup_ok"):
+        contact.setup_error = action == "setup_error"
+    elif action == "using":
+        contact.using_since = contact.using_since or today()
+    elif action == "review_written":
+        contact.testimonial = WaContact.Testimonial.WRITTEN
+    elif action == "review_video":
+        contact.testimonial = WaContact.Testimonial.VIDEO
     if action == "interested":
         contact.status = Status.INTERESTED
     elif action == "signed":

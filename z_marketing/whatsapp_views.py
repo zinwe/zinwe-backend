@@ -12,7 +12,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from . import wa_media, wa_structure, whatsapp
+from . import wa_flow, wa_media, wa_structure, whatsapp
 from .contact_file import FileProblem
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
 from .views import Staff
@@ -20,15 +20,78 @@ from .whatsapp import WaError, WaFieldError
 
 
 class WaTemplateSerializer(serializers.ModelSerializer):
-    """`parts` set = the outreach structure (wa_structure.py) and `text` is composed from it; empty = free text."""
+    """
+    `parts` set = the outreach structure (wa_structure.py) and `text` is composed from it; empty = free text.
+    `category` set = a 90-day campaign row (wa_flow.py): English in `text`, Hinglish in `text_hi`, a draft until both
+    are written. Only Engage and Demo video carry a Track; the kind follows the category.
+    """
 
     media = serializers.SerializerMethodField()
     text = serializers.CharField(max_length=1000, required=False, allow_blank=True, trim_whitespace=False)
+    text_hi = serializers.CharField(max_length=1000, required=False, allow_blank=True, trim_whitespace=False)
+    name = serializers.CharField(max_length=120, required=False, allow_blank=True)
+    draft = serializers.SerializerMethodField()
+    coupon_info = serializers.SerializerMethodField()
+    performance = serializers.SerializerMethodField()
 
     class Meta:
         model = WaTemplate
-        fields = ["id", "name", "kind", "language", "twin", "text", "parts", "track", "day", "media", "updated_at"]
+        fields = [
+            "id", "name", "kind", "language", "twin", "text", "text_hi", "parts", "track", "day", "media", "updated_at",
+            "category", "type_name", "stage", "step", "coupon", "coupon_info", "event", "archived", "draft", "performance",
+        ]
         read_only_fields = ["updated_at"]
+
+    def get_draft(self, obj: WaTemplate) -> bool:
+        return wa_flow.is_draft(obj)
+
+    def get_coupon_info(self, obj: WaTemplate) -> dict[str, Any] | None:
+        c = obj.coupon
+        if c is None:
+            return None
+        return {"code": c.code, "percent_off": c.percent_off, "plan_codes": c.plan_codes, "starts_on": c.starts_on,
+                "ends_on": c.ends_on, "status": c.status()}
+
+    def get_performance(self, obj: WaTemplate) -> dict[str, int] | None:
+        perf = self.context.get("performance")
+        if perf is None:
+            return None
+        return perf.get(obj.pk, {"sends": 0, "replies": 0, "next": 0})
+
+    def _category_rules(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        """A campaign row: the Track only where it belongs, the day inside 90, a code that hasn't ended, a name."""
+        Cat = WaTemplate.Category
+        get = lambda k, d=None: attrs.get(k, getattr(self.instance, k, d) if self.instance else d)  # noqa: E731
+        category = get("category", "")
+        errors: dict[str, str] = {}
+        if category in wa_flow.TRACKED:
+            if not get("track", ""):
+                errors["track"] = "Pick the Track: Data Privacy, Team Activity Monitoring or Both Pack."
+        else:
+            attrs["track"] = ""
+        step, stage = int(get("step", 0) or 0), int(get("stage", 0) or 0)
+        if category == Cat.OUTREACH:
+            if not 1 <= step <= wa_flow.LAST_DAY:
+                errors["step"] = "Pick a day from 1 to 90."
+            else:
+                attrs["stage"] = wa_flow.stage_of(step)
+        elif category in (Cat.ENGAGE, Cat.DEMO_VIDEO) and not 1 <= step <= 6:
+            errors["step"] = "Pick a step from 1 to 6."
+        elif category in (Cat.SETUP, Cat.TESTIMONIAL) and not 1 <= step <= 2:
+            errors["step"] = "Pick step 1 or 2."
+        if category == Cat.OFFER and not 1 <= stage <= 3:
+            errors["stage"] = "Pick stage 1, 2 or 3."
+        coupon = attrs.get("coupon")
+        if coupon is not None and coupon.status() in ("ended", "cancelled") and (self.instance is None or self.instance.coupon_id != coupon.pk):
+            errors["coupon"] = f"{coupon.code} has {coupon.status()}. Pick a code that is live or yet to start."
+        if errors:
+            raise serializers.ValidationError(errors)
+        attrs["kind"] = wa_flow.kind_for(category)
+        attrs["parts"] = {}
+        attrs["twin"] = None
+        if not (attrs.get("name") or (self.instance.name if self.instance else "")).strip():
+            attrs["name"] = wa_flow.template_name(category, get("type_name", ""), get("track", "") if category in wa_flow.TRACKED else "", attrs.get("stage", stage), step)
+        return attrs
 
     def save(self, **kwargs: Any) -> WaTemplate:
         """A twin link goes both ways: the other-language version points back here."""
@@ -39,6 +102,10 @@ class WaTemplateSerializer(serializers.ModelSerializer):
         return obj
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        if attrs.get("category", getattr(self.instance, "category", "") if self.instance else ""):
+            return self._category_rules(attrs)
+        if not (attrs.get("name") or getattr(self.instance, "name", "")).strip():
+            raise serializers.ValidationError({"name": "Name the template."})
         twin = attrs.get("twin")
         if twin is not None and twin.language == attrs.get("language", getattr(self.instance, "language", "en")):
             raise serializers.ValidationError({"twin": "Pick a template in the other language."})
@@ -58,15 +125,20 @@ class WaTemplateSerializer(serializers.ModelSerializer):
         return wa_media.describe(obj)
 
     def validate_kind(self, value: str) -> str:
-        if self.instance and self.instance.media and value in wa_media.COLD:
+        if self.instance and self.instance.media and value in wa_media.COLD and not self.instance.category:
             raise serializers.ValidationError("Remove the picture or video first. " + wa_media.COLD_REFUSAL)
         return value
 
 
 class WaMessageSerializer(serializers.ModelSerializer):
+    label = serializers.SerializerMethodField()
+
     class Meta:
         model = WaMessage
-        fields = ["id", "kind", "text", "at", "by"]
+        fields = ["id", "kind", "text", "at", "by", "template", "label"]
+
+    def get_label(self, obj: WaMessage) -> str:
+        return wa_flow.label(obj.template) if obj.template_id and obj.template.category else ""
 
 
 class WaContactSerializer(serializers.ModelSerializer):
@@ -75,6 +147,27 @@ class WaContactSerializer(serializers.ModelSerializer):
     greet_as = serializers.SerializerMethodField()
     salutation = serializers.SerializerMethodField()
     short_name = serializers.SerializerMethodField()
+    day = serializers.SerializerMethodField()
+    stage = serializers.SerializerMethodField()
+    plan = serializers.CharField(source="campaign.plan", read_only=True, default="")
+
+    def get_day(self, obj: WaContact) -> int:
+        return wa_flow.day_of(obj, whatsapp.today())
+
+    def get_stage(self, obj: WaContact) -> int:
+        return wa_flow.stage_of(wa_flow.day_of(obj, whatsapp.today()))
+
+    def update(self, instance: WaContact, validated: dict[str, Any]) -> WaContact:
+        """A Track set here moves the campaign status too (Track assigned), as the Set the Track buttons do."""
+        track = validated.pop("track", None)
+        obj = super().update(instance, validated)
+        if track is not None and track != obj.track:
+            if track:
+                wa_flow.set_track(obj, track)
+            else:
+                obj.track = ""
+            obj.save(update_fields=["track", "campaign_status"])
+        return obj
 
     def get_greet_as(self, obj: WaContact) -> str:
         from .wa_names import address
@@ -97,11 +190,14 @@ class WaContactSerializer(serializers.ModelSerializer):
             "id", "campaign", "campaign_name", "phone", "first_name", "firm", "segment", "country", "city", "source", "info",
             "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "last", "track", "yes_date",
             "nurture_day", "first_sent", "opted_in", "opt_in_note", "greet_as", "salutation", "short_name",
+            "campaign_status", "day", "stage", "plan", "out_day", "engage_step", "demo_step", "setup_step", "demo_call_sent",
+            "offer_sent", "setup_error", "using_since", "pack", "testimonial",
         ]
         read_only_fields = [
             "opted_in", "opt_in_note",
             "phone", "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "yes_date", "nurture_day",
-            "first_sent",
+            "first_sent", "campaign_status", "out_day", "engage_step", "demo_step", "setup_step", "demo_call_sent",
+            "offer_sent", "setup_error", "using_since", "testimonial",
         ]
 
     def get_last(self, obj: WaContact) -> dict[str, str] | None:
@@ -123,6 +219,7 @@ class WaCampaignSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "audience", "audience_name", "goal", "status", "daily_limit", "followup_days", "first", "followup",
             "interested", "question", "notnow", "touch3", "touch4", "touch3_days", "touch4_days", "language", "stats", "created_at",
+            "plan",
         ]
         read_only_fields = ["status", "created_at"]
 
@@ -150,17 +247,25 @@ def _contact(pk: int) -> WaContact:
 class WaTodayView(Staff):
     def get(self, request: Request) -> Response:
         items = whatsapp.queue()
+
+        def row(i: dict[str, Any]) -> dict[str, Any]:
+            t = i.get("template")
+            if isinstance(t, WaTemplate):  # a 90-day campaign message (wa_flow.py)
+                return {"kind": i["kind"], "template": t.name, "template_id": t.pk, "label": wa_flow.label(t),
+                        "category": t.category, "draft": wa_flow.is_draft(t), "note": i.get("note", ""),
+                        "contact": WaContactSerializer(i["contact"]).data}
+            return {"kind": i["kind"], "template": t or "", "template_id": None, "label": "", "category": "",
+                    "draft": False, "note": i.get("note", ""), "contact": WaContactSerializer(i["contact"]).data}
+
         return Response({
-            "queue": [
-                {"kind": i["kind"], "template": i.get("template", ""), "contact": WaContactSerializer(i["contact"]).data}
-                for i in items
-            ],
+            "queue": [row(i) for i in items],
             "replies": [
                 {**WaContactSerializer(c).data, "messages": WaMessageSerializer(c.messages.all(), many=True).data}
                 for c in whatsapp.replies()
             ],
             "sent_today": whatsapp._sent_today(),
             "stats": whatsapp.stats(),
+            "campaign": wa_flow.counts(),
         })
 
 
@@ -209,7 +314,9 @@ class WaContactActionView(Staff):
                 template = request.data.get("template")
                 return Response(whatsapp.draft(c, str(request.data.get("kind", "first")), int(template) if str(template or "").isdigit() else None))
             if action == "sent":
-                whatsapp.mark_sent(c, str(request.data.get("kind", "")), str(request.data.get("text", "")), actor)
+                template = request.data.get("template")
+                whatsapp.mark_sent(c, str(request.data.get("kind", "")), str(request.data.get("text", "")), actor,
+                                   int(template) if str(template or "").isdigit() else None)
             elif action == "reply":
                 whatsapp.record_reply(c, str(request.data.get("text", "")), actor)
             elif action == "act":
@@ -309,7 +416,8 @@ class WaCampaignActionView(Staff):
 
 class WaTemplateListView(Staff):
     def get(self, request: Request) -> Response:
-        return Response(WaTemplateSerializer(WaTemplate.objects.all(), many=True).data)
+        rows = WaTemplate.objects.select_related("coupon")
+        return Response(WaTemplateSerializer(rows, many=True, context={"performance": wa_flow.performance()}).data)
 
     def post(self, request: Request) -> Response:
         data = WaTemplateSerializer(data=request.data)

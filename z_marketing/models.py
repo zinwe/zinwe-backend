@@ -270,16 +270,43 @@ class WaTemplate(models.Model):
         NURTURE = "nurture", "After YES"
 
     class Track(models.TextChoices):
-        ALL = "", "Every YES"
-        DATA = "data", "Data safety"
-        DAY = "day", "Team's day"
-        CHAT = "chat", "Team chat"
+        """What the contact wants (100 Reviews campaign, owner 10 Nov 2026). On a contact "" = Unassigned; on an
+        older after-YES template "" = every YES. The old Team chat track is retired (its templates are archived)."""
+
+        NONE = "", "Unassigned"
+        PRIVACY = "privacy", "Data Privacy"
+        ACTIVITY = "activity", "Team Activity Monitoring"
+        BOTH = "both", "Both Pack"
+
+    class Category(models.TextChoices):
+        """The campaign's message categories (wa_flow.py). "" = an older template (kind decides)."""
+
+        NONE = "", "Older template"
+        OUTREACH = "outreach", "Outreach"
+        ENGAGE = "engage", "Engage"
+        DEMO_VIDEO = "demo_video", "Demo video"
+        SETUP = "setup", "Setup"
+        DEMO_CALL = "demo_call", "Demo call"
+        OFFER = "offer", "Offer & discount"
+        TESTIMONIAL = "testimonial", "Testimonial"
+        QUICK = "quick_reply", "Quick reply"
 
     name = models.CharField(max_length=120)
     kind = models.CharField(max_length=12, choices=Kind.choices, default=Kind.FIRST)
-    text = models.TextField(max_length=1000)
+    # Blank only for a campaign draft (a category row whose copy isn't written yet): drafts are never sent.
+    text = models.TextField(max_length=1000, blank=True)
     # After-YES messages only: which sequence it belongs to ("" = every YES) and how many days after the YES it is due.
-    track = models.CharField(max_length=4, choices=Track.choices, default="", blank=True)
+    # Category rows: only Engage and Demo video carry a Track.
+    track = models.CharField(max_length=8, choices=Track.choices, default="", blank=True)
+    category = models.CharField(max_length=12, choices=Category.choices, default="", blank=True, db_index=True)
+    type_name = models.CharField(max_length=60, blank=True)  # the category's type: Need discovery, Booking link...
+    stage = models.PositiveSmallIntegerField(default=0)  # Outreach and Offer: stage 1-3 of the 90 days; 0 = none
+    # Outreach: the day 1-90 it is due. Engage and Demo video: step 1-6 within the Track. Setup, Testimonial: 1-2.
+    step = models.PositiveSmallIntegerField(default=0)
+    text_hi = models.TextField(max_length=1000, blank=True)  # category rows: the Hinglish text on the same row
+    coupon = models.ForeignKey("z_auth.Coupon", on_delete=models.SET_NULL, null=True, blank=True, related_name="wa_templates")
+    event = models.BooleanField(default=False)  # Offer: a festival code, picked by staff, never by the queue
+    archived = models.BooleanField(default=False)  # kept for its history, never sent again
     day = models.PositiveSmallIntegerField(default=0)
     # A picture or video staff attach in WhatsApp (wa_media.py). Never on messages to people who haven't replied.
     media = models.FileField(upload_to="wa-media/", blank=True)
@@ -343,6 +370,12 @@ class WaCampaign(models.Model):
 
     # Which language the cold messages go out in. "ab" splits contacts evenly so the two can be compared (Analytics).
     language = models.CharField(max_length=2, choices=Language.choices, default=Language.EN)
+    class Plan(models.TextChoices):
+        TOUCHES = "touches", "First message + up to 3 touches"
+        NINETY = "ninety", "90 days: Outreach templates by day, then the YES path"
+
+    # ninety: the 100 Reviews model (wa_flow.py); `first` is still required but only names the campaign's opener.
+    plan = models.CharField(max_length=8, choices=Plan.choices, default=Plan.TOUCHES)
     touch3_days = models.PositiveSmallIntegerField(default=7, help_text="Days after the first message.")
     touch4_days = models.PositiveSmallIntegerField(default=60, help_text="Days after the first message.")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -366,6 +399,33 @@ class WaContact(models.Model):
         NOTNOW = "notnow", "Not now"
         STOP = "stop", "Do not message"
 
+    class CampaignStatus(models.TextChoices):
+        NONE = "", "Not started"
+        MESSAGED = "messaged", "Messaged"
+        REPLIED = "replied", "Replied"
+        YES = "yes", "YES"
+        ENGAGED = "engaged", "Engaged"
+        TRACK = "track_assigned", "Track assigned"
+        DEMO = "demo_video_sent", "Demo video sent"
+        SETUP = "setup", "Setup"
+        DEMO_CALL = "demo_call", "Demo call"
+        OFFER = "offer", "Offer"
+        PAID = "paid", "Paid"
+        NO_REPLY = "no_reply", "No reply"
+        OPTED_OUT = "opted_out", "Opted out"
+
+    class Pack(models.TextChoices):
+        NONE = "", "Not picked"
+        STARTUP = "startup", "Startup pack"
+        TEAM = "team", "Team pack"
+
+    class Testimonial(models.TextChoices):
+        NONE = "", "Not asked"
+        WRITTEN_ASKED = "written_asked", "Written: asked"
+        WRITTEN = "written", "Written: got it"
+        VIDEO_ASKED = "video_asked", "Video: asked"
+        VIDEO = "video", "Video: got it"
+
     campaign = models.ForeignKey(WaCampaign, on_delete=models.SET_NULL, related_name="contacts", null=True, blank=True)
     phone = models.CharField(max_length=16, unique=True)  # E.164: +919810000101
     first_name = models.CharField(max_length=80, blank=True)
@@ -383,12 +443,25 @@ class WaContact(models.Model):
     next_date = models.DateField(null=True, blank=True)  # when the next no-reply message is due
     first_sent = models.DateField(null=True, blank=True)  # touches 3 and 4 count their days from here
     # After YES: which sequence they are on, when they said YES, and the day of the last after-YES message sent.
-    track = models.CharField(max_length=4, choices=WaTemplate.Track.choices, default="", blank=True)
+    # Track: what they want, set by staff from their Engage answer, never at upload. Independent of segment.
+    track = models.CharField(max_length=8, choices=WaTemplate.Track.choices, default="", blank=True)
     yes_date = models.DateField(null=True, blank=True)
     nurture_day = models.SmallIntegerField(default=-1)
     # The language of their first message (en or hi), kept so Analytics can compare reply rates.
     lang = models.CharField(max_length=2, blank=True, default="")
     needs_reply = models.BooleanField(default=False)  # they wrote and nobody has answered yet
+    # The 90-day campaign (wa_flow.py). campaign_status is the spec's path; Day and Stage come from first_sent.
+    campaign_status = models.CharField(max_length=16, choices=CampaignStatus.choices, default="", blank=True, db_index=True)
+    out_day = models.PositiveSmallIntegerField(default=0)  # the Outreach day last sent (0 = none)
+    engage_step = models.PositiveSmallIntegerField(default=0)
+    demo_step = models.PositiveSmallIntegerField(default=0)
+    setup_step = models.PositiveSmallIntegerField(default=0)
+    demo_call_sent = models.BooleanField(default=False)
+    offer_sent = models.DateField(null=True, blank=True)
+    setup_error = models.BooleanField(default=False)  # staff saw setup stop at an error: the Demo call goes next
+    using_since = models.DateField(null=True, blank=True)  # first PC connected: the Testimonial is due 14 days later
+    pack = models.CharField(max_length=8, choices=Pack.choices, default="", blank=True)
+    testimonial = models.CharField(max_length=14, choices=Testimonial.choices, default="", blank=True)
     paused_until = models.DateField(null=True, blank=True)
     added_by = models.EmailField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -408,12 +481,15 @@ class WaMessage(models.Model):
         FOLLOWUP = "followup", "Follow-up"
         TOUCH = "touch", "No-reply touch"
         NURTURE = "nurture", "After-YES message"
+        FLOW = "flow", "Campaign message"
         CUSTOM = "custom", "One-off message"
         REPLY = "reply", "Our reply"
         THEIRS = "theirs", "Their message"
 
     contact = models.ForeignKey(WaContact, on_delete=models.CASCADE, related_name="messages")
     kind = models.CharField(max_length=10, choices=Kind.choices)
+    # The template it came from (category rows), for each template's performance numbers.
+    template = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, null=True, blank=True, related_name="sends")
     text = models.TextField(max_length=2000)
     at = models.DateTimeField(auto_now_add=True, db_index=True)
     by = models.EmailField(blank=True)
