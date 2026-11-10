@@ -12,11 +12,50 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from . import wa_flow, wa_media, wa_structure, whatsapp
+from . import wa_conditions, wa_flow, wa_media, wa_structure, wa_templates, whatsapp
 from .contact_file import FileProblem
-from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
+from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTag, WaTemplate
 from .views import Staff
 from .whatsapp import WaError, WaFieldError
+
+
+def _conditions_ok(value: str) -> str:
+    """{{#if X}}...{{else}}...{{/if}} must be balanced, unnested and test a known detail (wa_conditions.py)."""
+    problem = wa_conditions.problem(value)
+    if problem:
+        raise serializers.ValidationError(problem)
+    return value
+
+
+class WaTagSerializer(serializers.ModelSerializer):
+    """A tag: name unique whatever the case; color from WaTag.COLORS (the next one in turn when left out)."""
+
+    name = serializers.CharField(max_length=60)
+    color = serializers.ChoiceField(choices=WaTag.COLORS, required=False)
+    templates = serializers.SerializerMethodField()
+
+    class Meta:
+        model = WaTag
+        fields = ["id", "name", "color", "templates"]
+
+    def get_templates(self, obj: WaTag) -> int:
+        """How many templates carry it (not counting version B rows)."""
+        return obj.templates.filter(version_of__isnull=True).count()
+
+    def validate_name(self, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise serializers.ValidationError("Name the tag.")
+        same = WaTag.objects.filter(name__iexact=value)
+        if self.instance is not None:
+            same = same.exclude(pk=self.instance.pk)
+        if same.exists():
+            raise serializers.ValidationError(f"There is already a tag called {same.first().name}.")
+        return value
+
+    def create(self, validated: dict[str, Any]) -> WaTag:
+        validated.setdefault("color", WaTag.COLORS[WaTag.objects.count() % len(WaTag.COLORS)])
+        return super().create(validated)
 
 
 class WaTemplateSerializer(serializers.ModelSerializer):
@@ -33,14 +72,55 @@ class WaTemplateSerializer(serializers.ModelSerializer):
     draft = serializers.SerializerMethodField()
     coupon_info = serializers.SerializerMethodField()
     performance = serializers.SerializerMethodField()
+    tags = serializers.SerializerMethodField()
+    tag_ids = serializers.PrimaryKeyRelatedField(
+        queryset=WaTag.objects.all(), many=True, write_only=True, required=False, source="tags",
+        error_messages={"does_not_exist": "That tag no longer exists.", "incorrect_type": "Pick a tag from the list."},
+    )
+    version_b = serializers.SerializerMethodField()
 
     class Meta:
         model = WaTemplate
         fields = [
             "id", "name", "kind", "language", "twin", "text", "text_hi", "parts", "track", "day", "media", "updated_at",
             "category", "type_name", "stage", "step", "coupon", "coupon_info", "event", "archived", "draft", "performance",
+            "tags", "tag_ids", "version_of", "version_b",
         ]
-        read_only_fields = ["updated_at"]
+        read_only_fields = ["updated_at", "version_of"]
+
+    validate_text = staticmethod(_conditions_ok)
+    validate_text_hi = staticmethod(_conditions_ok)
+
+    def _stats(self, pk: int) -> dict[str, int]:
+        """The last 30 days' numbers (wa_templates.template_stats): the list passes them all in its context; a single
+        template works out its own."""
+        stats = self.context.get("stats")
+        if stats is None:
+            stats = wa_templates.template_stats(ids=[pk])
+        return stats.get(pk) or wa_templates.blank_stats()
+
+    def _b(self, obj: WaTemplate) -> WaTemplate | None:
+        if obj.version_of_id:
+            return None
+        versions = self.context.get("versions")
+        return versions.get(obj.pk) if versions is not None else wa_flow.active_b(obj)
+
+    def get_tags(self, obj: WaTemplate) -> list[dict[str, Any]]:
+        return [{"id": t.id, "name": t.name, "color": t.color} for t in obj.tags.all()]
+
+    def get_version_b(self, obj: WaTemplate) -> dict[str, Any] | None:
+        b = self._b(obj)
+        if b is None:
+            return None
+        return {"id": b.pk, "name": b.name, "text": b.text, "text_hi": b.text_hi, "draft": wa_flow.is_draft(b),
+                "updated_at": b.updated_at, **self._stats(b.pk)}
+
+    def to_representation(self, obj: WaTemplate) -> dict[str, Any]:
+        """A's own numbers sit at the top level, with the same keys as version_b's."""
+        data = super().to_representation(obj)
+        data.update(self._stats(obj.pk))
+        data["stats_days"] = wa_templates.WINDOW_DAYS
+        return data
 
     def get_draft(self, obj: WaTemplate) -> bool:
         return wa_flow.is_draft(obj)
@@ -99,6 +179,7 @@ class WaTemplateSerializer(serializers.ModelSerializer):
         if obj.twin_id and obj.twin.twin_id != obj.id:
             obj.twin.twin = obj
             obj.twin.save(update_fields=["twin"])
+        wa_templates.sync_versions(obj)
         return obj
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
@@ -146,7 +227,11 @@ class WaContactSerializer(serializers.ModelSerializer):
     last = serializers.SerializerMethodField()
     greet_as = serializers.SerializerMethodField()
     salutation = serializers.SerializerMethodField()
+    salutation_hi = serializers.SerializerMethodField()
     short_name = serializers.SerializerMethodField()
+    how_we_know = serializers.SerializerMethodField()
+    # For the Templates page: which details a condition finds known for this contact (wa_conditions.known).
+    known = serializers.SerializerMethodField()
     day = serializers.SerializerMethodField()
     stage = serializers.SerializerMethodField()
     plan = serializers.CharField(source="campaign.plan", read_only=True, default="")
@@ -169,27 +254,41 @@ class WaContactSerializer(serializers.ModelSerializer):
             obj.save(update_fields=["track", "campaign_status"])
         return obj
 
-    def get_greet_as(self, obj: WaContact) -> str:
+    @staticmethod
+    def _address(obj: WaContact) -> dict[str, str]:
+        """wa_names.address(), worked out once per contact per response."""
         from .wa_names import address
 
-        return address(obj)["greeting"]
+        cached = getattr(obj, "_wa_address", None)
+        if cached is None:
+            cached = obj._wa_address = address(obj)
+        return cached
+
+    def get_greet_as(self, obj: WaContact) -> str:
+        return self._address(obj)["greeting"]
 
     def get_salutation(self, obj: WaContact) -> str:
-        from .wa_names import address
+        return self._address(obj)["salutation"]
 
-        return address(obj)["salutation"]
+    def get_salutation_hi(self, obj: WaContact) -> str:
+        return self._address(obj)["salutation_hi"]
 
     def get_short_name(self, obj: WaContact) -> str:
-        from .wa_names import address
+        return self._address(obj)["business"]
 
-        return address(obj)["business"]
+    def get_how_we_know(self, obj: WaContact) -> str:
+        return self._address(obj)["how_we_know"]
+
+    def get_known(self, obj: WaContact) -> dict[str, bool]:
+        return wa_conditions.known(obj, self._address(obj))
 
     class Meta:
         model = WaContact
         fields = [
-            "id", "campaign", "campaign_name", "phone", "first_name", "firm", "segment", "country", "city", "source", "info",
-            "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "last", "track", "yes_date",
-            "nurture_day", "first_sent", "opted_in", "opt_in_note", "greet_as", "salutation", "short_name",
+            "id", "campaign", "campaign_name", "phone", "first_name", "owner_name", "firm", "segment", "country", "city", "source",
+            "info", "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "last", "track", "yes_date",
+            "nurture_day", "first_sent", "opted_in", "opt_in_note", "greet_as", "salutation", "salutation_hi", "short_name",
+            "how_we_know", "known",
             "campaign_status", "day", "stage", "plan", "out_day", "engage_step", "demo_step", "setup_step", "demo_call_sent",
             "offer_sent", "setup_error", "using_since", "pack", "testimonial",
         ]
@@ -253,9 +352,10 @@ class WaTodayView(Staff):
             if isinstance(t, WaTemplate):  # a 90-day campaign message (wa_flow.py)
                 return {"kind": i["kind"], "template": t.name, "template_id": t.pk, "label": wa_flow.label(t),
                         "category": t.category, "draft": wa_flow.is_draft(t), "note": i.get("note", ""),
+                        "version": "B" if t.version_of_id else "",
                         "contact": WaContactSerializer(i["contact"]).data}
             return {"kind": i["kind"], "template": t or "", "template_id": None, "label": "", "category": "",
-                    "draft": False, "note": i.get("note", ""), "contact": WaContactSerializer(i["contact"]).data}
+                    "draft": False, "note": i.get("note", ""), "version": "", "contact": WaContactSerializer(i["contact"]).data}
 
         return Response({
             "queue": [row(i) for i in items],
@@ -415,9 +515,14 @@ class WaCampaignActionView(Staff):
 
 
 class WaTemplateListView(Staff):
+    """GET every template except version B rows (each sits in its A's `version_b`), with tags and the last 30 days'
+    numbers · POST a new one (tag_ids to tag it)."""
+
     def get(self, request: Request) -> Response:
-        rows = WaTemplate.objects.select_related("coupon")
-        return Response(WaTemplateSerializer(rows, many=True, context={"performance": wa_flow.performance()}).data)
+        rows = WaTemplate.objects.filter(version_of__isnull=True).select_related("coupon").prefetch_related("tags")
+        context = {"performance": wa_flow.performance(), "stats": wa_templates.template_stats(),
+                   "versions": wa_templates.active_versions()}
+        return Response(WaTemplateSerializer(rows, many=True, context=context).data)
 
     def post(self, request: Request) -> Response:
         data = WaTemplateSerializer(data=request.data)
@@ -426,9 +531,20 @@ class WaTemplateListView(Staff):
 
 
 class WaTemplateDetailView(Staff):
+    """GET one · PUT all fields · PATCH some (archived, tag_ids, text...) · DELETE (its version B goes with it)."""
+
+    def get(self, request: Request, pk: int) -> Response:
+        return Response(WaTemplateSerializer(get_object_or_404(WaTemplate, pk=pk)).data)
+
     def put(self, request: Request, pk: int) -> Response:
+        return self._save(request, pk, partial=False)
+
+    def patch(self, request: Request, pk: int) -> Response:
+        return self._save(request, pk, partial=True)
+
+    def _save(self, request: Request, pk: int, partial: bool) -> Response:
         t = get_object_or_404(WaTemplate, pk=pk)
-        data = WaTemplateSerializer(t, data=request.data)
+        data = WaTemplateSerializer(t, data=request.data, partial=partial)
         data.is_valid(raise_exception=True)
         return Response(WaTemplateSerializer(data.save()).data)
 
@@ -441,6 +557,112 @@ class WaTemplateDetailView(Staff):
                 template.media.storage.delete(media)
         except ProtectedError:
             return Response({"detail": "A campaign starts with this template. Pick another first message there first."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class WaVersionSerializer(serializers.Serializer):
+    text = serializers.CharField(max_length=1000, required=False, allow_blank=True, trim_whitespace=False, default="")
+    text_hi = serializers.CharField(max_length=1000, required=False, allow_blank=True, trim_whitespace=False, default="")
+
+    validate_text = staticmethod(_conditions_ok)
+    validate_text_hi = staticmethod(_conditions_ok)
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        if not (attrs.get("text", "").strip() or attrs.get("text_hi", "").strip()):
+            raise serializers.ValidationError({"text": ["Write version B first."]})
+        return attrs
+
+
+class WaTemplateVersionView(Staff):
+    """POST {text, text_hi}: version B of this template (201, A's JSON with version_b). One B at a time. Edit B later
+    with PATCH /templates/<B's id>/."""
+
+    def post(self, request: Request, pk: int) -> Response:
+        a = get_object_or_404(WaTemplate, pk=pk)
+        data = WaVersionSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        try:
+            b = wa_templates.add_version(a, data.validated_data["text"], data.validated_data["text_hi"])
+        except wa_templates.VersionError as exc:
+            return self.refused(exc)
+        self.audit(request, "wa_template_version", b, of=a.pk)
+        return Response(WaTemplateSerializer(WaTemplate.objects.get(pk=a.pk)).data, status=status.HTTP_201_CREATED)
+
+
+class WaTemplateKeepView(Staff):
+    """POST {version: "A"|"B"}: end the A/B test. B: A takes B's texts. B is archived either way; numbers stay."""
+
+    def post(self, request: Request, pk: int) -> Response:
+        a = get_object_or_404(WaTemplate, pk=pk)
+        which = str(request.data.get("version", "")).upper()
+        if which not in ("A", "B"):
+            return Response({"version": ["Pick A or B."]}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            a = wa_templates.keep(a, which)
+        except wa_templates.VersionError as exc:
+            return self.refused(exc)
+        self.audit(request, "wa_template_keep", a, version=which)
+        return Response(WaTemplateSerializer(a).data)
+
+
+class WaTemplateDuplicateView(Staff):
+    """POST: a copy named "<name> (copy)", same texts, category, step and tags (201, the copy's JSON)."""
+
+    def post(self, request: Request, pk: int) -> Response:
+        copy = wa_templates.duplicate(get_object_or_404(WaTemplate, pk=pk))
+        return Response(WaTemplateSerializer(copy).data, status=status.HTTP_201_CREATED)
+
+
+class WaTemplateReachView(Staff):
+    """GET {total, known: {FirstName, OwnerName, Business, City, HowWeKnow}, examples}: contacts that can be messaged."""
+
+    def get(self, request: Request) -> Response:
+        return Response(wa_templates.reach())
+
+
+class WaTemplatePreviewView(Staff):
+    """POST {contact, text?, text_hi?}: the texts filled in for that contact exactly as a draft would be, and the
+    details used outside a condition that this contact doesn't have (missing_en, missing_hi)."""
+
+    def post(self, request: Request) -> Response:
+        contact = request.data.get("contact")
+        if not str(contact or "").isdigit():
+            return Response({"contact": ["Pick a contact."]}, status=status.HTTP_400_BAD_REQUEST)
+        c = _contact(int(contact))
+        known = wa_conditions.known(c)
+        out: dict[str, Any] = {"contact": c.pk, "known": known}
+        for field, lang in (("text", "en"), ("text_hi", "hi")):
+            raw = str(request.data.get(field) or "")[:1000]
+            problem = wa_conditions.problem(raw)
+            if problem:
+                return Response({field: [problem]}, status=status.HTTP_400_BAD_REQUEST)
+            out[field] = whatsapp.fill(raw, c, lang) if raw else ""
+            out[f"missing_{lang}"] = [d for d in wa_conditions.outside(raw) if not known[d]]
+        return Response(out)
+
+
+class WaTagListView(Staff):
+    """GET every tag (with how many templates carry it) · POST {name, color?}."""
+
+    def get(self, request: Request) -> Response:
+        return Response(WaTagSerializer(WaTag.objects.all(), many=True).data)
+
+    def post(self, request: Request) -> Response:
+        data = WaTagSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        return Response(WaTagSerializer(data.save()).data, status=status.HTTP_201_CREATED)
+
+
+class WaTagDetailView(Staff):
+    """PATCH {name?, color?} · DELETE: the tag comes off every template; the templates stay."""
+
+    def patch(self, request: Request, pk: int) -> Response:
+        data = WaTagSerializer(get_object_or_404(WaTag, pk=pk), data=request.data, partial=True)
+        data.is_valid(raise_exception=True)
+        return Response(WaTagSerializer(data.save()).data)
+
+    def delete(self, request: Request, pk: int) -> Response:
+        get_object_or_404(WaTag, pk=pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

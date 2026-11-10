@@ -5,6 +5,7 @@ import secrets
 
 from django.conf import settings
 from django.db import models
+from django.db.models.functions import Lower
 
 
 def new_token() -> str:
@@ -256,6 +257,24 @@ def sender_address() -> str:
 # in, and records what was sent and what came back. Nothing here sends a WhatsApp message by itself.
 
 
+class WaTag(models.Model):
+    """A label staff put on templates (CA firms, Festival...): their own, nothing in the flow reads it."""
+
+    # The fixed palette, in the order new tags take it.
+    COLORS = ["#24508f", "#f26a0a", "#17663f", "#c0331c", "#7a4fb5", "#0f766e", "#9c5b2e", "#54656f"]
+
+    name = models.CharField(max_length=60)
+    color = models.CharField(max_length=7, choices=[(c, c) for c in COLORS], default=COLORS[0])
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name", "id"]
+        constraints = [models.UniqueConstraint(Lower("name"), name="wa_tag_name_ci")]
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class WaTemplate(models.Model):
     """A WhatsApp message draft. {{FirstName}}, {{Firm}} (or {{Business}}) and {{City}} are filled in per contact."""
 
@@ -322,6 +341,10 @@ class WaTemplate(models.Model):
     # The outreach structure (wa_structure.py): creative, intro, problem, solution, reward, cta, details, notes.
     # Empty = a free-text template. When set, `text` is composed from it on save.
     parts = models.JSONField(default=dict, blank=True)
+    tags = models.ManyToManyField(WaTag, blank=True, related_name="templates")
+    # Set on a version B row (A/B test, wa_templates.py): same category, type and step as A, never its own card.
+    # While A has an un-archived B, odd-numbered contacts get B; Keep ends the test and archives B.
+    version_of = models.ForeignKey("self", on_delete=models.CASCADE, null=True, blank=True, related_name="versions")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -429,6 +452,7 @@ class WaContact(models.Model):
     campaign = models.ForeignKey(WaCampaign, on_delete=models.SET_NULL, related_name="contacts", null=True, blank=True)
     phone = models.CharField(max_length=16, unique=True)  # E.164: +919810000101
     first_name = models.CharField(max_length=80, blank=True)
+    owner_name = models.CharField(max_length=120, blank=True)  # who decides, when it isn't the contact: {{OwnerName}}
     firm = models.CharField(max_length=160)
     segment = models.CharField(max_length=120)
     country = models.CharField(max_length=40)
@@ -491,6 +515,8 @@ class WaMessage(models.Model):
     # The template it came from (category rows), for each template's performance numbers.
     template = models.ForeignKey(WaTemplate, on_delete=models.SET_NULL, null=True, blank=True, related_name="sends")
     text = models.TextField(max_length=2000)
+    # The language a templated message went out in (en or hi); "" for older rows and their messages.
+    language = models.CharField(max_length=2, blank=True, default="")
     at = models.DateTimeField(auto_now_add=True, db_index=True)
     by = models.EmailField(blank=True)
 

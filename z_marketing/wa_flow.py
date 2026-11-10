@@ -117,7 +117,22 @@ def suggest_track(text: str) -> str:
 
 
 def _rows(category: str, **filters: Any) -> Any:
-    return WaTemplate.objects.filter(category=category, archived=False, **filters).select_related("coupon")
+    """A category's live rows. Version B rows never count as rows of their own: version() swaps them in."""
+    return WaTemplate.objects.filter(category=category, archived=False, version_of__isnull=True, **filters).select_related("coupon")
+
+
+def active_b(t: WaTemplate) -> WaTemplate | None:
+    """A's version B while the A/B test runs (not archived), or None."""
+    return WaTemplate.objects.filter(version_of=t, archived=False).select_related("coupon").order_by("id").first()
+
+
+def version(t: WaTemplate | None, contact: WaContact) -> WaTemplate | None:
+    """The version this contact gets: while A has a written B, odd-numbered contacts get B, the rest A, until Keep.
+    A B that is still a draft is never sent, so everyone gets A meanwhile."""
+    if t is None or t.version_of_id or contact.pk % 2 == 0:
+        return t
+    b = active_b(t)
+    return b if b is not None and not is_draft(b) else t
 
 
 def _last_theirs(contact: WaContact) -> str:
@@ -126,6 +141,11 @@ def _last_theirs(contact: WaContact) -> str:
 
 
 def next_outreach(contact: WaContact, on: date) -> WaTemplate | None:
+    """The Outreach row due today (or its version B for this contact)."""
+    return version(_next_outreach(contact, on), contact)
+
+
+def _next_outreach(contact: WaContact, on: date) -> WaTemplate | None:
     """The Outreach row due today: the opener for a new contact, then the latest day reached and not sent yet."""
     rows = list(_rows(Cat.OUTREACH, step__gt=contact.out_day).order_by("step", "id"))
     if not rows:
@@ -161,6 +181,12 @@ def offer_for(contact: WaContact, on: date, include_events: bool = False) -> WaT
 
 
 def next_yes_path(contact: WaContact, on: date) -> tuple[WaTemplate | None, str]:
+    """(template, note) for a contact past their YES (the template's version B for this contact, while one runs)."""
+    t, note = _next_yes_path(contact, on)
+    return version(t, contact), note
+
+
+def _next_yes_path(contact: WaContact, on: date) -> tuple[WaTemplate | None, str]:
     """(template, note) for a contact past their YES. note "set_track" = waiting for staff to set the Track."""
     if contact.yes_date is None or contact.campaign_status == CS.OPTED_OUT:
         return None, ""
@@ -314,19 +340,21 @@ def performance() -> dict[int, dict[str, int]]:
         at, c = s["at"], contacts[s["contact_id"]]
         if any(at <= t <= at + timedelta(days=3) for t in theirs.get(c.id, [])):
             row["replies"] += 1
-        cat = s["template__category"]
-        if cat in (Cat.OUTREACH, Cat.OFFER):
-            hit = c.yes_date is not None and c.yes_date >= at.date() if cat == Cat.OUTREACH else c.campaign_status == CS.PAID
-        elif cat == Cat.ENGAGE:
-            hit = bool(c.track)
-        elif cat == Cat.TESTIMONIAL:
-            hit = c.testimonial in ((WaContact.Testimonial.WRITTEN, WaContact.Testimonial.VIDEO_ASKED, WaContact.Testimonial.VIDEO) if s["template__step"] <= 1 else (WaContact.Testimonial.VIDEO,))
-        elif cat in STATUS_FOR:
-            hit = c.campaign_status in PATH and PATH.index(c.campaign_status) > PATH.index(STATUS_FOR[cat])
-        else:
-            hit = False
-        row["next"] += int(hit)
+        row["next"] += int(took_next_step(s["template__category"], s["template__step"], c, at))
     return out
+
+
+def took_next_step(cat: str, step: int, c: WaContact, at: Any) -> bool:
+    """Did the contact take the step a message of this category is for, after it went out at `at`?"""
+    if cat in (Cat.OUTREACH, Cat.OFFER):
+        return c.yes_date is not None and c.yes_date >= at.date() if cat == Cat.OUTREACH else c.campaign_status == CS.PAID
+    if cat == Cat.ENGAGE:
+        return bool(c.track)
+    if cat == Cat.TESTIMONIAL:
+        return c.testimonial in ((WaContact.Testimonial.WRITTEN, WaContact.Testimonial.VIDEO_ASKED, WaContact.Testimonial.VIDEO) if step <= 1 else (WaContact.Testimonial.VIDEO,))
+    if cat in STATUS_FOR:
+        return c.campaign_status in PATH and PATH.index(c.campaign_status) > PATH.index(STATUS_FOR[cat])
+    return False
 
 
 def counts() -> dict[str, Any]:

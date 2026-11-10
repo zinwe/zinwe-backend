@@ -26,7 +26,7 @@ from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 
-from . import wa_flow
+from . import wa_conditions, wa_flow
 from .contact_file import MAX_BYTES, MAX_ROWS, FileProblem, _read_rows
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
 
@@ -42,6 +42,7 @@ HEADERS = {
     "country": ("country",),
     "city": ("city", "town"),
     "first_name": ("first name", "firstname", "first", "name", "contact name"),
+    "owner_name": ("owner name", "owner", "owner's name", "owners name"),  # optional: older files have no such column
     "source": ("source", "where found", "found at"),
     "info": ("useful info", "info", "notes"),
     "opt_in": ("opt-in", "opt in", "optin", "opted in", "consent"),
@@ -49,7 +50,7 @@ HEADERS = {
 OPT_IN = {"y", "yes", "true"}  # opted in or introduced; any other value loads the contact locked
 LOCKED = "Not opted in yet. Mark them as opted in, with how they agreed, before messaging."
 REQUIRED = {"firm": "Business Name", "phone": "Phone", "segment": "Segment", "country": "Country", "city": "City"}
-TEMPLATE_COLUMNS = ["Business Name", "Phone", "Segment", "Country", "City", "First Name", "Source", "Opt-in", "Useful Info"]
+TEMPLATE_COLUMNS = ["Business Name", "Phone", "Segment", "Country", "City", "First Name", "Source", "Opt-in", "Useful Info", "Owner Name"]
 ACTIONS = ("interested", "signed", "notnow", "stop", "pause", "resume", "optin",
            # 90-day campaign (wa_flow.py): Track, paid, setup error, first PC connected, a testimonial back
            "track", "paid", "setup_error", "setup_ok", "using", "review_written", "review_video")
@@ -143,7 +144,8 @@ def parse_file(upload: Any, name: str, size: int) -> list[dict[str, Any]]:
             continue
         cell = lambda f: row[columns[f]].strip() if f in columns and columns[f] < len(row) else ""  # noqa: E731, B023
         item: dict[str, Any] = {
-            "row": at, "firm": cell("firm")[:160], "first_name": cell("first_name")[:80], "segment": cell("segment")[:120],
+            "row": at, "firm": cell("firm")[:160], "first_name": cell("first_name")[:80], "owner_name": cell("owner_name")[:120],
+            "segment": cell("segment")[:120],
             "country": cell("country")[:40], "city": cell("city")[:80], "source": cell("source")[:160],
             "info": _info(cell("info")), "phone": "",
         }
@@ -189,7 +191,7 @@ def add_rows(rows: list[dict[str, Any]], choices: dict[str, dict[str, Any]], act
         _, made = WaContact.objects.get_or_create(
             phone=item["phone"],
             defaults=dict(
-                campaign=campaign, first_name=item["first_name"], firm=item["firm"],
+                campaign=campaign, first_name=item["first_name"], owner_name=item.get("owner_name", ""), firm=item["firm"],
                 segment=str(pick.get("segment") or item["segment"])[:120], country=item["country"], city=item["city"],
                 source=source, info=item["info"], added_by=actor, opted_in=item["opted_in"],
                 opt_in_note="Opt-in in the uploaded sheet" if item["opted_in"] else "",
@@ -234,7 +236,8 @@ def add_one(data: dict[str, Any], actor: str) -> WaContact:
     note = text("opt_in_note", 200)
     notes = text("notes", 500)
     return WaContact.objects.create(
-        phone=phone, campaign=campaign, first_name=text("first_name", 80), firm=firm, segment=segment, country=country,
+        phone=phone, campaign=campaign, first_name=text("first_name", 80), owner_name=text("owner_name", 120), firm=firm,
+        segment=segment, country=country,
         city=city, source=text("source", 160) or f"Added by hand {today():%d %b %Y}", info={"notes": notes} if notes else {},
         added_by=actor, opted_in=opted_in,
         opt_in_note=(note or f"Marked opted in when added, {today():%d %b %Y}") if opted_in else "",
@@ -254,8 +257,8 @@ def template_file() -> bytes:
     for cell in sheet[1]:
         cell.font = Font(bold=True)
     sheet.append(["Sample Exports (delete this row)", "+91 98100 00000", "Traders and export houses", "India", "Delhi", "Rakesh",
-                  "Replied to our email", "Y", '{"website":"sample.example","team_size":"12"}'])
-    for letter, width in zip("ABCDEFGHI", (30, 18, 26, 10, 14, 14, 22, 8, 40), strict=True):
+                  "Replied to our email", "Y", '{"website":"sample.example","team_size":"12"}', "Suresh Gupta"])
+    for letter, width in zip("ABCDEFGHIJ", (30, 18, 26, 10, 14, 14, 22, 8, 40, 18), strict=True):
         sheet.column_dimensions[letter].width = width
     sheet.freeze_panes = "A2"
     out = BytesIO()
@@ -269,14 +272,17 @@ def template_file() -> bytes:
 def fill(text: str, contact: WaContact, language: str = "en") -> str:
     """{{Greeting}} (and an opening "Hi {{FirstName}}") is "Hi Rohit", or "Hello <Business> team" without a real name;
     {{FirstName}} is their first name only when it clearly is one, else "<Business> team" (wa_names.py);
-    {{Business}} is the short clean name; {{HowWeKnow}} is one true line on where we found them."""
+    {{Business}} is the short clean name; {{OwnerName}} is the owner's name as staff typed it; {{HowWeKnow}} is one
+    true line on where we found them. Conditions ({{#if FirstName}}...{{else}}...{{/if}}, wa_conditions.py) are
+    resolved first, so their parts go through the same replacements."""
     from .wa_names import address
 
     a = address(contact)
+    text = wa_conditions.apply(text, wa_conditions.known(contact, a))
     # An opening "Hi {{FirstName}}" becomes the salutation: "Hi Rohit", or "Hello Webgross team" without a real name.
     text = re.sub(r"^\s*(Hi|Hello)\s+\{\{FirstName\}\}", "{{Greeting}}", text)
     for key, value in (("{{Greeting}}", a["salutation_hi"] if language == "hi" else a["salutation"]), ("{{FirstName}}", a["greeting"]), ("{{Firm}}", a["business"]), ("{{Business}}", a["business"]),
-                       ("{{City}}", contact.city), ("{{HowWeKnow}}", a["how_we_know"])):
+                       ("{{City}}", contact.city), ("{{OwnerName}}", (contact.owner_name or "").strip()), ("{{HowWeKnow}}", a["how_we_know"])):
         text = text.replace(key, value)
     text = re.sub(r"[ \t]+\n", "\n", text)  # a blank {{HowWeKnow}} leaves no trailing space
     return re.sub(r"[ \t]{2,}", " ", text).strip()
@@ -415,10 +421,12 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
     parts = template.parts or {}
     return {
         "text": personal or base, "template": template.name, "by": "claude" if personal else "template",
-        "media": describe(template),
+        # A version B shows A's picture or video: the A/B test is about the words.
+        "media": describe(template.version_of if template.version_of_id and not template.media else template),
         # From the outreach structure, never sent: what to attach, and context for whoever replies next.
         "creative": parts.get("creative", ""), "notes": fill(parts["notes"], contact) if parts.get("notes") else "",
         "language": language, "template_id": template.pk, "label": wa_flow.label(template) if template.category else "",
+        "version": "B" if template.version_of_id else "",
     }
 
 
@@ -499,7 +507,8 @@ def mark_sent(contact: WaContact, kind: str, text: str, actor: str, template_id:
             wa_flow.check_sendable(contact, picked)
         except wa_flow.FlowError as exc:
             raise WaError(str(exc)) from exc
-        WaMessage.objects.create(contact=contact, kind=Kind.FLOW, text=text[:2000], by=actor, template=picked)
+        WaMessage.objects.create(contact=contact, kind=Kind.FLOW, text=text[:2000], by=actor, template=picked,
+                                 language=language_for(contact))
         if not contact.lang:
             contact.lang = language_for(contact)
         wa_flow.record_send(contact, picked, today())
