@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from django.conf import settings
+from z_analytics.ops import environment
 from django.core.management.base import BaseCommand, CommandError
 
 from z_marketing import wa_seed
@@ -26,7 +26,7 @@ class Command(BaseCommand):
         parser.add_argument("--sample", action="store_true", help="Test rows for dev and local (never prod).")
 
     def handle(self, *args: Any, **opts: Any) -> None:
-        env = getattr(settings, "ZINWE_ENV", "") or "local"
+        env = environment()  # ZINWE_FLAVOUR, else the release path (/srv/zinwe/<flavour>/...), else local
         if not (opts["templates"] or opts["coupons"] or opts["sample"]):
             raise CommandError("Say what to seed: --templates, --coupons (prod) or --sample (dev, local).")
         if (opts["templates"] or opts["coupons"]) and env != "prod":
