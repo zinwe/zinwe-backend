@@ -131,7 +131,7 @@ def how_we_know(source: str, info: dict[str, Any], subject: str) -> str:
         return own
     source = (source or "").strip()
     low = source.lower()
-    if not source or low.startswith("uploaded"):
+    if not source or low.startswith(("uploaded", "added by hand")):  # our own placeholders, not a real source
         return ""
     if "google" in low and "map" in low:
         rating = _rating(info)
