@@ -184,7 +184,9 @@ def _data() -> _Data:
     if root is not None:
         try:
             pointer = (root / CURRENT_NAME).stat()
-            signature += (pointer.st_mtime_ns, pointer.st_size)
+            # The pointer's text too: two publishes within one clock tick can leave the same mtime and size
+            # (Linux file times move in ~4 ms steps), and then the old build would stay cached.
+            signature += (pointer.st_mtime_ns, pointer.st_size, (root / CURRENT_NAME).read_bytes())
         except OSError:
             pass  # Nothing published yet.
     cached = _cache
