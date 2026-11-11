@@ -301,7 +301,7 @@ class WaTemplate(models.Model):
         """The campaign's message categories (wa_flow.py). "" = an older template (kind decides)."""
 
         NONE = "", "Older template"
-        OUTREACH = "outreach", "Outreach"
+        OUTREACH = "outreach", "Intro"
         ENGAGE = "engage", "Engage"
         DEMO_VIDEO = "demo_video", "Demo video"
         SETUP = "setup", "Setup"
@@ -319,8 +319,8 @@ class WaTemplate(models.Model):
     track = models.CharField(max_length=8, choices=Track.choices, default="", blank=True)
     category = models.CharField(max_length=12, choices=Category.choices, default="", blank=True, db_index=True)
     type_name = models.CharField(max_length=60, blank=True)  # the category's type: Need discovery, Booking link...
-    stage = models.PositiveSmallIntegerField(default=0)  # Outreach and Offer: stage 1-3 of the 90 days; 0 = none
-    # Outreach: the day 1-90 it is due. Engage and Demo video: step 1-6 within the Track. Setup, Testimonial: 1-2.
+    stage = models.PositiveSmallIntegerField(default=0)  # Intro and Offer: stage 1-3 of the 90 days; 0 = none
+    # Intro: the day 1-90 it is due. Engage and Demo video: step 1-6 within the Track. Setup, Testimonial: 1-2.
     step = models.PositiveSmallIntegerField(default=0)
     text_hi = models.TextField(max_length=1000, blank=True)  # category rows: the Hinglish text on the same row
     coupon = models.ForeignKey("z_auth.Coupon", on_delete=models.SET_NULL, null=True, blank=True, related_name="wa_templates")
@@ -395,7 +395,7 @@ class WaCampaign(models.Model):
     language = models.CharField(max_length=2, choices=Language.choices, default=Language.EN)
     class Plan(models.TextChoices):
         TOUCHES = "touches", "First message + up to 3 touches"
-        NINETY = "ninety", "90 days: Outreach templates by day, then the YES path"
+        NINETY = "ninety", "90 days: Intro templates by day, then the YES path"
 
     # ninety: the 100 Reviews model (wa_flow.py); `first` is still required but only names the campaign's opener.
     plan = models.CharField(max_length=8, choices=Plan.choices, default=Plan.TOUCHES)
@@ -476,7 +476,7 @@ class WaContact(models.Model):
     needs_reply = models.BooleanField(default=False)  # they wrote and nobody has answered yet
     # The 90-day campaign (wa_flow.py). campaign_status is the spec's path; Day and Stage come from first_sent.
     campaign_status = models.CharField(max_length=16, choices=CampaignStatus.choices, default="", blank=True, db_index=True)
-    out_day = models.PositiveSmallIntegerField(default=0)  # the Outreach day last sent (0 = none)
+    out_day = models.PositiveSmallIntegerField(default=0)  # the Intro day last sent (0 = none)
     engage_step = models.PositiveSmallIntegerField(default=0)
     demo_step = models.PositiveSmallIntegerField(default=0)
     setup_step = models.PositiveSmallIntegerField(default=0)

@@ -1,7 +1,7 @@
 """
 The 100 Reviews campaign's starting rows (spec of 10 Nov 2026), used by `manage.py seed_100_reviews`.
 
-- templates(): the 86 template rows as drafts (no copy yet; copy is written in a separate pass): Outreach 30,
+- templates(): the 86 template rows as drafts (no copy yet; copy is written in a separate pass): Intro 30,
   Engage 18 (6 per Track), Demo video 18 (6 per Track), Setup 2, Demo call 1, Offer & discount 8 (one per code),
   Testimonial 2, Quick reply 7. A draft is never sent.
 - coupons(): the campaign's 8 coupon codes, linked to their Offer rows.
@@ -24,7 +24,7 @@ Track = WaTemplate.Track
 TRACKS = [Track.PRIVACY, Track.ACTIVITY, Track.BOTH]
 CAMPAIGN = "100 Reviews"
 
-# The 30 Outreach messages: 10 per 30-day stage, every third day (days 1, 4, ... 28 in stage 1).
+# The 30 Intro messages: 10 per 30-day stage, every third day (days 1, 4, ... 28 in stage 1).
 OUTREACH_TYPES = ["Intro", "Problem", "Value", "Question", "Problem", "Value", "Season or event", "Question", "Offer", "Discount"]
 ENGAGE_TYPES = ["Need discovery", "Need discovery", "Qualification question", "Qualification question", "Track confirmation", "Track confirmation"]
 DEMO_TYPES = ["Overview video", "Feature clip", "Feature clip", "Feature clip", "Feature clip", "Recap and next step"]

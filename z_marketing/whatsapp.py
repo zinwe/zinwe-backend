@@ -434,7 +434,7 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
 
 
 def _sent_today(campaign: WaCampaign | None = None) -> int:
-    """Cold messages sent today: first, follow-up, touches, one-offs, and 90-day Outreach."""
+    """Cold messages sent today: first, follow-up, touches, one-offs, and 90-day Intro."""
     q = WaMessage.objects.filter(Q(kind__in=COLD) | Q(kind=Kind.FLOW, template__category=WaTemplate.Category.OUTREACH), at__date=today())
     return q.filter(contact__campaign=campaign).count() if campaign else q.count()
 

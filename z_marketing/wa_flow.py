@@ -4,7 +4,7 @@ The 90-day WhatsApp campaign (the "100 Reviews" campaign, owner 10 Nov 2026), fo
 Templates carry a category (WaTemplate.Category) and, for Engage and Demo video only, a Track. A contact moves along
 one path, and `campaign_status` records how far it got:
 
-    Outreach (by day 1-90, no Track)      -> they reply: Replied
+    Intro (by day 1-90, no Track)      -> they reply: Replied
     a YES                                 -> YES
     Engage (one or two Need discovery questions while the Track is Unassigned) -> Engaged
     staff set the Track from the answer   -> Track assigned (an unclear answer: the Track stays Unassigned)
@@ -38,7 +38,7 @@ TRACKED = {Cat.ENGAGE, Cat.DEMO_VIDEO}  # the only categories with a Track
 STATUS_FOR = {Cat.OUTREACH: CS.MESSAGED, Cat.ENGAGE: CS.ENGAGED, Cat.DEMO_VIDEO: CS.DEMO, Cat.SETUP: CS.SETUP,
               Cat.DEMO_CALL: CS.DEMO_CALL, Cat.OFFER: CS.OFFER}
 # The legacy kind each category row gets, so older code (media rules, campaign pickers) treats it right:
-# Outreach goes to strangers (text only), quick replies answer a message, the rest go to people who said YES.
+# Intro goes to strangers (text only), quick replies answer a message, the rest go to people who said YES.
 KIND_FOR = {Cat.OUTREACH: WaTemplate.Kind.FIRST, Cat.QUICK: WaTemplate.Kind.QUESTION}
 PACK_PLAN = {WaContact.Pack.STARTUP: "startups", WaContact.Pack.TEAM: "teams"}
 TESTIMONIAL_AFTER = 14  # days of real use before we ask
@@ -69,7 +69,7 @@ def text_in(t: WaTemplate, language: str) -> str:
 
 
 def label(t: WaTemplate) -> str:
-    """Outreach · Problem · day 4 / Engage · Need discovery · Data Privacy · step 1."""
+    """Intro · Problem · day 4 / Engage · Need discovery · Data Privacy · step 1."""
     bits = [t.get_category_display(), t.type_name]
     if t.category in TRACKED and t.track:
         bits.append(t.get_track_display())
@@ -141,12 +141,12 @@ def _last_theirs(contact: WaContact) -> str:
 
 
 def next_outreach(contact: WaContact, on: date) -> WaTemplate | None:
-    """The Outreach row due today (or its version B for this contact)."""
+    """The Intro row due today (or its version B for this contact)."""
     return version(_next_outreach(contact, on), contact)
 
 
 def _next_outreach(contact: WaContact, on: date) -> WaTemplate | None:
-    """The Outreach row due today: the opener for a new contact, then the latest day reached and not sent yet."""
+    """The Intro row due today: the opener for a new contact, then the latest day reached and not sent yet."""
     rows = list(_rows(Cat.OUTREACH, step__gt=contact.out_day).order_by("step", "id"))
     if not rows:
         return None
@@ -239,7 +239,7 @@ def _sent_today(contact: WaContact, on: date) -> bool:
 
 
 def queue(on: date, cold_room: dict[int, int]) -> list[dict[str, Any]]:
-    """Today's campaign messages for "ninety" campaigns: the YES path first (no daily limit), then Outreach within
+    """Today's campaign messages for "ninety" campaigns: the YES path first (no daily limit), then Intro within
     each campaign's daily limit (`cold_room`: campaign id -> sends left today)."""
     out: list[dict[str, Any]] = []
     base = (
@@ -261,7 +261,7 @@ def queue(on: date, cold_room: dict[int, int]) -> list[dict[str, Any]]:
         template = next_outreach(contact, on)
         if template is None:
             if contact.first_sent and not _rows(Cat.OUTREACH, step__gt=contact.out_day).exists() and contact.campaign_status == CS.MESSAGED:
-                contact.campaign_status = CS.NO_REPLY  # every Outreach message went and nothing came back
+                contact.campaign_status = CS.NO_REPLY  # every Intro message went and nothing came back
                 contact.save(update_fields=["campaign_status"])
             continue
         out.append({"contact": contact, "kind": "flow", "template": template, "note": ""})
@@ -320,7 +320,7 @@ def set_track(contact: WaContact, track: str) -> None:
 
 
 def performance() -> dict[int, dict[str, int]]:
-    """Per template: sends, replies (they wrote within 3 days of it) and the step it is for (YES for Outreach and
+    """Per template: sends, replies (they wrote within 3 days of it) and the step it is for (YES for Intro and
     Offer, Track set for Engage, a later step for the YES path, a testimonial for Testimonial)."""
     sends = list(
         WaMessage.objects.filter(template__isnull=False)

@@ -131,7 +131,7 @@ class FlowTests(FlowBase):
         self.assertEqual((c.campaign_status, c.out_day, c.first_sent, c.status), (CS.MESSAGED, 1, self.today, WaContact.Status.MESSAGED))
         self.assertIsNone(self.due(c))  # one a day
         c = self.pass_days(c, 1)
-        self.assertIsNone(self.due(c))  # day 2: nothing; the next Outreach is day 4
+        self.assertIsNone(self.due(c))  # day 2: nothing; the next Intro is day 4
         c = self.pass_days(c, 2)
         self.assertEqual(self.due(c)["template"].step, 4)
         self.assertEqual(wa_flow.day_of(c, self.today), 4)
@@ -266,7 +266,7 @@ class TemplateApiTests(FlowBase):
         self.assertEqual(r.status_code, 201, r.json())
         body = r.json()
         self.assertEqual((body["track"], body["stage"], body["kind"], body["draft"]), ("", 1, "first", True))
-        self.assertEqual(body["name"], "Outreach · Problem · day 7")
+        self.assertEqual(body["name"], "Intro · Problem · day 7")
         r = self.api.post(f"{BASE}/templates/", {"category": "engage", "type_name": "Need discovery", "step": 1}, format="json")
         self.assertEqual((r.status_code, list(r.json())), (400, ["track"]))
         r = self.api.post(f"{BASE}/templates/", {"category": "outreach", "type_name": "Intro", "step": 95}, format="json")
