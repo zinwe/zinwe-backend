@@ -97,12 +97,12 @@ class FillTests(TestCase):
 
 class ValidationTests(Api):
     def test_an_unbalanced_or_nested_if_is_refused(self) -> None:
-        r = self.api.post(f"{BASE}/templates/", {"category": "outreach", "type_name": "Intro", "step": 2, "text": "{{#if FirstName}}Hi"}, format="json")
+        r = self.api.post(f"{BASE}/templates/", {"category": "outreach", "type_name": "Opener", "step": 2, "text": "{{#if FirstName}}Hi"}, format="json")
         self.assertEqual((r.status_code, r.json()), (400, {"text": ["An If has no matching end."]}))
-        r = self.api.post(f"{BASE}/templates/", {"category": "outreach", "type_name": "Intro", "step": 2, "text": GREETING,
+        r = self.api.post(f"{BASE}/templates/", {"category": "outreach", "type_name": "Opener", "step": 2, "text": GREETING,
                                                  "text_hi": "{{#if City}}{{#if OwnerName}}x{{/if}}{{/if}}"}, format="json")
         self.assertEqual((r.status_code, r.json()), (400, {"text_hi": [wa_conditions.NESTED]}))
-        r = self.api.post(f"{BASE}/templates/", {"category": "outreach", "type_name": "Intro", "step": 2, "text": GREETING}, format="json")
+        r = self.api.post(f"{BASE}/templates/", {"category": "outreach", "type_name": "Opener", "step": 2, "text": GREETING}, format="json")
         self.assertEqual(r.status_code, 201, r.json())
         pk = r.json()["id"]
         r = self.api.patch(f"{BASE}/templates/{pk}/", {"text_hi": "{{/if}}"}, format="json")
@@ -284,7 +284,7 @@ class VersionTests(FlowBase):
         self.assertEqual(r.status_code, 200, r.json())
         self.assertFalse(self.api.get(f"{BASE}/templates/{self.a.pk}/").json()["version_b"]["draft"])
         self.assertEqual(self.due(self.odd)["template"].pk, b.pk)
-        # A is the campaign opener (PROTECT), so use another Outreach row for the delete.
+        # A is the campaign opener (PROTECT), so use another Intro row for the delete.
         other = WaTemplate.objects.get(category=Cat.OUTREACH, step=4)
         self.api.post(f"{BASE}/templates/{other.pk}/versions/", {"text": "x"}, format="json")
         self.assertEqual(self.api.delete(f"{BASE}/templates/{other.pk}/").status_code, 204)

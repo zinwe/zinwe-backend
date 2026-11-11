@@ -25,7 +25,7 @@ TRACKS = [Track.PRIVACY, Track.ACTIVITY, Track.BOTH]
 CAMPAIGN = "100 Reviews"
 
 # The 30 Intro messages: 10 per 30-day stage, every third day (days 1, 4, ... 28 in stage 1).
-OUTREACH_TYPES = ["Intro", "Problem", "Value", "Question", "Problem", "Value", "Season or event", "Question", "Offer", "Discount"]
+OUTREACH_TYPES = ["Opener", "Problem", "Value", "Question", "Problem", "Value", "Season or event", "Question", "Offer", "Discount"]
 ENGAGE_TYPES = ["Need discovery", "Need discovery", "Qualification question", "Qualification question", "Track confirmation", "Track confirmation"]
 DEMO_TYPES = ["Overview video", "Feature clip", "Feature clip", "Feature clip", "Feature clip", "Recap and next step"]
 QUICK_TYPES = ["STOP / band karo", "Price question", "Is this spyware?", "Not now", "We already use something", "Send it on email", "Where did you get my number?"]

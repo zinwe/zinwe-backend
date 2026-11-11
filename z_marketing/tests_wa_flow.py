@@ -269,7 +269,7 @@ class TemplateApiTests(FlowBase):
         self.assertEqual(body["name"], "Intro · Problem · day 7")
         r = self.api.post(f"{BASE}/templates/", {"category": "engage", "type_name": "Need discovery", "step": 1}, format="json")
         self.assertEqual((r.status_code, list(r.json())), (400, ["track"]))
-        r = self.api.post(f"{BASE}/templates/", {"category": "outreach", "type_name": "Intro", "step": 95}, format="json")
+        r = self.api.post(f"{BASE}/templates/", {"category": "outreach", "type_name": "Opener", "step": 95}, format="json")
         self.assertIn("step", r.json())
         gone = Coupon.objects.create(code="ZWTESTGONE2", percent_off=10, starts_on=self.today - timedelta(days=9), ends_on=self.today - timedelta(days=1))
         r = self.api.post(f"{BASE}/templates/", {"category": "offer", "type_name": "Startup pack", "stage": 1, "coupon": gone.pk}, format="json")
