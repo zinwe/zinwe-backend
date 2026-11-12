@@ -13,7 +13,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from . import wa_conditions, wa_flow, wa_media, wa_path_model, wa_paths, wa_paths_convert, wa_structure, wa_templates, whatsapp
+from . import wa_contact_view, wa_conditions, wa_flow, wa_media, wa_path_model, wa_paths, wa_paths_convert, wa_structure, wa_templates, whatsapp
 from .contact_file import FileProblem
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTag, WaTemplate
 from .views import Staff
@@ -240,6 +240,12 @@ class WaContactSerializer(serializers.ModelSerializer):
     engine = serializers.CharField(source="campaign.engine", read_only=True, default="")
     step_label = serializers.SerializerMethodField()
     next_due = serializers.SerializerMethodField()
+    # The Contacts tab (wa_contact_view.py): where on the path, what goes next, what needs staff, the last message.
+    where = serializers.SerializerMethodField()
+    need = serializers.SerializerMethodField()
+    next = serializers.SerializerMethodField()
+    last_message = serializers.SerializerMethodField()
+    language = serializers.SerializerMethodField()
 
     def _path(self, obj: WaContact) -> dict[str, Any]:
         cached = getattr(obj, "_wa_path", None)
@@ -255,6 +261,23 @@ class WaContactSerializer(serializers.ModelSerializer):
         if obj.campaign_id and obj.campaign.engine == WaCampaign.Engine.PATH:
             return self._path(obj)["next_due"]
         return obj.next_date.isoformat() if obj.next_date else None
+
+    def get_where(self, obj: WaContact) -> dict[str, str]:
+        blocks = self.context.get("_wa_blocks") if isinstance(self.context, dict) else None
+        return wa_contact_view.where(obj, block=blocks.get(obj.phone) if blocks is not None else None)
+
+    def get_need(self, obj: WaContact) -> str:
+        return wa_contact_view.need(obj)
+
+    def get_next(self, obj: WaContact) -> dict[str, Any]:
+        cache = self.context.setdefault("_wa_next", {}) if isinstance(self.context, dict) else None
+        return wa_contact_view.next_step(obj, cache)
+
+    def get_last_message(self, obj: WaContact) -> dict[str, Any] | None:
+        return wa_contact_view.last_message(obj)
+
+    def get_language(self, obj: WaContact) -> str:
+        return whatsapp.language_for(obj)
 
     def get_day(self, obj: WaContact) -> int:
         return wa_flow.day_of(obj, whatsapp.today())
@@ -312,6 +335,7 @@ class WaContactSerializer(serializers.ModelSerializer):
             "campaign_status", "day", "stage", "plan", "out_day", "engage_step", "demo_step", "setup_step", "demo_call_sent",
             "offer_sent", "setup_error", "using_since", "pack", "testimonial",
             "engine", "lane", "step_id", "step_label", "next_due",
+            "where", "need", "next", "last_message", "language",
         ]
         read_only_fields = [
             "lane", "step_id",
@@ -468,7 +492,8 @@ class WaContactListView(Staff):
 
     def get(self, request: Request) -> Response:
         rows = WaContact.objects.select_related("campaign").prefetch_related("messages")
-        return Response(WaContactSerializer(rows, many=True).data)
+        blocks = {b.phone: b for b in WaBlock.objects.filter(phone__in=rows.filter(status=WaContact.Status.STOP).values("phone"))}
+        return Response(WaContactSerializer(rows, many=True, context={"_wa_blocks": blocks}).data)
 
     def post(self, request: Request) -> Response:
         try:
@@ -477,6 +502,23 @@ class WaContactListView(Staff):
             return Response({"detail": str(exc), **exc.errors}, status=status.HTTP_400_BAD_REQUEST)
         self.audit(request, "wa_add_contact", contact, opted_in=contact.opted_in)
         return Response(WaContactSerializer(contact).data, status=status.HTTP_201_CREATED)
+
+
+class WaContactCountsView(Staff):
+    """GET the Contacts menu's counts for the whole list: {all, added_week, need, need_by, where: {intro, replied, yes,
+    notnow, paid, stop, locked, none}, tracks: {privacy, activity, both, unset}, segments: [{segment, count, cities}],
+    campaigns: {id: n}, no_campaign, languages: {en, hi}}."""
+
+    def get(self, request: Request) -> Response:
+        return Response(wa_contact_view.counts(list(WaContact.objects.select_related("campaign"))))
+
+
+class WaContactPathView(Staff):
+    """GET one contact's path: {campaign, campaign_name, campaign_status, engine, day, next, steps: [{state: done | now
+    | next, label, date, note}], more: {count, last_date, last_day} | null}."""
+
+    def get(self, request: Request, pk: int) -> Response:
+        return Response(wa_contact_view.path_of(_contact(pk)))
 
 
 class WaContactDetailView(Staff):
