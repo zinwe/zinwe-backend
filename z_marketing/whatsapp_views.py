@@ -635,7 +635,9 @@ class WaCampaignActionView(Staff):
         if action == "start" and not c.contacts.exclude(status=WaContact.Status.STOP).exists():
             return Response({"detail": "Add contacts to this campaign first."}, status=status.HTTP_400_BAD_REQUEST)
         if action == "start" and c.engine == WaCampaign.Engine.PATH:
-            found = wa_path_model.blocking(wa_path_model.issues(c.path), drafts_block=True)
+            # Drafts don't block Start (owner, 12 Nov: starting a campaign must keep working): a draft is never sent,
+            # contacts wait at that step until its copy is written. Only real path errors refuse.
+            found = wa_path_model.blocking(wa_path_model.issues(c.path))
             if found:
                 return Response({"detail": f"Fix the path first: {found[0]['text']}", "issues": found},
                                 status=status.HTTP_400_BAD_REQUEST)

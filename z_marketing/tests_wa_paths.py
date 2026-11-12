@@ -615,12 +615,17 @@ class ApiTests(PathBase):
         t = WaTemplate.objects.get(pk=wa_path_model.lanes(draft.path)["main"][1]["template"])
         t.text_hi = ""
         t.save()
-        r = self.api.post(f"{BASE}/campaigns/{draft.pk}/start/")
-        self.assertEqual(r.status_code, 400)
-        self.assertIn("draft", r.json()["detail"])
-        t.text_hi = "written"
-        t.save()
+        # A draft template doesn't block Start: it is never sent, and contacts wait at it until it is written.
         self.assertEqual(self.api.post(f"{BASE}/campaigns/{draft.pk}/start/").json()["status"], "live")
+        broken = self.path_campaign(wa_path_model.preset_short(), status=WaCampaign.Status.DRAFT, name="Broken")
+        self.person("+919810000902", broken)
+        p = broken.path
+        p["lanes"]["yes"] = []
+        broken.path = p
+        broken.save(update_fields=["path"])
+        r = self.api.post(f"{BASE}/campaigns/{broken.pk}/start/")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("Fix the path first", r.json()["detail"])
 
     def test_a_slots_campaign_shows_its_path_read_only(self) -> None:
         body = self.api.get(f"{BASE}/campaigns/{self.campaign.pk}/path/").json()
