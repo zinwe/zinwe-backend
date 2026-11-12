@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from django.db import transaction
-from django.db.models import ProtectedError
+from django.db.models import Prefetch, ProtectedError, prefetch_related_objects
 from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers, status
@@ -14,7 +14,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 
 from . import (
-    wa_conditions, wa_flow, wa_media, wa_path_model, wa_paths, wa_paths_convert, wa_settings, wa_structure, wa_templates, whatsapp,
+    wa_conditions, wa_flow, wa_media, wa_path_model, wa_paths, wa_paths_convert, wa_settings, wa_structure, wa_templates, wa_today, whatsapp,
 )
 from .contact_file import FileProblem
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTag, WaTemplate
@@ -372,6 +372,7 @@ class WaCampaignSerializer(serializers.ModelSerializer):
             "id", "name", "audience", "audience_name", "goal", "status", "daily_limit", "followup_days", "first", "followup",
             "interested", "question", "notnow", "touch3", "touch4", "touch3_days", "touch4_days", "language", "stats", "created_at",
             "plan", "engine", "path_summary", "contacts", "sent", "replies", "reply_rate", "yes", "paid", "day", "path",
+            "send_slot",
         ]
         read_only_fields = ["status", "created_at", "engine"]
 
@@ -458,15 +459,30 @@ class WaTodayView(Staff):
                     "draft": False, "note": i.get("note", ""), "version": "", "contact": WaContactSerializer(i["contact"]).data,
                     **where}
 
+        def slotted(i: dict[str, Any]) -> dict[str, Any]:
+            # wa4 Today: the send slot the row goes in ("" = any time: replies and the after-YES steps go first).
+            return {**row(i), "slot": wa_today.row_slot(i), "after_yes": wa_today.is_after_yes(i)}
+
+        replies = list(whatsapp.replies())
+        prefetch_related_objects(replies, Prefetch("messages", queryset=WaMessage.objects.select_related("template")))
+        extras = wa_today.reply_extras(replies)
+        today = whatsapp.today()
+        sent_today = whatsapp._sent_today()
         return Response({
-            "queue": [row(i) for i in items],
+            "queue": [slotted(i) for i in items],
             "replies": [
-                {**WaContactSerializer(c).data, "messages": WaMessageSerializer(c.messages.all(), many=True).data}
-                for c in whatsapp.replies()
+                # wa4: Claude's read of the reply (suggest), the choices (sorts), what each does to their path
+                # (effect) and the template each answer starts from (answers).
+                {**WaContactSerializer(c).data, "messages": WaMessageSerializer(c.messages.all(), many=True).data, **extras[c.pk]}
+                for c in replies
             ],
-            "sent_today": whatsapp._sent_today(),
+            "sent_today": sent_today,
             "stats": whatsapp.stats(),
             "campaign": wa_flow.counts(),
+            # wa4 Today: the slot now and next, the day's numbers, and what was marked as sent today.
+            "slots": wa_today.slot_info(),
+            "day": wa_today.day_numbers(today, sent_today),
+            "sent_list": wa_today.sent_rows(today),
         })
 
 
@@ -513,7 +529,8 @@ class WaContactActionView(Staff):
         try:
             if action == "draft":
                 template = request.data.get("template")
-                return Response(whatsapp.draft(c, str(request.data.get("kind", "first")), int(template) if str(template or "").isdigit() else None))
+                return Response(whatsapp.draft(c, str(request.data.get("kind", "first")), int(template) if str(template or "").isdigit() else None,
+                                               track=str(request.data.get("track", "") or "")))
             if action == "sent":
                 template = request.data.get("template")
                 whatsapp.mark_sent(c, str(request.data.get("kind", "")), str(request.data.get("text", "")), actor,

@@ -413,6 +413,17 @@ class WaCampaign(models.Model):
     engine = models.CharField(max_length=5, choices=Engine.choices, default=Engine.SLOTS)
     # {"v": 1, "lanes": {"main": [...], "yes": [...], "notnow": [...], "stop": [...]}}: wa_path_model.py
     path = models.JSONField(default=dict, blank=True)
+
+    class Slot(models.TextChoices):
+        """The send slot (India time, Mon-Sat): Today lists the campaign's Intro messages in it. Replies and the YES
+        path go any time in the send window."""
+
+        S10 = "10", "10–12"
+        S12 = "12", "12–14"
+        S14 = "14", "14–17"
+        S17 = "17", "17–19"
+
+    send_slot = models.CharField(max_length=2, choices=Slot.choices, default=Slot.S10)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -542,6 +553,9 @@ class WaMessage(models.Model):
     lane = models.CharField(max_length=8, blank=True, default="")
     at = models.DateTimeField(auto_now_add=True, db_index=True)
     by = models.EmailField(blank=True)
+    # Their message only: Claude's read of it, kept so Today asks Claude once per message (wa_today.py).
+    # {"kind", "track", "why", "source"}; {} = not read yet.
+    read = models.JSONField(default=dict, blank=True)
 
     class Meta:
         ordering = ["at", "id"]

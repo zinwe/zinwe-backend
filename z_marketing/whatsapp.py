@@ -395,10 +395,17 @@ def _claude(template_text: str, contact: WaContact, their_last: str) -> str | No
     return text[:1000] or None
 
 
-def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict[str, Any]:
-    """The text to send next: {text, template, by, media, creative, notes}. `by` is "claude" when Claude personalised it."""
+def draft(contact: WaContact, kind: str, template_id: int | None = None, track: str = "") -> dict[str, Any]:
+    """The text to send next: {text, template, by, media, creative, notes}. `by` is "claude" when Claude personalised it.
+    `track` (Today, wa4): draft as if the contact's Unassigned Track were already set, so the first Demo video of the
+    Track staff are about to confirm can be read before they confirm it. Nothing is saved."""
     if not contact.opted_in:
         raise WaError(LOCKED)
+    if track and not contact.track and track in ("privacy", "activity", "both"):
+        import copy
+
+        contact = copy.copy(contact)
+        contact.track = track
     if template_id:  # staff picked a template for a one-off message (Contacts → Send WhatsApp)
         template = WaTemplate.objects.filter(pk=template_id).first()
         if template is None:
