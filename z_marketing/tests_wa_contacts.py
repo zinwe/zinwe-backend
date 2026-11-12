@@ -113,6 +113,7 @@ class CountsAndPathTests(PathBase):
         self.assertEqual((p["campaign"], p["campaign_name"], p["engine"], p["day"]), (self.camp.pk, "Diwali to Republic Day", "path", 2))
         done = [s for s in p["steps"] if s["state"] == "done"]
         self.assertEqual([(s["label"], s["date"]) for s in done], [("Added to Diwali to Republic Day", "2026-11-16"), (wa_flow.label(intro(1)), "2026-11-16")])
+        self.assertEqual([s["kind"] for s in done], ["event", "message"])
         now = [s for s in p["steps"] if s["state"] == "now"]
         self.assertEqual([s["label"] for s in now], ["Wait 3 days"])
         nxt = [s for s in p["steps"] if s["state"] == "next"]

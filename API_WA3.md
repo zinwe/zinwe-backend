@@ -317,13 +317,15 @@ One contact's path for the contact panel: what went (`done`), where they are (`n
 ```json
 {"campaign": 5, "campaign_name": "Diwali to Republic Day", "campaign_status": "live", "engine": "path", "day": 2,
  "next": {"state": "planned", "label": "Intro · Problem · day 4", "when": "2026-11-19", "slot": "", "send_kind": "flow"},
- "steps": [{"state": "done", "label": "Added to Diwali to Republic Day", "date": "2026-11-16", "note": ""},
+ "steps": [{"state": "done", "label": "Added to Diwali to Republic Day", "date": "2026-11-16", "note": "", "kind": "event"},
            {"state": "done", "label": "Intro · Opener · day 1", "date": "2026-11-16", "note": ""},
            {"state": "now", "label": "Wait 3 days", "date": null, "note": ""},
            {"state": "next", "label": "Intro · Problem · day 4", "date": "2026-11-19", "note": ""},
            {"state": "next", "label": "Intro · Value · day 7", "date": "2026-11-23", "note": "moved from Sun 22 Nov"}],
  "more": {"count": 21, "last_date": "2027-02-10", "last_day": 88}}
 ```
+- `kind`: `message` (one of our messages, sent or coming), `event` (added, Said YES, the Track, the first PC, paid) or
+  `step` (where they are: a wait, a hold, the end).
 - Done rows: our campaign messages and quick replies (one-offs and plain replies are in the conversation), Said YES,
   the Track, First PC set up, Goal · Paid.
 - Now: the wait they are in, what they wait for ("Set the Track", "Sort their reply on Today"), "Blocked in every

@@ -338,8 +338,10 @@ def counts(contacts: list[WaContact]) -> dict[str, Any]:
 # --- One contact's path: done, now, next ---------------------------------------------------------------------------
 
 
-def _row(state: str, label: str, d: date | None = None, note: str = "") -> dict[str, Any]:
-    return {"state": state, "label": label, "date": d.isoformat() if d else None, "note": note}
+def _row(state: str, label: str, d: date | None = None, note: str = "", kind: str = "step") -> dict[str, Any]:
+    """kind: message (one of our messages, sent or coming), event (their YES, the Track, the first PC, paid, added),
+    step (where they are: a wait, a hold, the end)."""
+    return {"state": state, "label": label, "date": d.isoformat() if d else None, "note": note, "kind": kind}
 
 
 def _upcoming(c: WaContact) -> list[dict[str, Any]]:
@@ -360,11 +362,11 @@ def _upcoming(c: WaContact) -> list[dict[str, Any]]:
 
 def path_of(c: WaContact) -> dict[str, Any]:
     """GET /contacts/<id>/path/: {campaign, campaign_name, campaign_status, engine, day, steps: [{state: done | now |
-    next, label, date, note}], more: {count, last_date} | None}. Done = what went (our messages, their YES, the Track,
+    next, label, date, note, kind: message | event | step}], more: {count, last_date} | None}. Done = what went (our messages, their YES, the Track,
     the first PC), now = where they are, next = the coming messages."""
     today = whatsapp.today()
     camp = c.campaign if c.campaign_id else None
-    added = [_row("done", f"Added to {camp.name}", timezone.localtime(c.created_at).date())] if camp is not None else []
+    added = [_row("done", f"Added to {camp.name}", timezone.localtime(c.created_at).date(), kind="event")] if camp is not None else []
     steps: list[dict[str, Any]] = []
     # Our messages on the path: campaign messages and quick replies. One-offs and plain replies are in the conversation.
     one_off = (WaMessage.Kind.THEIRS, WaMessage.Kind.REPLY, WaMessage.Kind.CUSTOM)
@@ -372,15 +374,15 @@ def path_of(c: WaContact) -> dict[str, Any]:
     for m in sent:
         t = m.template
         label = _tlabel(t) if t is not None else WaMessage.Kind(m.kind).label
-        steps.append(_row("done", label, timezone.localtime(m.at).date(), "quick" if t is not None and t.category == Cat.QUICK else ""))
+        steps.append(_row("done", label, timezone.localtime(m.at).date(), "quick" if t is not None and t.category == Cat.QUICK else "", "message"))
     if c.yes_date:
-        steps.append(_row("done", "Said YES", c.yes_date))
+        steps.append(_row("done", "Said YES", c.yes_date, kind="event"))
     if c.track:
-        steps.append(_row("done", f"Track · {WaTemplate.Track(c.track).label}", None))
+        steps.append(_row("done", f"Track · {WaTemplate.Track(c.track).label}", None, kind="event"))
     if c.using_since:
-        steps.append(_row("done", "First PC set up", c.using_since))
+        steps.append(_row("done", "First PC set up", c.using_since, kind="event"))
     if c.campaign_status == CS.PAID:
-        steps.append(_row("done", "Goal · Paid", None))
+        steps.append(_row("done", "Goal · Paid", None, kind="event"))
     # Dated rows in date order; the Track and Paid (no date kept) after the last dated row before them.
     dated = sorted([s for s in steps if s["date"]], key=lambda s: s["date"])
     steps = added + dated + [s for s in steps if not s["date"]]
@@ -418,7 +420,7 @@ def path_of(c: WaContact) -> dict[str, Any]:
             label = _tlabel(t) if t is not None else r.get("label", "")
             d = date.fromisoformat(r["date"]) if r.get("date") else None
             state = "now" if i == 0 and not any(s["state"] == "now" for s in steps) else "next"
-            steps.append(_row(state, label, d, f"moved from {r['moved_from']}" if r.get("moved_from") else ""))
+            steps.append(_row(state, label, d, f"moved from {r['moved_from']}" if r.get("moved_from") else "", "message"))
         if len(upcoming) > UPCOMING:
             rest = upcoming[UPCOMING:]
             more = {"count": len(rest), "last_date": rest[-1].get("date"), "last_day": rest[-1].get("day")}
