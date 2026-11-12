@@ -273,3 +273,57 @@ manage.py wa_paths --revert <id>                        back on slots (the path 
   daily limit, needs_reply and the 30-day pause are gates both engines share, so they are not compared.
 - A paused or draft ninety campaign with YES contacts counts as a difference: slots still sends their YES path, and a
   path campaign doesn't.
+
+## 5. Today (wa4, 12 Nov 2026): Claude's read, the choices and send slots
+
+Every key below is **added**; nothing changed shape. Code: `z_marketing/wa_today.py`.
+
+### `WaCampaign.send_slot` (migration 0027)
+`"10"` (10–12, the default) · `"12"` (12–14) · `"14"` (14–17) · `"17"` (17–19), India time, Mon–Sat. In `GET/PATCH
+/campaigns/` as `send_slot`; anything else is a 400. A path `send` step may carry its own `"slot"` (the builder already
+round-trips it), which wins for that step.
+
+### `GET /today/`
+- Each **queue** row adds `slot` and `after_yes`:
+  - `after_yes: true` = a step for someone who already replied (YES path, Not now path, after-YES, Set the Track). These
+    go any time in the window, so `slot` is `""`.
+  - Otherwise `slot` is the step's own slot or the campaign's `send_slot`.
+- Top level adds:
+  - `slots`: `{now, now_label, open, sunday, next, next_label, next_at, list: [{key, label, start}]}`. Before 10:00
+    `now` is `"10"`; after 17:00 it is `"17"`, so whatever is left counts as due now.
+  - `day`: `{sent, limit, replies, yes}`. `sent` = messages counted against the daily limit today (`sent_today`),
+    `limit` = the live campaigns' daily limits added up, `replies` = people who wrote today, `yes` = people who said
+    YES today.
+  - `sent_list`: every message marked as sent today, newest first:
+    `{at, contact, name, what, replied_at, blocked}` (`replied_at` = their first message after it today, or null).
+- Each **reply** row adds:
+  - `suggest`: `{kind, track, why, source}`. `kind`: `yes` · `question` · `notnow` · `stop` · `track`. `track` only
+    when kind is `track` (`privacy` · `activity` · `both`, or `""` when unclear). `source`: `rules` or `claude`.
+  - `sorts`: the buttons, in order: `["yes", "question", "notnow", "stop"]`, or `["privacy", "activity", "both"]` when
+    they already said YES and the Track is Unassigned (ninety or a path contact in the YES lane).
+  - `effect`: one line per sort, worked out by running the engine on a copy of the contact (nothing is saved).
+  - `answers`: the template each answer starts from (id, or null: draft by `kind` instead). Drafts are never picked.
+
+```json
+{"id": 5, "firm": "Mehta & Co CA", "...": "...",
+ "suggest": {"kind": "yes", "track": "", "why": "asks for the video and names the problem", "source": "rules"},
+ "sorts": ["yes", "question", "notnow", "stop"],
+ "effect": {"yes": "YES moves Rohit to the YES path: Engage · Need discovery goes now, then Zinwe waits up to 2 days for the answer.",
+            "question": "A question doesn't move them. Rohit stays on Intro; the next message still goes on Thu 19 Nov.",
+            "notnow": "Not now moves them to the Not now path: this reply, a 30-day wait, then back to Intro at the next message.",
+            "stop": "STOP ends every campaign for this number. Send the confirmation, then the number is blocked for good."},
+ "answers": {"yes": 79, "question": null, "notnow": 131, "stop": 128}}
+```
+
+**Confirming** is the existing calls, in this order: `act` (`interested` / `notnow` / `track` with the Track in
+`note`; nothing for a question), then `sent {kind: "reply", text, template: answers[sort]}`. STOP: `sent` the
+confirmation, then `act stop`.
+
+**Claude.** Rules first (English and Hinglish keywords, `wa_flow.suggest_track`). With `ANTHROPIC_API_KEY` set, Today
+asks Claude (`ZINWE_WA_MODEL`, low effort, JSON schema output) about up to 4 new replies per load, in parallel. The
+read is kept on the message (`WaMessage.read`, migration 0027), so each message is read once; a failed call keeps the
+rules' read and isn't retried. Claude never sends anything.
+
+### `POST /contacts/<id>/draft/` adds `track`
+`{kind, template, track: "privacy"}` drafts as if the Unassigned Track were set, so Today can show the first Demo video
+of the Track staff are about to confirm. Nothing is saved.
