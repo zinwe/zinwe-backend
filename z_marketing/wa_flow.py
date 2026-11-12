@@ -244,6 +244,7 @@ def queue(on: date, cold_room: dict[int, int]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     base = (
         WaContact.objects.filter(campaign__plan=WaCampaign.Plan.NINETY, opted_in=True, needs_reply=False)
+        .exclude(campaign__engine=WaCampaign.Engine.PATH)  # converted campaigns run on wa_paths.py
         .exclude(status=WaContact.Status.STOP).exclude(campaign_status=CS.OPTED_OUT)
         .exclude(paused_until__gt=on).select_related("campaign")
     )

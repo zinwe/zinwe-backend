@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from django.db import transaction
 from django.db.models import ProtectedError
 from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
@@ -12,7 +13,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from . import wa_conditions, wa_flow, wa_media, wa_structure, wa_templates, whatsapp
+from . import wa_conditions, wa_flow, wa_media, wa_path_model, wa_paths, wa_paths_convert, wa_structure, wa_templates, whatsapp
 from .contact_file import FileProblem
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTag, WaTemplate
 from .views import Staff
@@ -235,6 +236,25 @@ class WaContactSerializer(serializers.ModelSerializer):
     day = serializers.SerializerMethodField()
     stage = serializers.SerializerMethodField()
     plan = serializers.CharField(source="campaign.plan", read_only=True, default="")
+    # Path campaigns (wa_paths.py): where they are and when their next message is due. Blank on slots campaigns.
+    engine = serializers.CharField(source="campaign.engine", read_only=True, default="")
+    step_label = serializers.SerializerMethodField()
+    next_due = serializers.SerializerMethodField()
+
+    def _path(self, obj: WaContact) -> dict[str, Any]:
+        cached = getattr(obj, "_wa_path", None)
+        if cached is None:
+            cache = self.context.setdefault("_wa_tpl", {}) if isinstance(self.context, dict) else None
+            cached = obj._wa_path = wa_paths.contact_view(obj, cache)
+        return cached
+
+    def get_step_label(self, obj: WaContact) -> str:
+        return self._path(obj)["step_label"]
+
+    def get_next_due(self, obj: WaContact) -> str | None:
+        if obj.campaign_id and obj.campaign.engine == WaCampaign.Engine.PATH:
+            return self._path(obj)["next_due"]
+        return obj.next_date.isoformat() if obj.next_date else None
 
     def get_day(self, obj: WaContact) -> int:
         return wa_flow.day_of(obj, whatsapp.today())
@@ -291,8 +311,10 @@ class WaContactSerializer(serializers.ModelSerializer):
             "how_we_know", "known",
             "campaign_status", "day", "stage", "plan", "out_day", "engage_step", "demo_step", "setup_step", "demo_call_sent",
             "offer_sent", "setup_error", "using_since", "pack", "testimonial",
+            "engine", "lane", "step_id", "step_label", "next_due",
         ]
         read_only_fields = [
+            "lane", "step_id",
             "opted_in", "opt_in_note",
             "phone", "status", "step", "next_date", "needs_reply", "paused_until", "created_at", "yes_date", "nurture_day",
             "first_sent", "campaign_status", "out_day", "engage_step", "demo_step", "setup_step", "demo_call_sent",
@@ -309,21 +331,89 @@ class WaContactSerializer(serializers.ModelSerializer):
         return value
 
 
+def campaign_numbers(c: WaCampaign) -> dict[str, int]:
+    """For the campaign list: people, messages we sent, people who replied (and the % of those messaged), YES, paid."""
+    contacts = c.contacts.all()
+    theirs = WaMessage.Kind.THEIRS
+    messaged = contacts.filter(messages__isnull=False).exclude(messages__kind=theirs).distinct().count()
+    replies = contacts.filter(messages__kind=theirs).distinct().count()
+    return {
+        "contacts": contacts.count(),
+        "sent": WaMessage.objects.filter(contact__campaign=c).exclude(kind=theirs).count(),
+        "replies": replies,
+        "reply_rate": wa_templates.rate(replies, messaged),
+        "yes": contacts.filter(yes_date__isnull=False).count(),
+        "paid": contacts.filter(campaign_status=WaContact.CampaignStatus.PAID).count(),
+    }
+
+
 class WaCampaignSerializer(serializers.ModelSerializer):
     audience_name = serializers.CharField(source="audience.name", read_only=True, default="")
     stats = serializers.SerializerMethodField()
+    path_summary = serializers.SerializerMethodField()
+    contacts = serializers.SerializerMethodField()
+    sent = serializers.SerializerMethodField()
+    replies = serializers.SerializerMethodField()
+    reply_rate = serializers.SerializerMethodField()
+    yes = serializers.SerializerMethodField()
+    paid = serializers.SerializerMethodField()
+    day = serializers.SerializerMethodField()
+    path = serializers.SerializerMethodField()
 
     class Meta:
         model = WaCampaign
         fields = [
             "id", "name", "audience", "audience_name", "goal", "status", "daily_limit", "followup_days", "first", "followup",
             "interested", "question", "notnow", "touch3", "touch4", "touch3_days", "touch4_days", "language", "stats", "created_at",
-            "plan",
+            "plan", "engine", "path_summary", "contacts", "sent", "replies", "reply_rate", "yes", "paid", "day", "path",
         ]
-        read_only_fields = ["status", "created_at"]
+        read_only_fields = ["status", "created_at", "engine"]
 
     def get_stats(self, obj: WaCampaign) -> dict[str, int]:
         return whatsapp.stats(obj)
+
+    def get_day(self, obj: WaCampaign) -> int | None:
+        """The campaign's day: Day 1 is its first message to anyone. None before any message."""
+        first = obj.contacts.filter(first_sent__isnull=False).order_by("first_sent").values_list("first_sent", flat=True).first()
+        return (whatsapp.today() - first).days + 1 if first else None
+
+    def get_path(self, obj: WaCampaign) -> dict[str, Any] | None:
+        """The path it runs on (engine path), so the list can draw it without a fetch per campaign; None on slots."""
+        return obj.path if obj.engine == WaCampaign.Engine.PATH else None
+
+    def _numbers(self, obj: WaCampaign) -> dict[str, int]:
+        cached = getattr(obj, "_wa_numbers", None)
+        if cached is None:
+            cached = obj._wa_numbers = campaign_numbers(obj)
+        return cached
+
+    def get_path_summary(self, obj: WaCampaign) -> dict[str, int] | None:
+        """{steps, days, lanes} of the path it runs on (a slots campaign: the path it would convert to)."""
+        path = obj.path if obj.engine == WaCampaign.Engine.PATH or obj.path else None
+        if not path:
+            try:
+                path = wa_paths_convert.build(obj)
+            except Exception:  # noqa: BLE001 -- a summary is never worth a failed list
+                return None
+        return wa_path_model.summary(path)
+
+    def get_contacts(self, obj: WaCampaign) -> int:
+        return self._numbers(obj)["contacts"]
+
+    def get_sent(self, obj: WaCampaign) -> int:
+        return self._numbers(obj)["sent"]
+
+    def get_replies(self, obj: WaCampaign) -> int:
+        return self._numbers(obj)["replies"]
+
+    def get_reply_rate(self, obj: WaCampaign) -> int:
+        return self._numbers(obj)["reply_rate"]
+
+    def get_yes(self, obj: WaCampaign) -> int:
+        return self._numbers(obj)["yes"]
+
+    def get_paid(self, obj: WaCampaign) -> int:
+        return self._numbers(obj)["paid"]
 
     def validate_daily_limit(self, value: int) -> int:
         if not 1 <= value <= 50:
@@ -349,13 +439,17 @@ class WaTodayView(Staff):
 
         def row(i: dict[str, Any]) -> dict[str, Any]:
             t = i.get("template")
-            if isinstance(t, WaTemplate):  # a 90-day campaign message (wa_flow.py)
-                return {"kind": i["kind"], "template": t.name, "template_id": t.pk, "label": wa_flow.label(t),
+            # Path campaigns (wa_paths.py) add where the contact is; slots rows carry them blank.
+            where = {"step_id": i.get("step_id", ""), "step_label": i.get("step_label", ""), "lane": i.get("lane", "")}
+            if isinstance(t, WaTemplate):  # a 90-day campaign message (wa_flow.py), or a path step's
+                return {"kind": i["kind"], "template": t.name, "template_id": t.pk,
+                        "label": wa_flow.label(t) if t.category else t.name,
                         "category": t.category, "draft": wa_flow.is_draft(t), "note": i.get("note", ""),
                         "version": "B" if t.version_of_id else "",
-                        "contact": WaContactSerializer(i["contact"]).data}
+                        "contact": WaContactSerializer(i["contact"]).data, **where}
             return {"kind": i["kind"], "template": t or "", "template_id": None, "label": "", "category": "",
-                    "draft": False, "note": i.get("note", ""), "version": "", "contact": WaContactSerializer(i["contact"]).data}
+                    "draft": False, "note": i.get("note", ""), "version": "", "contact": WaContactSerializer(i["contact"]).data,
+                    **where}
 
         return Response({
             "queue": [row(i) for i in items],
@@ -468,11 +562,43 @@ class WaCampaignListView(Staff):
         return Response(WaCampaignSerializer(WaCampaign.objects.select_related("audience"), many=True).data)
 
     def post(self, request: Request) -> Response:
-        data = WaCampaignSerializer(data=request.data)
+        """With `preset` (100_reviews | short | blank) or `path`: a step-by-step campaign (engine "path"); `first` is
+        then optional (the path's first message, else the first Intro row). Without either: an old-style campaign."""
+        body = request.data.copy()
+        preset, raw = body.get("preset"), body.get("path")
+        path = None
+        if preset or raw is not None:
+            try:
+                path = wa_path_model.clean(raw if raw is not None else wa_path_model.preset(str(preset)))
+            except wa_path_model.PathError as exc:
+                return Response({"detail": str(exc), "path": exc.errors}, status=status.HTTP_400_BAD_REQUEST)
+            if not body.get("first"):
+                first = _first_message(path)
+                if first is None:
+                    return Response({"first": ["Add a template in Templates first: a campaign needs one to start from."]},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                body["first"] = first
+            if not body.get("plan"):
+                body["plan"] = WaCampaign.Plan.NINETY if preset == "100_reviews" else WaCampaign.Plan.TOUCHES
+        data = WaCampaignSerializer(data=body)
         data.is_valid(raise_exception=True)
-        campaign = data.save()
-        self.audit(request, "wa_campaign_create", campaign)
+        with transaction.atomic():
+            campaign = data.save()
+            if path is not None:
+                campaign.path, campaign.engine = path, WaCampaign.Engine.PATH
+                campaign.save(update_fields=["path", "engine"])
+        self.audit(request, "wa_campaign_create", campaign, preset=str(preset or ""))
         return Response(WaCampaignSerializer(campaign).data, status=status.HTTP_201_CREATED)
+
+
+def _first_message(path: dict[str, Any]) -> int | None:
+    """WaCampaign.first is required: the path's first message template, else the first Intro row, else any template."""
+    for s in wa_path_model.lanes(path)["main"]:
+        if s["k"] == "send" and s.get("template"):
+            return s["template"]
+    t = (WaTemplate.objects.filter(category=WaTemplate.Category.OUTREACH, archived=False).order_by("step", "id").first()
+         or WaTemplate.objects.filter(archived=False).order_by("id").first())
+    return t.pk if t else None
 
 
 class WaCampaignDetailView(Staff):
@@ -508,6 +634,11 @@ class WaCampaignActionView(Staff):
             return Response({"detail": "Unknown action."}, status=status.HTTP_404_NOT_FOUND)
         if action == "start" and not c.contacts.exclude(status=WaContact.Status.STOP).exists():
             return Response({"detail": "Add contacts to this campaign first."}, status=status.HTTP_400_BAD_REQUEST)
+        if action == "start" and c.engine == WaCampaign.Engine.PATH:
+            found = wa_path_model.blocking(wa_path_model.issues(c.path), drafts_block=True)
+            if found:
+                return Response({"detail": f"Fix the path first: {found[0]['text']}", "issues": found},
+                                status=status.HTTP_400_BAD_REQUEST)
         c.status = WaCampaign.Status.LIVE if action == "start" else WaCampaign.Status.PAUSED
         c.save(update_fields=["status"])
         self.audit(request, f"wa_campaign_{action}", c)
@@ -705,3 +836,102 @@ class WaAnalyticsView(Staff):
             "campaigns": [{"id": c.id, "name": c.name, "status": c.status, **whatsapp.stats(c)} for c in WaCampaign.objects.all()],
             "blocked": WaBlock.objects.count(),
         })
+
+
+# --- Step-by-step paths (wa_path_model.py, wa_paths.py) ------------------------------------------------------------
+
+
+def _path_body(c: WaCampaign, path: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    on_path = c.engine == WaCampaign.Engine.PATH
+    return {
+        "campaign": c.pk, "engine": c.engine, "status": c.status, "read_only": not on_path, "path": path,
+        "stats": wa_paths.step_stats(c) if on_path else {}, "issues": wa_path_model.issues(path),
+        "summary": wa_path_model.summary(path), **extra,
+    }
+
+
+class WaCampaignPathView(Staff):
+    """GET {path, engine, stats: {step_id: {here, sent, replies, reply_rate}}, issues, summary, read_only} (a slots
+    campaign: the path it would convert to, read only) · PUT {path}: save it. A draft saves with its issues; a live or
+    paused campaign refuses errors, and contacts at a removed step move to the next one ({moved: n})."""
+
+    def get(self, request: Request, pk: int) -> Response:
+        c = get_object_or_404(WaCampaign, pk=pk)
+        path = c.path if c.engine == WaCampaign.Engine.PATH else wa_path_model.clean(wa_paths_convert.build(c))
+        return Response(_path_body(c, path))
+
+    def put(self, request: Request, pk: int) -> Response:
+        c = get_object_or_404(WaCampaign, pk=pk)
+        if c.engine != WaCampaign.Engine.PATH and (c.status != WaCampaign.Status.DRAFT or WaMessage.objects.filter(contact__campaign=c).exists()):
+            return Response({"detail": "This campaign runs on the old engine. It moves to a path with manage.py wa_paths --convert."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            path = wa_path_model.clean(request.data.get("path"))
+        except wa_path_model.PathError as exc:
+            return Response({"detail": str(exc), "errors": exc.errors}, status=status.HTTP_400_BAD_REQUEST)
+        found = wa_path_model.issues(path)
+        running = c.status in (WaCampaign.Status.LIVE, WaCampaign.Status.PAUSED)
+        stop = wa_path_model.blocking(found)
+        if running and stop:
+            return Response({"detail": f"A running campaign needs a complete path: {stop[0]['text']}", "issues": found},
+                            status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            old = c.path if c.engine == WaCampaign.Engine.PATH else {}
+            c.path, c.engine = path, WaCampaign.Engine.PATH
+            c.save(update_fields=["path", "engine"])
+            moved = wa_paths.apply_edit(c, old, path) if old else 0
+        self.audit(request, "wa_campaign_path", c, moved=moved)
+        return Response(_path_body(c, path, moved=moved))
+
+
+class WaCampaignScheduleView(Staff):
+    """GET ?contact=<id>: every message from that contact's step on, if each goes on its due day and nobody replies,
+    with the real Mon-Sat window. Without a contact: someone who joins today. [{step_id, lane, day, date, moved_from,
+    template_id, template, label}]; day = Day N of the Intro path, or days since they entered a reply path."""
+
+    def get(self, request: Request, pk: int) -> Response:
+        c = get_object_or_404(WaCampaign, pk=pk)
+        raw = request.query_params.get("contact")
+        contact = None
+        if raw:
+            if not str(raw).isdigit():
+                return Response({"contact": ["Pick a contact."]}, status=status.HTTP_400_BAD_REQUEST)
+            contact = _contact(int(raw))
+        if c.engine == WaCampaign.Engine.PATH:
+            return Response(wa_paths.simulate(c, contact))
+        path = wa_path_model.clean(wa_paths_convert.build(c))
+        if contact is not None and contact.campaign_id == c.pk:
+            try:
+                p = wa_paths_convert.place(c, path, contact, wa_paths.timezone.now())
+            except wa_paths_convert.Unplaceable as exc:
+                return Response({"detail": f"This contact can't be shown on the path yet: {exc}."}, status=status.HTTP_400_BAD_REQUEST)
+            contact = wa_paths_convert._virtual(contact, c, path, p)
+        return Response(wa_paths.simulate(c, contact, path=path))
+
+
+class WaCampaignPresetsView(Staff):
+    """GET [{key, name, path, summary}]: the ready paths a new campaign starts from (POST /campaigns/ with preset)."""
+
+    def get(self, request: Request) -> Response:
+        out = []
+        for key, name in wa_path_model.PRESETS:
+            path = wa_path_model.preset(key)
+            out.append({"key": key, "name": name, "path": path, "summary": wa_path_model.summary(path)})
+        return Response(out)
+
+
+class WaAnalyticsStepsView(Staff):
+    """GET ?campaign=<id>: {campaign, name, engine, steps: [{step_id, lane, k, label, here, sent, replies,
+    reply_rate}]} in path order."""
+
+    def get(self, request: Request) -> Response:
+        raw = request.query_params.get("campaign")
+        if not str(raw or "").isdigit():
+            return Response({"campaign": ["Pick a campaign."]}, status=status.HTTP_400_BAD_REQUEST)
+        c = get_object_or_404(WaCampaign, pk=int(raw))
+        if c.engine != WaCampaign.Engine.PATH:
+            preview = WaCampaign(pk=c.pk, name=c.name, path=wa_path_model.clean(wa_paths_convert.build(c)))
+            steps = [{**r, "here": 0, "sent": 0, "replies": 0, "reply_rate": 0} for r in wa_paths.steps_view(preview)]
+        else:
+            steps = wa_paths.steps_view(c)
+        return Response({"campaign": c.pk, "name": c.name, "engine": c.engine, "steps": steps})

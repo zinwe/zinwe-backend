@@ -32,6 +32,9 @@ urlpatterns = [
     path("wa/contacts/<int:pk>/<slug:action>/", wa.WaContactActionView.as_view(), name="wa-contact-action"),
     path("wa/campaigns/", wa.WaCampaignListView.as_view(), name="wa-campaigns"),
     path("wa/campaigns/<int:pk>/", wa.WaCampaignDetailView.as_view(), name="wa-campaign"),
+    path("wa/campaigns/presets/", wa.WaCampaignPresetsView.as_view(), name="wa-campaign-presets"),
+    path("wa/campaigns/<int:pk>/path/", wa.WaCampaignPathView.as_view(), name="wa-campaign-path"),
+    path("wa/campaigns/<int:pk>/schedule/", wa.WaCampaignScheduleView.as_view(), name="wa-campaign-schedule"),
     path("wa/campaigns/<int:pk>/<slug:action>/", wa.WaCampaignActionView.as_view(), name="wa-campaign-action"),
     path("wa/templates/", wa.WaTemplateListView.as_view(), name="wa-templates"),
     path("wa/templates/reach/", wa.WaTemplateReachView.as_view(), name="wa-template-reach"),
@@ -44,4 +47,5 @@ urlpatterns = [
     path("wa/tags/<int:pk>/", wa.WaTagDetailView.as_view(), name="wa-tag"),
     path("wa/templates/<int:pk>/media/", wa.WaTemplateMediaView.as_view(), name="wa-template-media"),
     path("wa/analytics/", wa.WaAnalyticsView.as_view(), name="wa-analytics"),
+    path("wa/analytics/steps/", wa.WaAnalyticsStepsView.as_view(), name="wa-analytics-steps"),
 ]

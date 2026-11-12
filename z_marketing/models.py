@@ -401,6 +401,17 @@ class WaCampaign(models.Model):
     plan = models.CharField(max_length=8, choices=Plan.choices, default=Plan.TOUCHES)
     touch3_days = models.PositiveSmallIntegerField(default=7, help_text="Days after the first message.")
     touch4_days = models.PositiveSmallIntegerField(default=60, help_text="Days after the first message.")
+
+    class Engine(models.TextChoices):
+        """slots: the touches / ninety code above (wa_flow.py, whatsapp.py), unchanged. path: the step-by-step path in
+        `path` (wa_paths.py). Existing campaigns stay on slots until `manage.py wa_paths --convert` switches them."""
+
+        SLOTS = "slots", "Slots (the old engine)"
+        PATH = "path", "Step-by-step path"
+
+    engine = models.CharField(max_length=5, choices=Engine.choices, default=Engine.SLOTS)
+    # {"v": 1, "lanes": {"main": [...], "yes": [...], "notnow": [...], "stop": [...]}}: wa_path_model.py
+    path = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -488,6 +499,13 @@ class WaContact(models.Model):
     testimonial = models.CharField(max_length=14, choices=Testimonial.choices, default="", blank=True)
     paused_until = models.DateField(null=True, blank=True)
     added_by = models.EmailField(blank=True)
+    # Where the contact is on a "path" campaign's steps (wa_paths.py); blank on slots campaigns and before they start.
+    lane = models.CharField(max_length=8, blank=True, default="")  # main, yes, notnow, stop
+    step_id = models.CharField(max_length=24, blank=True, default="")
+    step_due = models.DateTimeField(null=True, blank=True)  # the planned time of the step's next action (before the window)
+    step_entered = models.DateTimeField(null=True, blank=True)
+    # The engine's bookkeeping: the campaign the position belongs to, the group cursor, where they left the main lane...
+    path_state = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -517,6 +535,10 @@ class WaMessage(models.Model):
     text = models.TextField(max_length=2000)
     # The language a templated message went out in (en or hi); "" for older rows and their messages.
     language = models.CharField(max_length=2, blank=True, default="")
+    # Path campaigns (wa_paths.py): the campaign and the step this message completed, for the numbers per step.
+    campaign = models.ForeignKey(WaCampaign, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    step_id = models.CharField(max_length=24, blank=True, default="")
+    lane = models.CharField(max_length=8, blank=True, default="")
     at = models.DateTimeField(auto_now_add=True, db_index=True)
     by = models.EmailField(blank=True)
 

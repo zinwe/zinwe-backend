@@ -12,6 +12,9 @@ and due `day` days after the YES.
 
 Campaigns with plan "ninety" (the 100 Reviews campaign) follow wa_flow.py instead: category templates by day, then the
 YES path by Track.
+
+Campaigns with engine "path" (the step-by-step builder, 11 Nov 2026) follow wa_paths.py: the queue, drafts, sends,
+replies and the reply buttons hand path contacts to it. Everything else here is unchanged for slots campaigns.
 """
 from __future__ import annotations
 
@@ -26,7 +29,7 @@ from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 
-from . import wa_conditions, wa_flow
+from . import wa_conditions, wa_flow, wa_paths
 from .contact_file import MAX_BYTES, MAX_ROWS, FileProblem, _read_rows
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
 
@@ -399,6 +402,10 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
         template = WaTemplate.objects.filter(pk=template_id).first()
         if template is None:
             raise WaError("That template no longer exists.")
+    elif wa_paths.on_path(contact) and kind in ("flow", "first", "followup", "touch3", "touch4", "nurture"):
+        template, note = wa_paths.due_template(contact)
+        if template is None:
+            raise WaError("Set the contact's Track first." if note == "set_track" else "Nothing is due for this contact.")
     elif kind == "flow":
         template, note = wa_flow.next_for(contact, today())
         if template is None:
@@ -412,6 +419,8 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
             wa_flow.check_sendable(contact, template)
         except wa_flow.FlowError as exc:
             raise WaError(str(exc)) from exc
+    if not template.category and wa_paths.on_path(contact):
+        template = _in_language(template, language_for(contact))  # an older template on a path: its twin, as slots does
     language = language_for(contact) if template.category else template.language
     base = fill(wa_flow.text_in(template, language), contact, language)
     last = contact.messages.filter(kind=Kind.THEIRS).last()
@@ -435,7 +444,8 @@ def draft(contact: WaContact, kind: str, template_id: int | None = None) -> dict
 
 def _sent_today(campaign: WaCampaign | None = None) -> int:
     """Cold messages sent today: first, follow-up, touches, one-offs, and 90-day Intro."""
-    q = WaMessage.objects.filter(Q(kind__in=COLD) | Q(kind=Kind.FLOW, template__category=WaTemplate.Category.OUTREACH), at__date=today())
+    q = WaMessage.objects.filter(Q(kind__in=COLD) | Q(kind=Kind.FLOW, template__category=WaTemplate.Category.OUTREACH) | Q(lane="main"),
+                                 at__date=today())
     return q.filter(contact__campaign=campaign).count() if campaign else q.count()
 
 
@@ -448,12 +458,14 @@ def queue() -> list[dict[str, Any]]:
     and first messages in live campaigns, within each campaign's daily limit. 90-day campaigns: wa_flow.queue.
     """
     now = today()
-    room = {c.id: max(0, c.daily_limit - _sent_today(c)) for c in WaCampaign.objects.filter(plan=WaCampaign.Plan.NINETY)}
+    slots = WaCampaign.objects.exclude(engine=WaCampaign.Engine.PATH)
+    room = {c.id: max(0, c.daily_limit - _sent_today(c)) for c in slots.filter(plan=WaCampaign.Plan.NINETY)}
     out: list[dict[str, Any]] = wa_flow.queue(now, room)
     ninety = WaCampaign.Plan.NINETY
     warm = (
         WaContact.objects.filter(status__in=[Status.INTERESTED, Status.SIGNED], yes_date__isnull=False, needs_reply=False)
         .exclude(campaign__plan=ninety)
+        .exclude(campaign__engine=WaCampaign.Engine.PATH)
         .exclude(paused_until__gt=now)
         .select_related("campaign")
         .order_by("yes_date", "id")
@@ -462,7 +474,7 @@ def queue() -> list[dict[str, Any]]:
         template = next_nurture(contact)
         if template is not None and contact.yes_date + timedelta(days=template.day) <= now:
             out.append({"contact": contact, "kind": "nurture", "template": template.name})
-    for c in WaCampaign.objects.filter(status=WaCampaign.Status.LIVE).exclude(plan=ninety):
+    for c in slots.filter(status=WaCampaign.Status.LIVE).exclude(plan=ninety):
         room = max(0, c.daily_limit - _sent_today(c))
         due = c.contacts.filter(opted_in=True).exclude(paused_until__gt=now)
         touches = due.filter(status=Status.MESSAGED, step__in=[1, 2, 3], next_date__lte=now, needs_reply=False)
@@ -475,7 +487,7 @@ def queue() -> list[dict[str, Any]]:
                 continue
             out.append({"contact": contact, "kind": kind})
             room -= 1
-    return out
+    return out + wa_paths.queue()
 
 
 def replies() -> list[WaContact]:
@@ -499,21 +511,37 @@ def mark_sent(contact: WaContact, kind: str, text: str, actor: str, template_id:
     picked = WaTemplate.objects.filter(pk=template_id).select_related("coupon").first() if template_id else None
     if template_id and picked is None:
         raise WaError("That template no longer exists.")
+    if wa_paths.on_path(contact) and (kind not in ("reply", "custom") or (picked is not None and picked.category)):
+        # A path campaign (wa_paths.py): recorded as below, then it moves the path when it is the step's message.
+        return wa_paths.record_sent(contact, kind, text, actor, picked)
     if kind == "flow" or (picked is not None and picked.category):
         # A 90-day campaign message, or a category template sent as a reply or one-off: it moves the path.
         if picked is None or not picked.category:
             raise WaError("Pick the campaign template this message came from.")
-        try:
-            wa_flow.check_sendable(contact, picked)
-        except wa_flow.FlowError as exc:
-            raise WaError(str(exc)) from exc
-        WaMessage.objects.create(contact=contact, kind=Kind.FLOW, text=text[:2000], by=actor, template=picked,
-                                 language=language_for(contact))
-        if not contact.lang:
-            contact.lang = language_for(contact)
-        wa_flow.record_send(contact, picked, today())
-        contact.save()
+        _record_flow(contact, picked, text, actor)
         return contact
+    _record_legacy(contact, kind, text, actor)
+    return contact
+
+
+def _record_flow(contact: WaContact, picked: WaTemplate, text: str, actor: str) -> WaMessage:
+    """A category template sent: the message, and what it changes on the contact (wa_flow.record_send)."""
+    try:
+        wa_flow.check_sendable(contact, picked)
+    except wa_flow.FlowError as exc:
+        raise WaError(str(exc)) from exc
+    msg = WaMessage.objects.create(contact=contact, kind=Kind.FLOW, text=text.strip()[:2000], by=actor, template=picked,
+                                   language=language_for(contact))
+    if not contact.lang:
+        contact.lang = language_for(contact)
+    wa_flow.record_send(contact, picked, today())
+    contact.save()
+    return msg
+
+
+def _record_legacy(contact: WaContact, kind: str, text: str, actor: str) -> WaMessage:
+    """An older-template message (first, follow-up, touches, after-YES, a reply, a one-off) and its sequence fields."""
+    text = text.strip()
     c = contact.campaign
     if kind == "nurture":
         template = next_nurture(contact)
@@ -521,7 +549,7 @@ def mark_sent(contact: WaContact, kind: str, text: str, actor: str, template_id:
             raise WaError("No after-YES message is left for this contact.")
         contact.nurture_day = template.day
     stored = Kind.TOUCH if kind in ("touch3", "touch4") else kind
-    WaMessage.objects.create(contact=contact, kind=stored, text=text[:2000], by=actor)
+    msg = WaMessage.objects.create(contact=contact, kind=stored, text=text[:2000], by=actor)
     start = contact.first_sent or today()
     if kind == "first":
         contact.status, contact.step, contact.first_sent = Status.MESSAGED, 1, today()
@@ -540,7 +568,22 @@ def mark_sent(contact: WaContact, kind: str, text: str, actor: str, template_id:
     elif kind in ("reply", "custom"):  # a one-off message answers them too, and never moves the sequence
         contact.needs_reply = False
     contact.save()
-    return contact
+    return msg
+
+
+def _record_older(contact: WaContact, template: WaTemplate, text: str, actor: str) -> WaMessage:
+    """An older template on a path campaign that isn't one of the campaign's own slots: an after-YES message keeps
+    nurture_day, anything else is a campaign message. Either answers them."""
+    nurture = template.kind == WaTemplate.Kind.NURTURE
+    msg = WaMessage.objects.create(contact=contact, kind=Kind.NURTURE if nurture else Kind.FLOW, text=text.strip()[:2000],
+                                   by=actor, template=template, language=template.language)
+    if nurture:
+        contact.nurture_day = max(contact.nurture_day, template.day)
+    if not contact.lang:
+        contact.lang = template.language or "en"
+    contact.needs_reply = False
+    contact.save()
+    return msg
 
 
 @transaction.atomic
@@ -559,6 +602,8 @@ def record_reply(contact: WaContact, text: str, actor: str) -> WaContact:
     if re.fullmatch(r"\W*(stop|unsubscribe|band karo|mat bhejo)\W*", text, flags=re.I):
         _stop(contact, "Replied STOP")
     contact.save()
+    if wa_paths.on_path(contact):
+        wa_paths.after_reply(contact)
     return contact
 
 
@@ -618,6 +663,8 @@ def act(contact: WaContact, action: str, note: str = "") -> WaContact:
     elif action == "resume":
         contact.paused_until = None
     contact.save()
+    if wa_paths.on_path(contact):
+        wa_paths.after_act(contact, action)
     return contact
 
 
