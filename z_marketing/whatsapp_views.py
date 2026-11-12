@@ -14,7 +14,8 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 
 from . import (
-    wa_conditions, wa_flow, wa_media, wa_path_model, wa_paths, wa_paths_convert, wa_settings, wa_structure, wa_templates, wa_today, whatsapp,
+    wa_analytics, wa_conditions, wa_flow, wa_media, wa_path_model, wa_paths, wa_paths_convert, wa_settings, wa_structure, wa_templates,
+    wa_today, whatsapp,
 )
 from .contact_file import FileProblem
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTag, WaTemplate
@@ -952,17 +953,43 @@ class WaCampaignPresetsView(Staff):
 
 
 class WaAnalyticsStepsView(Staff):
-    """GET ?campaign=<id>: {campaign, name, engine, steps: [{step_id, lane, k, label, here, sent, replies,
-    reply_rate}]} in path order."""
+    """GET ?campaign=<id>[&period=all|30|7]: {campaign, name, engine, period, steps: [{step_id, lane, k, label, here,
+    sent, replies, reply_rate, went_on}]} in path order. With a period of 30 or 7 days, sent, replies and went_on count
+    only the messages sent in it; `here` is always now."""
 
     def get(self, request: Request) -> Response:
         raw = request.query_params.get("campaign")
         if not str(raw or "").isdigit():
             return Response({"campaign": ["Pick a campaign."]}, status=status.HTTP_400_BAD_REQUEST)
+        period = request.query_params.get("period") or "all"
+        try:
+            since = wa_analytics.since_of(period)
+        except wa_analytics.PeriodError as exc:
+            return Response({"period": [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
         c = get_object_or_404(WaCampaign, pk=int(raw))
         if c.engine != WaCampaign.Engine.PATH:
             preview = WaCampaign(pk=c.pk, name=c.name, path=wa_path_model.clean(wa_paths_convert.build(c)))
-            steps = [{**r, "here": 0, "sent": 0, "replies": 0, "reply_rate": 0} for r in wa_paths.steps_view(preview)]
+            steps = [{**r, "here": 0, "sent": 0, "replies": 0, "reply_rate": 0, "went_on": 0} for r in wa_paths.steps_view(preview)]
         else:
-            steps = wa_paths.steps_view(c)
-        return Response({"campaign": c.pk, "name": c.name, "engine": c.engine, "steps": steps})
+            numbers = wa_analytics.step_numbers(c, since)
+            steps = []
+            for r in wa_paths.steps_view(c):
+                n = numbers.get(r["step_id"], wa_analytics.BLANK)
+                steps.append({**r, **(n if since is not None else {}), "went_on": n["went_on"]})
+        return Response({"campaign": c.pk, "name": c.name, "engine": c.engine, "period": period, "steps": steps})
+
+
+class WaAnalyticsViewView(Staff):
+    """GET ?campaign=<id>|all&period=all|30|7 (both optional; all and all by default): the Analytics tab for one
+    campaign or all of them in one period. Counting rules: wa_analytics.py. {campaign, period, since, today, kpis,
+    funnel, days, campaigns, steps, templates, segments, languages, slots, codes}"""
+
+    def get(self, request: Request) -> Response:
+        raw = request.query_params.get("campaign") or "all"
+        if raw != "all" and not raw.isdigit():
+            return Response({"campaign": ["Pick a campaign or all."]}, status=status.HTTP_400_BAD_REQUEST)
+        period = request.query_params.get("period") or "all"
+        if period not in wa_analytics.PERIODS:
+            return Response({"period": ["Pick all, 30 or 7."]}, status=status.HTTP_400_BAD_REQUEST)
+        campaign = None if raw == "all" else get_object_or_404(WaCampaign, pk=int(raw))
+        return Response(wa_analytics.view(campaign, period))

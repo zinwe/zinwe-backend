@@ -252,6 +252,45 @@ is `next_date`). `lane` and `step_id` are read only.
 - Without `?campaign` the response is a 400.
 - On a slots campaign, it lists the steps of the path it would convert to, with zeros.
 - After `--convert`, earlier messages are tagged with the step that sends that template now.
+- wa4 (12 Nov 2026): every step also has `went_on` (messages after which the contact took the step the message is
+  for: said YES after an Intro, set a Track after Engage, paid after an Offer). Optional `&period=all|30|7`: with 30
+  or 7, `sent`, `replies`, `reply_rate` and `went_on` count only the messages sent in that period; `here` is always
+  now. The response adds `"period"`. A bad period is a 400.
+
+### `GET /analytics/view/?campaign=<id>|all&period=all|30|7` (wa4, the Analytics tab)
+Both parameters are optional (`all` and `all`). Counting rules are in `z_marketing/wa_analytics.py`; in short:
+people = those whose first message from the campaign went out in the period (what they did next counts to today);
+a reply = they wrote within 3 days of one of our messages; the splits by template, step, slot and code count the
+messages sent in the period. `GET /analytics/` is unchanged. Example from the local DB (fake sample data, lists cut
+to one row):
+```json
+{"campaign": 3, "period": "7", "since": "2026-11-06", "today": "2026-11-12",
+ "kpis": {"people": 25, "messages": 88, "replied": 8, "yes": 4, "track": 2, "first_pc": 2, "paid": 2, "paid_pcs": 20, "stopped": 0},
+ "funnel": [{"key": "messaged", "label": "Messaged", "people": 25}, {"key": "replied", "label": "Replied", "people": 8},
+            {"key": "yes", "label": "Said YES", "people": 4}, {"key": "track", "label": "Track set", "people": 2},
+            {"key": "first_pc", "label": "First PC", "people": 2}, {"key": "paid", "label": "Paid", "people": 2}],
+ "days": [{"date": "2026-11-12", "sent": 7, "replies": 0}],
+ "campaigns": [{"id": 3, "name": "Diwali to Republic Day (sample)", "status": "live", "engine": "path", "people": 25, "replied": 8}],
+ "steps": [{"step_id": "m1", "lane": "main", "k": "send", "label": "Day 1 · Opener", "title": "Opener", "day": 1, "here": 14,
+            "sent": 25, "replies": 7, "reply_rate": 28, "went_on": 4}],
+ "templates": [{"id": 80, "name": "Intro · Question · day 10", "category": "outreach", "type_name": "Question", "version": "A",
+                "version_of": null, "archived": false, "sends": 8, "replies": 3, "reply_rate": 38, "went_on": 1, "languages": ["en", "hi"]}],
+ "segments": [{"segment": "S1 · CA firms", "cities": ["Jaipur", "Delhi"], "people": 12, "replied": 5, "yes": 3, "paid": 2}],
+ "languages": [{"language": "hi", "label": "Hinglish", "people": 19, "messages": 38, "replied": 7, "yes": 3, "stopped": 0}],
+ "slots": [{"slot": "10-12", "label": "10–12", "name": "Morning", "sent": 31, "replied": 11, "same_day": 4, "first_reply_secs": 74362}],
+ "codes": [{"code": "ZWTESTCODE1", "percent_off": 15, "status": "live", "pack": "Startup pack", "stage": 1, "event": false,
+            "starts_on": "2026-11-01", "ends_on": "2027-02-12", "shown_to": 1, "replied": 0, "used": 1, "pcs_paid": 10}]}
+```
+- `kpis.paid_pcs`: the PCs the plan behind each paid person's pack covers (Startup pack = `startups`, Team pack =
+  `teams`, `Plan.max_devices`). A WhatsApp contact isn't linked to a company, so this is the pack, not a device count.
+- `steps`: message steps only (`send`, `group`), in path order; people waiting after a message count in its `here`.
+  `null` for all campaigns and for a campaign on the old slots engine.
+- `slots`: India time 10–12, 12–14, 14–17, 17–19, plus `other` only when something went out outside them.
+  `same_day` = replied the same India date; `first_reply_secs` averages over the messages that got a reply.
+- `codes`: every code a WhatsApp template carries, plus WhatsApp-channel codes. `shown_to` and `replied` are people who
+  got a message carrying it (in this campaign and period); `used` = the code's pending or paid uses in the period from
+  any channel (a use belongs to a company, not a contact); `pcs_paid` = `max_devices` of the plans of the paid uses.
+- `?period=` other than `all`, `30`, `7`, or a `campaign` that isn't a number or `all`, is a 400; an unknown id is a 404.
 
 ## 4. Converting the old campaigns: `manage.py wa_paths`
 ```

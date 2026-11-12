@@ -49,4 +49,5 @@ urlpatterns = [
     path("wa/analytics/", wa.WaAnalyticsView.as_view(), name="wa-analytics"),
     path("wa/analytics/steps/", wa.WaAnalyticsStepsView.as_view(), name="wa-analytics-steps"),
     path("wa/settings/", wa_settings_views.WaSettingsView.as_view(), name="wa-settings"),
+    path("wa/analytics/view/", wa.WaAnalyticsViewView.as_view(), name="wa-analytics-view"),
 ]
