@@ -48,4 +48,5 @@ urlpatterns = [
     path("wa/templates/<int:pk>/media/", wa.WaTemplateMediaView.as_view(), name="wa-template-media"),
     path("wa/analytics/", wa.WaAnalyticsView.as_view(), name="wa-analytics"),
     path("wa/analytics/steps/", wa.WaAnalyticsStepsView.as_view(), name="wa-analytics-steps"),
+    path("wa/analytics/view/", wa.WaAnalyticsViewView.as_view(), name="wa-analytics-view"),
 ]
