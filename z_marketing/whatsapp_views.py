@@ -335,7 +335,7 @@ def campaign_numbers(c: WaCampaign) -> dict[str, int]:
     """For the campaign list: people, messages we sent, people who replied (and the % of those messaged), YES, paid."""
     contacts = c.contacts.all()
     theirs = WaMessage.Kind.THEIRS
-    messaged = contacts.filter(messages__isnull=False).exclude(messages__kind=theirs).distinct().count()
+    messaged = WaMessage.objects.filter(contact__campaign=c).exclude(kind=theirs).values("contact_id").distinct().count()
     replies = contacts.filter(messages__kind=theirs).distinct().count()
     return {
         "contacts": contacts.count(),

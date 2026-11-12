@@ -11,9 +11,11 @@ The rules:
 
 - Today is by day. A step is due when its due date (after the window) is today or earlier.
 - One message per contact per day, as today. The daily limit counts main-lane messages (people who haven't replied).
-- Waits count on the lane's calendar: from the planned day of the message before, not from when staff pressed Mark as
-  sent, so a late message doesn't push the later ones back. The calendar starts at the first message actually sent,
-  and starts again after a step whose length isn't known in advance (an answer, the Track, a goal, a goto, a lane).
+- Main lane waits count on its calendar: from the planned day of the message before, not from when staff pressed Mark
+  as sent, so a late Intro message doesn't push the later ones back (as the ninety and touches plans count from the
+  first message). The calendar starts at the first message actually sent, and again after a step whose length isn't
+  known in advance (an answer, the Track, a goal, a goto). In a reply lane every wait counts from when the message
+  before it actually went (a conversation: "3 days after the setup steps" means after they got them).
 - Window (Mon-Sat 10:00-19:00): a message due on a Sunday moves to Monday; the calendar after it doesn't move.
 - Late Intro messages never pile up: when the next Intro message is already due too, the late one is skipped (as the
   ninety plan does). Messages after a reply are never skipped.
@@ -404,7 +406,7 @@ class Ctx:
 
     def consume(self, s: dict[str, Any], g: dict[str, Any], t: WaTemplate, at: datetime | None) -> None:
         """A group item went (at = when it was sent) or was skipped (at None)."""
-        base = self.due if (at is None or self.st.get("cal")) else at
+        base = self.due if (at is None or (self.st.get("cal") and self.lane == "main")) else at
         g["cursor"] = max(g["cursor"], t.step)
         g["done"] += 1
         g["last"] = _iso(base)
@@ -539,7 +541,7 @@ class Ctx:
         if s["k"] == "group":
             self.consume(s, self.group_state(s), t, at)
         elif s["k"] == "send":
-            base = self.due if (self.st.get("cal") and self.due) else at
+            base = self.due if (self.st.get("cal") and self.due and self.lane == "main") else at
             self.enter_next(base, True, bool(self.st.get("win")), after_message=True)
 
     def answered(self) -> None:
