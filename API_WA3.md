@@ -273,3 +273,22 @@ manage.py wa_paths --revert <id>                        back on slots (the path 
   daily limit, needs_reply and the 30-day pause are gates both engines share, so they are not compared.
 - A paused or draft ninety campaign with YES contacts counts as a difference: slots still sends their YES path, and a
   path campaign doesn't.
+
+## 5. Settings: `GET` / `PUT /api/admin/marketing/wa/settings/` (wa4, 12 Nov 2026)
+Staff only. One row (`WaSettings` pk 1, migration `0027_wa_settings`); until staff save it, GET returns the defaults,
+which are what the code did before. PUT takes any of the fields (the rest stay) and returns the saved settings, or a
+400 `{field: message}` with everything to fix; nothing is half-saved. Live campaigns follow a change from their next
+send. Logic and the list of where each field is used: `z_marketing/wa_settings.py`.
+```json
+{"send_days": [0, 1, 2, 3, 4, 5], "send_from": "10:00", "send_to": "19:00", "skip_holidays": false,
+ "new_per_day": 15, "per_number_day": 120, "per_person_day": 1, "min_intro_wait": 1, "max_days": 90,
+ "slots": ["10-12", "12-14", "14-17", "17-19"], "stop_words": ["STOP", "unsubscribe", "band karo", "mat bhejo"],
+ "stop_pause_pct": 0, "language": "en", "switch_en": false, "claude_read": true, "claude_draft": true,
+ "claude_track": true, "wa_number": "", "wa_name": "", "discount_max": 40, "updated_at": null, "updated_by": ""}
+```
+- `send_days`: 0 = Monday … 6 = Sunday, at least one. `send_from` < `send_to`, "HH:MM", India time.
+- `new_per_day` 1–50, `per_number_day` 1–500, `per_person_day` 1 | 2, `min_intro_wait` 1 | 2 | 3 days,
+  `max_days` 30 | 60 | 90, `stop_pause_pct` 0 (never) | 2 | 3 | 5, `discount_max` 1–50, `language` en | hi | ab.
+- `stop_words`: STOP always stays; at most 30, each under 40 letters; repeats (any case) are dropped.
+- `slots`, `switch_en`, `claude_read`, `claude_track`, `wa_number`, `wa_name` are stored for the UI; the engine
+  doesn't read them yet.

@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views, whatsapp_views as wa
+from . import views, wa_settings_views, whatsapp_views as wa
 
 app_name = "z_marketing_staff"
 
@@ -48,4 +48,5 @@ urlpatterns = [
     path("wa/templates/<int:pk>/media/", wa.WaTemplateMediaView.as_view(), name="wa-template-media"),
     path("wa/analytics/", wa.WaAnalyticsView.as_view(), name="wa-analytics"),
     path("wa/analytics/steps/", wa.WaAnalyticsStepsView.as_view(), name="wa-analytics-steps"),
+    path("wa/settings/", wa_settings_views.WaSettingsView.as_view(), name="wa-settings"),
 ]

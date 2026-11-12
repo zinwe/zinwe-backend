@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import secrets
+from datetime import time
 
 from django.conf import settings
 from django.db import models
@@ -552,3 +553,65 @@ class WaBlock(models.Model):
     phone = models.CharField(max_length=16, unique=True)
     reason = models.CharField(max_length=120)
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+def _wa_days() -> list[int]:
+    return [0, 1, 2, 3, 4, 5]  # Mon-Sat (Python weekday: Monday is 0)
+
+
+def _wa_slots() -> list[str]:
+    return ["10-12", "12-14", "14-17", "17-19"]
+
+
+def _wa_stop_words() -> list[str]:
+    return ["STOP", "unsubscribe", "band karo", "mat bhejo"]
+
+
+class WaSettings(models.Model):
+    """
+    WhatsApp Settings (Marketing -> WhatsApp -> Settings, 12 Nov 2026): one row (pk 1) staff change in the admin.
+    The defaults are what the code did before this row existed. Read it through wa_settings.current().
+    """
+
+    class Language(models.TextChoices):
+        EN = "en", "English"
+        HI = "hi", "Hinglish first"
+        SPLIT = "ab", "Half and half, to compare"
+
+    # Days and hours: when messages may go out (India time). Waits that keep to the window move into it.
+    send_days = models.JSONField(default=_wa_days)
+    send_from = models.TimeField(default=time(10, 0))
+    send_to = models.TimeField(default=time(19, 0))
+    skip_holidays = models.BooleanField(default=False)
+    # Daily limits
+    new_per_day = models.PositiveSmallIntegerField(default=15)  # a new campaign's daily limit
+    per_number_day = models.PositiveSmallIntegerField(default=120)  # Intro messages a day, all campaigns together
+    per_person_day = models.PositiveSmallIntegerField(default=1)
+    min_intro_wait = models.PositiveSmallIntegerField(default=1)  # days between Intro messages, at least
+    max_days = models.PositiveSmallIntegerField(default=90)  # longest campaign; then no reply = No reply
+    # Send slots Today groups sends into (stored; Today reads them)
+    slots = models.JSONField(default=_wa_slots)
+    # STOP
+    stop_words = models.JSONField(default=_wa_stop_words)
+    stop_pause_pct = models.PositiveSmallIntegerField(default=0)  # 0 = never pause a campaign for its stops
+    # Language
+    language = models.CharField(max_length=2, choices=Language.choices, default=Language.EN)
+    switch_en = models.BooleanField(default=False)
+    # Claude (it never sends)
+    claude_read = models.BooleanField(default=True)
+    claude_draft = models.BooleanField(default=True)
+    claude_track = models.BooleanField(default=True)
+    # The number
+    wa_number = models.CharField(max_length=24, blank=True, default="")
+    wa_name = models.CharField(max_length=80, blank=True, default="")
+    # Offers
+    discount_max = models.PositiveSmallIntegerField(default=40)
+    updated_at = models.DateTimeField(null=True, blank=True)
+    updated_by = models.CharField(max_length=120, blank=True, default="")
+
+    class Meta:
+        verbose_name = "WhatsApp settings"
+        verbose_name_plural = "WhatsApp settings"
+
+    def __str__(self) -> str:
+        return "WhatsApp settings"

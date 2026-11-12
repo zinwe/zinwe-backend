@@ -29,7 +29,7 @@ from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 
-from . import wa_conditions, wa_flow, wa_paths
+from . import wa_conditions, wa_flow, wa_paths, wa_settings
 from .contact_file import MAX_BYTES, MAX_ROWS, FileProblem, _read_rows
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTemplate
 
@@ -364,8 +364,9 @@ SYSTEM = (
 
 
 def _claude(template_text: str, contact: WaContact, their_last: str) -> str | None:
-    """One personalised draft from Claude, or None (no key, an error, or a refusal): the template is used instead."""
-    if not settings.ANTHROPIC_API_KEY:
+    """One personalised draft from Claude, or None (no key, Settings -> Claude -> Draft the answer off, an error, or a
+    refusal): the template is used instead."""
+    if not settings.ANTHROPIC_API_KEY or not wa_settings.current().claude_draft:
         return None
     try:
         import anthropic
@@ -456,6 +457,8 @@ def queue() -> list[dict[str, Any]]:
     """
     What is due today: after-YES messages first (no daily limit: these people asked for them), then no-reply touches
     and first messages in live campaigns, within each campaign's daily limit. 90-day campaigns: wa_flow.queue.
+    Intro messages from every campaign together stop at the number's daily limit (Settings: messages a day from this
+    number), less those already sent today.
     """
     now = today()
     slots = WaCampaign.objects.exclude(engine=WaCampaign.Engine.PATH)
@@ -487,7 +490,28 @@ def queue() -> list[dict[str, Any]]:
                 continue
             out.append({"contact": contact, "kind": kind})
             room -= 1
-    return out + wa_paths.queue()
+    return _number_limit(out + wa_paths.queue())
+
+
+def _is_cold(row: dict[str, Any]) -> bool:
+    """An Intro message (to someone who hasn't replied): what the number's daily limit counts."""
+    if row.get("lane"):
+        return row["lane"] == "main"
+    if row["kind"] in NEXT_KIND.values():
+        return True
+    return row["kind"] == "flow" and row["contact"].yes_date is None
+
+
+def _number_limit(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    room = max(0, wa_settings.current().per_number_day - _sent_today())
+    out = []
+    for row in rows:
+        if _is_cold(row):
+            if room <= 0:
+                continue
+            room -= 1
+        out.append(row)
+    return out
 
 
 def replies() -> list[WaContact]:
@@ -599,7 +623,7 @@ def record_reply(contact: WaContact, text: str, actor: str) -> WaContact:
     if contact.campaign_status in (CS.NONE, CS.MESSAGED, CS.NO_REPLY):
         contact.campaign_status = CS.REPLIED
     contact.needs_reply, contact.next_date = True, None
-    if re.fullmatch(r"\W*(stop|unsubscribe|band karo|mat bhejo)\W*", text, flags=re.I):
+    if wa_settings.is_stop(text):  # Settings: Words that stop everything
         _stop(contact, "Replied STOP")
     contact.save()
     if wa_paths.on_path(contact):
@@ -611,6 +635,28 @@ def _stop(contact: WaContact, reason: str) -> None:
     contact.status, contact.next_date, contact.needs_reply = Status.STOP, None, False
     contact.campaign_status = CS.OPTED_OUT
     WaBlock.objects.get_or_create(phone=contact.phone, defaults={"reason": reason})
+    _pause_on_stops(contact)
+
+
+STOP_SAMPLE = 50  # people messaged in a campaign before its share of stops can pause it
+
+
+def _pause_on_stops(contact: WaContact) -> None:
+    """Settings -> Asked to stop: pause at. When more than that share of the people a live campaign messaged asked to
+    stop (counting this one, once at least STOP_SAMPLE were messaged), the campaign pauses until staff start it again."""
+    pct = wa_settings.current().stop_pause_pct
+    c = contact.campaign if contact.campaign_id else None
+    if not pct or c is None or c.status != WaCampaign.Status.LIVE:
+        return
+    people = c.contacts.filter(step__gte=1)
+    messaged = people.count()
+    if messaged < STOP_SAMPLE:
+        return
+    stops = people.filter(status=Status.STOP).exclude(pk=contact.pk).count() + 1
+    if stops * 100 > pct * messaged:
+        c.status = WaCampaign.Status.PAUSED
+        c.save(update_fields=["status"])
+        logger.info("WhatsApp campaign %s paused: %s of %s people asked to stop", c.pk, stops, messaged)
 
 
 @transaction.atomic

@@ -19,7 +19,8 @@ Each step is {"id": "m1", "k": <kind>, ...}:
 
 Hard errors (a 400 on every save): the shape, unknown kinds, duplicate ids, a template id that doesn't exist, a wait
 that isn't above 0. Issues (saved on a draft, refused on a live or paused campaign, and they stop Start): a lane that
-doesn't end in end, goal or goto, an empty lane, a send with no template, a goto to a step that isn't there.
+doesn't end in end, goal or goto, an empty lane, a send with no template, a goto to a step that isn't there, a wait
+between Intro messages shorter than Settings allows (shortest wait between Intro messages).
 """
 from __future__ import annotations
 
@@ -262,11 +263,24 @@ def issues(path: dict[str, Any], live: bool = False) -> list[dict[str, Any]]:
                     add("error", lane, s["id"], "Go to Start would add them again. Pick a step after it.")
             elif s["k"] == "group" and s["category"] == Cat.QUICK:
                 add("error", lane, s["id"], "Quick replies answer a message; they can't be a group.")
-    days = plan_days(path)
+    from . import wa_settings
+
+    rules = wa_settings.current()
+    shortest = rules.min_intro_wait
+    started = False
     for s in L["main"]:
-        last = days.get(s["id"], {}).get("last")
-        if s["k"] == "group" and last and last > 90:
-            add("warn", "main", s["id"], f"Runs to day {last}, past day 90: shorten a wait.")
+        if s["k"] in ("send", "group"):
+            if s["k"] == "group" and s["every"] < shortest and s["count"] > 1:
+                add("error", "main", s["id"], f"These go {s['every']} day{'s' if s['every'] > 1 else ''} apart. Intro messages wait at least {shortest} day{'s' if shortest > 1 else ''} (Settings).")
+            started = True
+        elif s["k"] in ("wait", "reply") and started and hours(s) < shortest * 24:
+            add("error", "main", s["id"], f"Intro messages wait at least {shortest} day{'s' if shortest > 1 else ''} (Settings). Make this wait longer.")
+    days = plan_days(path)
+    limit = rules.max_days
+    for s in L["main"]:
+        last = days.get(s["id"], {}).get("last") or days.get(s["id"], {}).get("day")
+        if s["k"] in ("group", "send") and last and last > limit:
+            add("warn", "main", s["id"], f"Runs to day {last}, past day {limit}: shorten a wait. After day {limit} no reply means No reply.")
     return out
 
 

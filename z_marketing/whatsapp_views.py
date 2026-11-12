@@ -13,7 +13,9 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from . import wa_conditions, wa_flow, wa_media, wa_path_model, wa_paths, wa_paths_convert, wa_structure, wa_templates, whatsapp
+from . import (
+    wa_conditions, wa_flow, wa_media, wa_path_model, wa_paths, wa_paths_convert, wa_settings, wa_structure, wa_templates, whatsapp,
+)
 from .contact_file import FileProblem
 from .models import WaBlock, WaCampaign, WaContact, WaMessage, WaTag, WaTemplate
 from .views import Staff
@@ -165,6 +167,10 @@ class WaTemplateSerializer(serializers.ModelSerializer):
         coupon = attrs.get("coupon")
         if coupon is not None and coupon.status() in ("ended", "cancelled") and (self.instance is None or self.instance.coupon_id != coupon.pk):
             errors["coupon"] = f"{coupon.code} has {coupon.status()}. Pick a code that is live or yet to start."
+        ceiling = wa_settings.current().discount_max
+        if (coupon is not None and category == Cat.OFFER and coupon.percent_off > ceiling
+                and (self.instance is None or self.instance.coupon_id != coupon.pk)):
+            errors["coupon"] = f"{coupon.code} takes {coupon.percent_off} % off. The biggest discount in a message is {ceiling} % (Settings)."
         if errors:
             raise serializers.ValidationError(errors)
         attrs["kind"] = wa_flow.kind_for(category)
@@ -422,9 +428,10 @@ class WaCampaignSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         days = [attrs.get(k, getattr(self.instance, k, d)) for k, d in (("followup_days", 3), ("touch3_days", 30), ("touch4_days", 60))]
-        if not days[0] < days[1] < days[2] <= 90:
+        last = wa_settings.current().max_days  # Settings: longest campaign
+        if not days[0] < days[1] < days[2] <= last:
             raise serializers.ValidationError(
-                "Space the messages out: follow-up, then touch 3, then touch 4, all within 90 days of the first."
+                f"Space the messages out: follow-up, then touch 3, then touch 4, all within {last} days of the first."
             )
         return attrs
 
@@ -565,6 +572,11 @@ class WaCampaignListView(Staff):
         """With `preset` (100_reviews | short | blank) or `path`: a step-by-step campaign (engine "path"); `first` is
         then optional (the path's first message, else the first Intro row). Without either: an old-style campaign."""
         body = request.data.copy()
+        rules = wa_settings.current()  # Settings: a new campaign's daily limit and language, unless the form sends them
+        if body.get("daily_limit") in (None, ""):
+            body["daily_limit"] = rules.new_per_day
+        if not body.get("language"):
+            body["language"] = rules.language
         preset, raw = body.get("preset"), body.get("path")
         path = None
         if preset or raw is not None:

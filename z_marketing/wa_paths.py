@@ -10,13 +10,16 @@ position (just added, or moved in from another campaign) starts at Start the fir
 The rules:
 
 - Today is by day. A step is due when its due date (after the window) is today or earlier.
-- One message per contact per day, as today. The daily limit counts main-lane messages (people who haven't replied).
+- One message per contact per day (Settings: one or two). The daily limit counts main-lane messages (people who haven't replied).
 - Main lane waits count on its calendar: from the planned day of the message before, not from when staff pressed Mark
   as sent, so a late Intro message doesn't push the later ones back (as the ninety and touches plans count from the
   first message). The calendar starts at the first message actually sent, and again after a step whose length isn't
   known in advance (an answer, the Track, a goal, a goto). In a reply lane every wait counts from when the message
   before it actually went (a conversation: "3 days after the setup steps" means after they got them).
-- Window (Mon-Sat 10:00-19:00): a message due on a Sunday moves to Monday; the calendar after it doesn't move.
+- Window (Settings, wa_settings.py; Mon-Sat 10:00-19:00 by default): a message due outside it moves to the next send
+  day's opening (a Sunday to Monday); the calendar after it doesn't move.
+- Longest campaign (Settings, 90 days by default): someone on the Intro path who never replied is marked No reply once
+  they pass it, at the Intro path's End.
 - Late Intro messages never pile up: when the next Intro message is already due too, the late one is skipped (as the
   ninety plan does). Messages after a reply are never skipped.
 - A send step whose template this contact already got is skipped (except Quick replies). Engage and Demo video steps
@@ -35,13 +38,13 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from django.db.models import Q
 from django.utils import timezone
 
-from . import wa_flow
+from . import wa_flow, wa_settings
 from .models import WaCampaign, WaContact, WaMessage, WaTemplate
 from .wa_path_model import LANE_NAMES, index, lanes, plan_days, type_of
 
@@ -50,7 +53,6 @@ Cat = WaTemplate.Category
 Track = WaTemplate.Track
 CS = WaContact.CampaignStatus
 Kind = WaMessage.Kind
-OPEN, CLOSE = 10, 19
 MAX_HOPS = 400
 COLD = [Kind.FIRST, Kind.FOLLOWUP, Kind.TOUCH, Kind.CUSTOM]  # whatsapp.COLD
 LANE_SHORT = {"main": "Intro", "yes": "YES", "notnow": "Not now", "stop": "STOP"}
@@ -70,7 +72,8 @@ def local(dt: datetime) -> datetime:
 
 
 def at_open(d: date) -> datetime:
-    return timezone.make_aware(datetime.combine(d, time(OPEN)))
+    """The window's opening on day d (Settings: send_from)."""
+    return timezone.make_aware(datetime.combine(d, wa_settings.opens()))
 
 
 def add(base: datetime, n: int, unit: str) -> datetime:
@@ -81,13 +84,17 @@ def add(base: datetime, n: int, unit: str) -> datetime:
 
 
 def shift(dt: datetime) -> datetime:
-    """Into the window: before 10:00 goes to 10:00, after 19:00 to the next morning, a Sunday to Monday."""
+    """Into the window (Settings): before the opening goes to the opening, after the close to the next morning, a day
+    that isn't a send day (a Sunday, a skipped holiday) to the next send day's opening."""
+    s = wa_settings.current()
     x = local(dt)
-    if x.hour < OPEN:
+    if x.time() < s.send_from:
         x = at_open(x.date())
-    elif x.hour >= CLOSE:
+    elif x.time() >= s.send_to:
         x = at_open(x.date() + timedelta(days=1))
-    if x.weekday() == 6:
+    for _ in range(21):
+        if wa_settings.is_send_day(x.date(), s):
+            break
         x = at_open(x.date() + timedelta(days=1))
     return x
 
@@ -312,7 +319,7 @@ class Ctx:
 
     def _offer_ok(self, t: WaTemplate) -> bool:
         cp = t.coupon
-        if cp is None or t.event or cp.status(self.today) != "live":
+        if cp is None or t.event or cp.status(self.today) != "live" or cp.percent_off > wa_settings.current().discount_max:
             return False
         plan = wa_flow.PACK_PLAN[self.c.pack or wa_flow.default_pack(self.c)]
         return not cp.plan_codes or plan in cp.plan_codes
@@ -463,6 +470,32 @@ class Ctx:
         elif status == "opted_out":
             self.effects["campaign_status"] = CS.OPTED_OUT
 
+    def too_long(self) -> bool:
+        """On the Intro path past the longest campaign (Settings), never having replied."""
+        c = self.c
+        if self.lane != "main" or c.first_sent is None or c.yes_date is not None or c.needs_reply or self.st.get("ended"):
+            return False
+        if c.campaign_status not in (CS.NONE, CS.MESSAGED, CS.NO_REPLY):
+            return False
+        return (self.today - c.first_sent).days + 1 > wa_settings.current().max_days
+
+    def cut(self) -> Out:
+        """No reply by the last day: they go to the Intro path's End (its No reply one first) and are marked No reply."""
+        ends = [s for s in self.L["main"] if s["k"] == "end"]
+        s = next((x for x in ends if x.get("status") == "no_reply"), ends[-1] if ends else None)
+        if s is None:
+            self.st["finished"] = True
+            if self.c.campaign_status in (CS.NONE, CS.MESSAGED):
+                self.effects["campaign_status"] = CS.NO_REPLY
+            return Out("ended")
+        self.lane, self.step_id, self.due, self.entered = "main", s["id"], None, self.now
+        self.st.pop("finished", None)
+        self.st.update(cal=False, win=False)
+        self.end(s)
+        if self.c.campaign_status in (CS.NONE, CS.MESSAGED):
+            self.effects["campaign_status"] = CS.NO_REPLY
+        return Out("ended", s)
+
     # the walk
     def run(self) -> Out:
         if not self.L["main"]:
@@ -470,6 +503,8 @@ class Ctx:
         if stopped(self.c):
             return self.to_stop()
         self.ensure()
+        if self.too_long():
+            return self.cut()
         for _ in range(MAX_HOPS):
             s = self.step()
             if s is None:
@@ -661,14 +696,17 @@ def queue(now: datetime | None = None) -> list[dict[str, Any]]:
     cache: dict[str, Any] = {}
     for camp in WaCampaign.objects.filter(engine=PATH, status=WaCampaign.Status.LIVE):
         room = max(0, camp.daily_limit - _sent_today_main(camp, today))
-        done_today = set(WaMessage.objects.filter(contact__campaign=camp, at__date=today).exclude(kind=Kind.THEIRS)
-                         .values_list("contact_id", flat=True))
+        per_person = wa_settings.current().per_person_day
+        sent_to: dict[int, int] = {}
+        for cid in (WaMessage.objects.filter(contact__campaign=camp, at__date=today).exclude(kind=Kind.THEIRS)
+                    .values_list("contact_id", flat=True)):
+            sent_to[cid] = sent_to.get(cid, 0) + 1
         contacts = (camp.contacts.filter(opted_in=True).exclude(status=WaContact.Status.STOP)
                     .exclude(campaign_status=CS.OPTED_OUT).exclude(paused_until__gt=today).select_related("campaign"))
         mine: list[tuple[datetime, int, dict[str, Any]]] = []
         for contact in contacts.order_by("step_due", "id"):
             out, ctx = settle(contact, now, cache)
-            if contact.needs_reply or contact.pk in done_today:
+            if contact.needs_reply or sent_to.get(contact.pk, 0) >= per_person:
                 continue
             if out.kind == "due":
                 row = {"contact": contact, "kind": "flow", "template": out.template, "note": ""}

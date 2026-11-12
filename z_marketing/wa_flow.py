@@ -16,7 +16,8 @@ one path, and `campaign_status` records how far it got:
     Testimonial: 14 days after their first PC, paid or free: written, then video
 
 Quick replies answer a message at any time and never move the path. STOP, "band karo" or "mat bhejo" at any point:
-Opted out, and the number is never messaged again (whatsapp._stop). At most one message per contact per day. A
+Opted out, and the number is never messaged again (whatsapp._stop). At most one message per contact per day
+(Settings: one or two), no Intro after the longest campaign (Settings: 90 days), no code above the biggest discount. A
 template is a draft until both its English and Hinglish texts are written; drafts are never sent.
 
 Nothing here sends a WhatsApp message: staff send each one themselves from the admin.
@@ -27,6 +28,7 @@ import re
 from datetime import date, timedelta
 from typing import Any
 
+from . import wa_settings
 from .models import WaCampaign, WaContact, WaMessage, WaTemplate
 
 Cat = WaTemplate.Category
@@ -173,7 +175,7 @@ def offer_for(contact: WaContact, on: date, include_events: bool = False) -> WaT
     best = None
     for t in rows.order_by("stage", "id"):
         c = t.coupon
-        if c.status(on) != "live" or (c.plan_codes and plan not in c.plan_codes):
+        if c.status(on) != "live" or (c.plan_codes and plan not in c.plan_codes) or c.percent_off > wa_settings.current().discount_max:
             continue
         if best is None or t.stage == stage:
             best = t
@@ -235,7 +237,8 @@ def next_for(contact: WaContact, on: date) -> tuple[WaTemplate | None, str]:
 
 
 def _sent_today(contact: WaContact, on: date) -> bool:
-    return contact.messages.exclude(kind=WaMessage.Kind.THEIRS).filter(at__date=on).exists()
+    """Had as many messages from us today as one person gets a day (Settings: one or two)."""
+    return contact.messages.exclude(kind=WaMessage.Kind.THEIRS).filter(at__date=on).count() >= wa_settings.current().per_person_day
 
 
 def queue(on: date, cold_room: dict[int, int]) -> list[dict[str, Any]]:
@@ -258,6 +261,11 @@ def queue(on: date, cold_room: dict[int, int]) -> list[dict[str, Any]]:
     for contact in cold.order_by("first_sent", "id"):
         room = cold_room.get(contact.campaign_id, 0)
         if room <= 0 or _sent_today(contact, on):
+            continue
+        if contact.first_sent and (on - contact.first_sent).days + 1 > wa_settings.current().max_days:
+            if contact.campaign_status == CS.MESSAGED:  # past the longest campaign with no reply
+                contact.campaign_status = CS.NO_REPLY
+                contact.save(update_fields=["campaign_status"])
             continue
         template = next_outreach(contact, on)
         if template is None:
@@ -311,6 +319,9 @@ def check_sendable(contact: WaContact, template: WaTemplate) -> None:
         raise FlowError("Set the contact's Track first: the Demo videos follow it.")
     if template.category == Cat.OFFER and template.coupon_id and template.coupon.status() != "live":
         raise FlowError(f"{template.coupon.code} is {template.coupon.status()}, not live. Pick the current code.")
+    ceiling = wa_settings.current().discount_max
+    if template.category == Cat.OFFER and template.coupon_id and template.coupon.percent_off > ceiling:
+        raise FlowError(f"{template.coupon.code} takes {template.coupon.percent_off} % off. The biggest discount in a message is {ceiling} % (Settings).")
 
 
 def set_track(contact: WaContact, track: str) -> None:
