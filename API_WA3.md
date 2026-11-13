@@ -385,3 +385,61 @@ rules' read and isn't retried. Claude never sends anything.
 ### `POST /contacts/<id>/draft/` adds `track`
 `{kind, template, track: "privacy"}` drafts as if the Unassigned Track were set, so Today can show the first Demo video
 of the Track staff are about to confirm. Nothing is saved.
+
+## 7. The Contacts tab (wa4, 12 Nov 2026: `z_marketing/wa_contact_view.py`)
+
+Read only: nothing here moves a contact or sends a message. Path campaigns are walked with a simulation (never saved);
+slots campaigns get what their own rules say, and a blank where nothing is known.
+
+### Contact JSON: added keys
+`where`, `need`, `next`, `last_message`, `language` on `/contacts/`, `/contacts/<id>/` and `contact` in Today rows.
+```json
+{"where": {"key": "intro", "label": "Intro · day 34", "sub": "No reply yet"},
+ "need": "",
+ "next": {"state": "due", "label": "Intro · Problem · day 34", "when": "2026-11-12", "slot": "", "send_kind": "flow"},
+ "last_message": {"text": "Namaste Verma & Verma CA team, ...", "at": "2026-11-10T05:35:00+00:00", "direction": "out", "by": "admin@zinwe.local"},
+ "language": "hi"}
+```
+- `where.key` (one per contact, in this order): `stop` (STOP or opted out) · `locked` (not opted in) · `paid` ·
+  `yes` (said YES) · `notnow` · `replied` (wrote back, not sorted into YES, Not now or STOP) · `intro` (in a campaign)
+  · `none` (no campaign).
+- `need`: `reply` (a reply waiting) · `track` (said YES on a campaign with a Track, Track not set) · `optin` · `""`.
+- `next.state`: `due` (today) · `planned` (on `when`) · `hold` (waits: `label` says for what, e.g. "Set the Track",
+  "Goal · Paid") · `reply` (answer on Today) · `paused` (`when` = the contact's pause end, or `null` for a paused or
+  draft campaign) · `never` (stopped) · `locked` · `done` (the path ended) · `none` (no campaign).
+  `slot` is the step's `slot` when the path has one, else `""`. `send_kind` is the `kind` for `/draft/` and `/sent/`
+  when the next message is a template (`flow`, `first`, `followup`, `touch3`, `touch4`, `nurture`), else `""`.
+- `last_message.direction`: `in` (they wrote) or `out` (we sent). `null` before any message.
+- `language`: `en` or `hi`, the language they get cold messages in (`whatsapp.language_for`).
+
+### `GET /contacts/counts/`
+Counts for the whole list (the menu), by the same rules as the keys above.
+```json
+{"all": 16, "added_week": 11, "need": 6, "need_by": {"reply": 4, "track": 1, "optin": 1},
+ "where": {"intro": 6, "replied": 1, "yes": 3, "notnow": 1, "paid": 1, "stop": 2, "locked": 1, "none": 1},
+ "tracks": {"privacy": 0, "activity": 2, "both": 0, "unset": 1},
+ "segments": [{"segment": "S1", "count": 5, "cities": ["Jaipur", "Delhi"]}],
+ "campaigns": {"5": 9, "2": 3, "1": 3}, "no_campaign": 1, "languages": {"en": 13, "hi": 3}}
+```
+`tracks.unset` = said YES, Track not set (the `track` need, whatever else they need).
+
+### `GET /contacts/<id>/path/`
+One contact's path for the contact panel: what went (`done`), where they are (`now`), the next messages (`next`, up to
+8, the rest in `more`). Dates are `YYYY-MM-DD` or `null`.
+```json
+{"campaign": 5, "campaign_name": "Diwali to Republic Day", "campaign_status": "live", "engine": "path", "day": 2,
+ "next": {"state": "planned", "label": "Intro · Problem · day 4", "when": "2026-11-19", "slot": "", "send_kind": "flow"},
+ "steps": [{"state": "done", "label": "Added to Diwali to Republic Day", "date": "2026-11-16", "note": "", "kind": "event"},
+           {"state": "done", "label": "Intro · Opener · day 1", "date": "2026-11-16", "note": ""},
+           {"state": "now", "label": "Wait 3 days", "date": null, "note": ""},
+           {"state": "next", "label": "Intro · Problem · day 4", "date": "2026-11-19", "note": ""},
+           {"state": "next", "label": "Intro · Value · day 7", "date": "2026-11-23", "note": "moved from Sun 22 Nov"}],
+ "more": {"count": 21, "last_date": "2027-02-10", "last_day": 88}}
+```
+- `kind`: `message` (one of our messages, sent or coming), `event` (added, Said YES, the Track, the first PC, paid) or
+  `step` (where they are: a wait, a hold, the end).
+- Done rows: our campaign messages and quick replies (one-offs and plain replies are in the conversation), Said YES,
+  the Track, First PC set up, Goal · Paid.
+- Now: the wait they are in, what they wait for ("Set the Track", "Sort their reply on Today"), "Blocked in every
+  campaign" (note = the block's reason), "Waiting for their opt-in", or the first coming message.
+- A slots contact's next messages come from the path its campaign would convert to (as `/schedule/` does).
